@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Workflow, _identifier
+from .model import Workflow, _identifier, evaluate_condition
 from .store import Store
 
 
@@ -63,6 +63,8 @@ class ChronicleFlow:
                 "input": raw["input"],
                 "completed_nodes": [],
                 "outputs": {},
+                "condition_results": {},
+                "skipped_nodes": [],
             }
             try:
                 self.store.connection.execute(
@@ -105,17 +107,77 @@ class ChronicleFlow:
                 raise ConflictError("execution is not running")
             workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+            by_id = {node.id: node for node in workflow.nodes}
+
             completed = set(state["completed_nodes"])
-            ready = sorted(node.id for node in workflow.nodes if node.id not in completed and set(node.depends_on) <= completed)
+            skipped = set(state["skipped_nodes"])
+            resolved = completed | skipped
+
+            # Auto-process ready conditions (deterministic id order) and skip
+            # tasks whose run_if no longer matches, until a fixed point. A
+            # skipped node satisfies downstream dependencies just like a
+            # completed one, which may unlock further conditions.
+            while True:
+                progressed = False
+                ready_conditions = sorted(
+                    node.id
+                    for node in workflow.nodes
+                    if node.kind == "condition"
+                    and node.id not in resolved
+                    and set(node.depends_on) <= resolved
+                )
+                for node_id in ready_conditions:
+                    node = by_id[node_id]
+                    result = evaluate_condition(state["input"], node.path, node.equals)
+                    state["condition_results"][node_id] = result
+                    state["completed_nodes"].append(node_id)
+                    completed.add(node_id)
+                    resolved.add(node_id)
+                    self._append(execution_id, "condition_evaluated", {"node_id": node_id, "result": result})
+                    progressed = True
+
+                skippable = sorted(
+                    node.id
+                    for node in workflow.nodes
+                    if node.kind == "task"
+                    and node.id not in resolved
+                    and node.run_if is not None
+                    and node.run_if[0] in state["condition_results"]
+                    and state["condition_results"][node.run_if[0]] != node.run_if[1]
+                )
+                for node_id in skippable:
+                    state["skipped_nodes"].append(node_id)
+                    skipped.add(node_id)
+                    resolved.add(node_id)
+                    self._append(execution_id, "node_skipped", {"node_id": node_id})
+                    progressed = True
+
+                if not progressed:
+                    break
+
+            if len(resolved) == len(workflow.nodes):
+                # Auto-processing finished the execution; the supplied output
+                # is not consumed.
+                state["status"] = "completed"
+                self._append(execution_id, "execution_completed", {})
+                self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+                return state
+
+            ready = sorted(
+                node.id
+                for node in workflow.nodes
+                if node.kind == "task" and node.id not in resolved and set(node.depends_on) <= resolved
+            )
             if not ready:
                 raise ConflictError("execution has no ready node")
             node_id = ready[0]
             state["completed_nodes"].append(node_id)
             state["outputs"][node_id] = raw["output"]
-            if len(state["completed_nodes"]) == len(workflow.nodes):
-                state["status"] = "completed"
+            completed.add(node_id)
+            resolved.add(node_id)
             self._append(execution_id, "node_completed", {"node_id": node_id, "output": raw["output"]})
-            if state["status"] == "completed":
+            if len(resolved) == len(workflow.nodes):
+                state["status"] = "completed"
                 self._append(execution_id, "execution_completed", {})
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
             return state
@@ -134,12 +196,22 @@ class ChronicleFlow:
                     "input": event["payload"]["input"],
                     "completed_nodes": [],
                     "outputs": {},
+                    "condition_results": {},
+                    "skipped_nodes": [],
                 }
-            elif event["type"] == "node_completed" and rebuilt is not None:
+            elif rebuilt is None:
+                continue
+            elif event["type"] == "condition_evaluated":
+                node_id = event["payload"]["node_id"]
+                rebuilt["completed_nodes"].append(node_id)
+                rebuilt["condition_results"][node_id] = event["payload"]["result"]
+            elif event["type"] == "node_skipped":
+                rebuilt["skipped_nodes"].append(event["payload"]["node_id"])
+            elif event["type"] == "node_completed":
                 node_id = event["payload"]["node_id"]
                 rebuilt["completed_nodes"].append(node_id)
                 rebuilt["outputs"][node_id] = event["payload"]["output"]
-            elif event["type"] == "execution_completed" and rebuilt is not None:
+            elif event["type"] == "execution_completed":
                 rebuilt["status"] = "completed"
         if rebuilt is None:
             raise ConflictError("execution event stream has no start event")
@@ -154,4 +226,3 @@ class ChronicleFlow:
             "INSERT INTO events(execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
             (execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
         )
-
