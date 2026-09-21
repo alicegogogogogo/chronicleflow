@@ -6,8 +6,9 @@ SQLite so an execution can be inspected and replayed deterministically.
 
 The initial release intentionally supports a compact public contract:
 
-- workflows are directed acyclic graphs of `task` nodes;
-- executions advance one ready node at a time;
+- workflows are directed acyclic graphs of `task` and `condition` nodes;
+- executions advance one ready task at a time, evaluating conditions and
+  skipping unmatched branches automatically;
 - every state transition is appended to the execution event stream;
 - replay rebuilds execution state from the recorded events;
 - duplicate commands with the same idempotency key return the original result.
@@ -56,6 +57,29 @@ Idempotency-Key: workflow-request-1
 Returns HTTP 201 with the stored workflow. Node identifiers must be unique,
 dependencies must exist, and cycles are rejected.
 
+Besides `task`, a node may have `kind` set to `condition`:
+
+```json
+{"id": "is_vip", "kind": "condition", "depends_on": ["reserve"], "path": "customer.vip", "equals": true}
+```
+
+`path` is a non-empty dot-separated path into the execution input and `equals`
+is a JSON scalar (string, number, boolean, or null). A condition is evaluated
+automatically once its dependencies complete: the input value at `path` is
+compared with `equals` by JSON type and value, and a missing path evaluates to
+`false`.
+
+A task may carry an optional `run_if` guard:
+
+```json
+{"id": "expedite", "kind": "task", "depends_on": ["is_vip"], "run_if": {"condition_id": "is_vip", "expected": true}}
+```
+
+`condition_id` must reference a `condition` node that is also listed in the
+task's `depends_on`. When the condition's result differs from `expected`, the
+task is marked as skipped: it receives no output and still satisfies the
+dependencies of its successors.
+
 ### Start an execution
 
 ```http
@@ -86,8 +110,17 @@ Idempotency-Key: advance-request-1
 {"output":{"reservation_id":"r-9"}}
 ```
 
-The lexicographically first ready node is completed. The response contains the
-updated execution. When all nodes are complete, its status becomes `completed`.
+The lexicographically first ready task is completed. The response contains the
+updated execution. Before that, each call first evaluates all ready conditions
+in deterministic order and skips tasks whose `run_if` does not match; if this
+automatic processing finishes the execution, the current state is returned and
+the submitted output is not consumed. When every node is completed or skipped,
+the status becomes `completed`.
+
+Execution state includes `completed_nodes` (which also lists evaluated
+conditions), `skipped_nodes`, `condition_results`, and `outputs`. Each
+condition evaluation appends a `condition_evaluated` event and each skip a
+`node_skipped` event to the execution stream.
 
 ### Replay
 

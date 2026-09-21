@@ -3,8 +3,29 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Workflow, _identifier
+from .model import Node, Workflow, _identifier
 from .store import Store
+
+
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "other"
+
+
+def _evaluate_condition(node: Node, input_data: Any) -> bool:
+    current = input_data
+    for segment in node.path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return False
+        current = current[segment]
+    return _json_type(current) == _json_type(node.equals) and current == node.equals
 
 
 class ChronicleFlow:
@@ -62,6 +83,8 @@ class ChronicleFlow:
                 "status": "running",
                 "input": raw["input"],
                 "completed_nodes": [],
+                "skipped_nodes": [],
+                "condition_results": {},
                 "outputs": {},
             }
             try:
@@ -102,25 +125,57 @@ class ChronicleFlow:
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id)
             if state["status"] != "running":
-                raise ConflictError("execution is not running")
+                return state
             workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
-            completed = set(state["completed_nodes"])
-            ready = sorted(node.id for node in workflow.nodes if node.id not in completed and set(node.depends_on) <= completed)
-            if not ready:
-                raise ConflictError("execution has no ready node")
-            node_id = ready[0]
-            state["completed_nodes"].append(node_id)
-            state["outputs"][node_id] = raw["output"]
-            if len(state["completed_nodes"]) == len(workflow.nodes):
-                state["status"] = "completed"
-            self._append(execution_id, "node_completed", {"node_id": node_id, "output": raw["output"]})
-            if state["status"] == "completed":
-                self._append(execution_id, "execution_completed", {})
+            self._auto_process(execution_id, workflow, state)
+            if state["status"] == "running":
+                satisfied = set(state["completed_nodes"]) | set(state["skipped_nodes"])
+                ready = sorted(
+                    node.id
+                    for node in workflow.nodes
+                    if node.kind == "task" and node.id not in satisfied and set(node.depends_on) <= satisfied
+                )
+                if not ready:
+                    raise ConflictError("execution has no ready node")
+                node_id = ready[0]
+                state["completed_nodes"].append(node_id)
+                state["outputs"][node_id] = raw["output"]
+                self._append(execution_id, "node_completed", {"node_id": node_id, "output": raw["output"]})
+                if len(state["completed_nodes"]) + len(state["skipped_nodes"]) == len(workflow.nodes):
+                    state["status"] = "completed"
+                    self._append(execution_id, "execution_completed", {})
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
             return state
 
         return self._idempotent(key, f"advance:{execution_id}", apply)
+
+    def _auto_process(self, execution_id: str, workflow: Workflow, state: dict[str, Any]) -> None:
+        completed = set(state["completed_nodes"])
+        skipped = set(state["skipped_nodes"])
+        changed = True
+        while changed:
+            changed = False
+            for node in sorted(workflow.nodes, key=lambda item: item.id):
+                if node.id in completed or node.id in skipped:
+                    continue
+                if not set(node.depends_on) <= completed | skipped:
+                    continue
+                if node.kind == "condition":
+                    result = _evaluate_condition(node, state["input"])
+                    state["condition_results"][node.id] = result
+                    state["completed_nodes"].append(node.id)
+                    completed.add(node.id)
+                    self._append(execution_id, "condition_evaluated", {"node_id": node.id, "result": result})
+                    changed = True
+                elif node.run_if is not None and state["condition_results"][node.run_if.condition_id] != node.run_if.expected:
+                    state["skipped_nodes"].append(node.id)
+                    skipped.add(node.id)
+                    self._append(execution_id, "node_skipped", {"node_id": node.id})
+                    changed = True
+        if len(completed) + len(skipped) == len(workflow.nodes):
+            state["status"] = "completed"
+            self._append(execution_id, "execution_completed", {})
 
     def replay(self, execution_id: str) -> dict[str, Any]:
         stored = self.get_execution(execution_id)
@@ -133,8 +188,16 @@ class ChronicleFlow:
                     "status": "running",
                     "input": event["payload"]["input"],
                     "completed_nodes": [],
+                    "skipped_nodes": [],
+                    "condition_results": {},
                     "outputs": {},
                 }
+            elif event["type"] == "condition_evaluated" and rebuilt is not None:
+                node_id = event["payload"]["node_id"]
+                rebuilt["condition_results"][node_id] = event["payload"]["result"]
+                rebuilt["completed_nodes"].append(node_id)
+            elif event["type"] == "node_skipped" and rebuilt is not None:
+                rebuilt["skipped_nodes"].append(event["payload"]["node_id"])
             elif event["type"] == "node_completed" and rebuilt is not None:
                 node_id = event["payload"]["node_id"]
                 rebuilt["completed_nodes"].append(node_id)
@@ -154,4 +217,3 @@ class ChronicleFlow:
             "INSERT INTO events(execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
             (execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
         )
-
