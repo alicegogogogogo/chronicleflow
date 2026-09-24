@@ -19,6 +19,9 @@ The initial release intentionally supports a compact public contract:
   continue condition at the loop boundaries;
 - every state transition is appended to the execution event stream;
 - replay rebuilds execution state from the recorded events;
+- a checkpoint is written at every node boundary, capturing the state
+  summary and event position, so an execution can be recovered from the
+  latest checkpoint after a restart;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -167,10 +170,30 @@ a timeout never expire.
 ```http
 GET /executions/run-1
 GET /executions/run-1/events
+GET /executions/run-1/checkpoints
 ```
 
 The first endpoint returns the materialized state. The second returns the
-ordered event stream.
+ordered event stream. The third returns the ordered checkpoints; each entry
+gives its `sequence`, the `event_sequence` position it was taken at, the full
+`state` summary, and `created_at`.
+
+### Checkpoints
+
+Every successful `advance` that settles a node boundary — a task is
+completed, or a failure is submitted (whether it retries or exhausts the
+attempts) — writes a checkpoint in the same transaction as the state update
+and event append. The checkpoint stores the complete state summary at that
+boundary, including completed, skipped, and failed nodes, condition results,
+outputs, attempts with their unfinished retry counts, and the status and
+current iteration of every loop (with the per-iteration records), together
+with the position of the last written event. Because the checkpoint matches
+the stored state at that position, recovery can continue without replaying or
+duplicating any node output.
+
+Checkpoints do not add fields to the execution state and do not append events:
+an execution that declares no retries, timeout, or loops keeps exactly the
+same state shape and event stream as before.
 
 ### Complete the next ready node
 
@@ -230,6 +253,41 @@ event; completed executions keep a `null` termination reason and their own
 `execution_completed` event. Advancing a terminated execution returns its
 state unchanged without consuming the submitted output or failure.
 
+### Recover from a checkpoint
+
+```http
+POST /executions/run-1/recover
+Idempotency-Key: recover-request-1
+
+{"from":"latest_checkpoint"}
+```
+
+Recovery rebuilds a running execution from its latest checkpoint and returns
+the rebuilt execution. It appends no events and changes no state: the rebuilt
+execution is exactly the materialized state, and a subsequent replay has the
+same conclusion as before the interruption. After recovery, further
+`advance` calls continue from the checkpoint, so node outputs, failure
+reasons, attempt numbers, and loop iteration ownership are identical to an
+uninterrupted run; failure records for tasks inside a loop body still carry
+their loop id and current iteration. Recovery works after the service has
+been restarted, because checkpoints live in the same SQLite database as the
+execution state and events.
+
+A completed execution is returned unchanged, producing no new events. A
+terminated execution is likewise returned unchanged and the operation
+absorbs no input; if a timeout or cancellation takes effect between
+checkpoint writes, termination takes precedence over recovery. Events and
+checkpoints remain queryable after cancellation or timeout, and their replay
+stays consistent with the materialized state.
+
+Recovering a missing execution returns 404. Recovering an execution that has
+no checkpoint, or whose latest checkpoint cannot be parsed, returns 409
+`conflict`. A missing `from` field, a wrong type, or an unknown recovery
+origin is a 400 `validation_error`; a non-finite number in the body is
+rejected the same way as every other request. Reusing an idempotency key
+already used by another operation (including an `advance` or `cancel` on the
+same execution) returns 409 `conflict`.
+
 ### Replay
 
 ```http
@@ -252,7 +310,10 @@ Validation errors return 400, missing resources return 404, and conflicts
 return 409. A `retries` value that is negative, non-integer, or greater than
 10, and a non-positive `timeout_seconds`, are validation errors. Reusing a
 workflow or execution identifier, or reusing an idempotency key across
-different operations, is a conflict. Request bodies must not contain
+different operations, is a conflict. Recovering a missing execution is a
+missing resource, while recovering an execution that has no checkpoint or
+whose latest checkpoint is unparseable is a conflict; an invalid recover body
+is a validation error. Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
 they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.

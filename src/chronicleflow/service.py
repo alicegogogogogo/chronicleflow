@@ -201,6 +201,9 @@ class ChronicleFlow:
                 if state["status"] == "running":
                     self._auto_process(execution_id, workflow, state)
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+            # Every path from a running start that reaches here settled at least
+            # one node boundary, so checkpoint it in the same transaction.
+            self._write_checkpoint(execution_id, state)
             return state
 
         return self._idempotent(key, f"advance:{execution_id}", apply)
@@ -215,6 +218,56 @@ class ChronicleFlow:
             return state
 
         return self._idempotent(key, f"cancel:{execution_id}", apply)
+
+    def checkpoints(self, execution_id: str) -> dict[str, Any]:
+        self.get_execution(execution_id)
+        rows = self.store.connection.execute(
+            "SELECT sequence, event_sequence, document, created_at FROM checkpoints WHERE execution_id = ? ORDER BY sequence",
+            (execution_id,),
+        ).fetchall()
+        return {
+            "checkpoints": [
+                {
+                    "sequence": row["sequence"],
+                    "event_sequence": row["event_sequence"],
+                    "state": self.store.decode(row["document"])["state"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        }
+
+    def recover(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"from"} or not isinstance(raw["from"], str):
+            raise ValidationError("recover body must contain exactly a from string")
+        if raw["from"] != "latest_checkpoint":
+            raise ValidationError("recover from must be \"latest_checkpoint\"")
+
+        def apply() -> dict[str, Any]:
+            # get_execution applies a due timeout first, so termination always
+            # takes precedence over recovery.
+            state = self.get_execution(execution_id)
+            if state["status"] != "running":
+                return state
+            row = self.store.connection.execute(
+                "SELECT document FROM checkpoints WHERE execution_id = ? ORDER BY sequence DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+            if not row:
+                raise ConflictError("execution has no checkpoint to recover from")
+            try:
+                document = self.store.decode(row["document"])
+                snapshot = document["state"]
+                event_sequence = document["event_sequence"]
+            except (ValueError, KeyError, TypeError) as error:
+                raise ConflictError("latest checkpoint is not parseable") from error
+            if not isinstance(snapshot, dict) or not isinstance(event_sequence, int):
+                raise ConflictError("latest checkpoint is not parseable")
+            if snapshot != state:
+                raise ConflictError("latest checkpoint does not match the materialized state")
+            return snapshot
+
+        return self._idempotent(key, f"recover:{execution_id}", apply)
 
     def _node_container(self, workflow: Workflow, state: dict[str, Any], node_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return the state fragment holding the node's progress and its event context."""
@@ -486,4 +539,20 @@ class ChronicleFlow:
         self.store.connection.execute(
             "INSERT INTO events(execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
             (execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
+        )
+
+    def _write_checkpoint(self, execution_id: str, state: dict[str, Any]) -> None:
+        """Persist the state summary and event position at a node boundary."""
+        event_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        checkpoint_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM checkpoints WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        document = {"state": state, "event_sequence": event_row["sequence"]}
+        self.store.connection.execute(
+            "INSERT INTO checkpoints(execution_id, sequence, event_sequence, document, created_at) VALUES (?, ?, ?, ?, ?)",
+            (execution_id, checkpoint_row["sequence"], event_row["sequence"], self.store.encode(document), self.store.now()),
         )

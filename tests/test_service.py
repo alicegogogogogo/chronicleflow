@@ -738,5 +738,240 @@ class LoopRetryTests(unittest.TestCase):
         self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-fatal"))
 
 
+class CheckpointRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name) / "test.db")
+        self.service = ChronicleFlow(self.database)
+        self.workflow = {
+            "id": "orders",
+            "nodes": [
+                {"id": "reserve", "kind": "task", "depends_on": []},
+                {"id": "charge", "kind": "task", "depends_on": ["reserve"]},
+            ],
+        }
+        self.service.create_workflow(self.workflow, "w1")
+        self.service.create_execution({"id": "run-1", "workflow_id": "orders", "input": {"order": 7}}, "e1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def event_payloads(self, service, execution_id="run-1"):
+        return [(event["type"], event["payload"]) for event in service.events(execution_id)]
+
+    def test_checkpoint_is_written_at_each_node_boundary_and_matches_state(self):
+        first = self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        second = self.service.advance("run-1", {"output": {"charge": "ok"}}, "a2")
+        checkpoints = self.service.checkpoints("run-1")["checkpoints"]
+        self.assertEqual(2, len(checkpoints))
+        self.assertEqual([1, 2], [checkpoint["sequence"] for checkpoint in checkpoints])
+        # execution_started then the first node completion; the final completion
+        # adds node_completed plus execution_completed
+        self.assertEqual(2, checkpoints[0]["event_sequence"])
+        self.assertEqual(4, checkpoints[1]["event_sequence"])
+        self.assertEqual(first, checkpoints[0]["state"])
+        self.assertEqual(second, checkpoints[1]["state"])
+        self.assertIn("created_at", checkpoints[0])
+
+    def test_recover_rebuilds_materialized_state_without_new_events(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        state = self.service.get_execution("run-1")
+        events_before = self.service.events("run-1")
+        rebuilt = self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+        self.assertEqual(state, rebuilt)
+        self.assertEqual(events_before, self.service.events("run-1"))
+        self.assertEqual({"consistent": True, "execution": rebuilt}, self.service.replay("run-1"))
+
+    def test_recover_is_idempotent_with_the_same_key(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        first = self.service.recover("run-1", {"from": "latest_checkpoint"}, "same")
+        repeated = self.service.recover("run-1", {"from": "latest_checkpoint"}, "same")
+        self.assertEqual(first, repeated)
+
+    def test_restart_recover_and_continue_matches_uninterrupted_run(self):
+        uninterrupted_db = str(Path(self.directory.name) / "plain.db")
+        uninterrupted = ChronicleFlow(uninterrupted_db)
+        uninterrupted.create_workflow(self.workflow, "w1")
+        uninterrupted.create_execution({"id": "run-1", "workflow_id": "orders", "input": {"order": 7}}, "e1")
+        uninterrupted.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        final_uninterrupted = uninterrupted.advance("run-1", {"output": {"charge": "ok"}}, "a2")
+
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        resumed = ChronicleFlow(self.database)
+        rebuilt = resumed.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+        self.assertEqual(["reserve"], rebuilt["completed_nodes"])
+        continued = resumed.advance("run-1", {"output": {"charge": "ok"}}, "a2")
+        self.assertEqual(final_uninterrupted, continued)
+        self.assertEqual(self.event_payloads(uninterrupted), self.event_payloads(resumed))
+        self.assertEqual({"consistent": True, "execution": continued}, resumed.replay("run-1"))
+
+    def test_restart_recover_continues_unfinished_retries_without_duplicate_output(self):
+        workflow = {
+            "id": "flaky",
+            "nodes": [
+                {"id": "fetch", "kind": "task", "depends_on": [], "retries": 2},
+                {"id": "report", "kind": "task", "depends_on": ["fetch"]},
+            ],
+        }
+        self.service.create_workflow(workflow, "w-flaky")
+        self.service.create_execution({"id": "run-flaky", "workflow_id": "flaky", "input": {}}, "e-flaky")
+        state = self.service.advance("run-flaky", {"failure": {"reason": "boom"}}, "af1")
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, state["attempts"])
+        checkpoint = self.service.checkpoints("run-flaky")["checkpoints"][-1]
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, checkpoint["state"]["attempts"])
+        resumed = ChronicleFlow(self.database)
+        resumed.recover("run-flaky", {"from": "latest_checkpoint"}, "rf1")
+        state = resumed.advance("run-flaky", {"output": {"page": 1}}, "af2")
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, state["attempts"])
+        state = resumed.advance("run-flaky", {"output": {"done": True}}, "af3")
+        self.assertEqual("completed", state["status"])
+        self.assertEqual({"fetch": {"page": 1}, "report": {"done": True}}, state["outputs"])
+        self.assertEqual({"consistent": True, "execution": state}, resumed.replay("run-flaky"))
+        types = [event[0] for event in self.event_payloads(resumed, "run-flaky")]
+        self.assertEqual(
+            ["execution_started", "node_failed", "node_retried", "node_completed", "node_completed", "execution_completed"],
+            types,
+        )
+
+    def test_loop_failure_checkpoint_and_recovery_keeps_iteration_identity(self):
+        workflow = {
+            "id": "loop-retry",
+            "nodes": [
+                {"id": "check", "kind": "condition", "depends_on": [], "path": "again", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["check"], "retries": 1},
+                {
+                    "id": "loop",
+                    "kind": "loop",
+                    "depends_on": [],
+                    "entry": "attempt",
+                    "condition": "check",
+                    "max_iterations": 2,
+                },
+            ],
+        }
+        self.service.create_workflow(workflow, "w-loop")
+        self.service.create_execution({"id": "run-loop", "workflow_id": "loop-retry", "input": {"again": True}}, "e-loop")
+        state = self.service.advance("run-loop", {"failure": {"reason": "flaky"}}, "al1")
+        iteration = state["loops"]["loop"]["iterations"][0]
+        self.assertEqual({"attempt": {"attempt": 2, "failures": 1}}, iteration["attempts"])
+        resumed = ChronicleFlow(self.database)
+        rebuilt = resumed.recover("run-loop", {"from": "latest_checkpoint"}, "rl1")
+        self.assertEqual(
+            {"attempt": {"attempt": 2, "failures": 1}},
+            rebuilt["loops"]["loop"]["iterations"][0]["attempts"],
+        )
+        state = resumed.advance("run-loop", {"output": {"try": 1}}, "al2")
+        failed = next(event for event in resumed.events("run-loop") if event["type"] == "node_failed")
+        self.assertEqual(
+            {"node_id": "attempt", "attempt": 1, "reason": "flaky", "loop_id": "loop", "iteration": 1},
+            failed["payload"],
+        )
+        self.assertEqual({"consistent": True, "execution": state}, resumed.replay("run-loop"))
+
+    def test_completed_execution_recovers_unchanged_without_events(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        completed = self.service.advance("run-1", {"output": {"charge": "ok"}}, "a2")
+        events_before = self.service.events("run-1")
+        recovered = self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+        self.assertEqual(completed, recovered)
+        self.assertEqual(events_before, self.service.events("run-1"))
+
+    def test_terminated_execution_recovers_unchanged(self):
+        self.service.cancel("run-1", "c1")
+        state = self.service.get_execution("run-1")
+        recovered = self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+        self.assertEqual(state, recovered)
+        self.assertEqual("cancelled", recovered["termination_reason"])
+
+    def test_timeout_takes_precedence_over_recovery(self):
+        self.service.create_execution(
+            {"id": "run-timeout", "workflow_id": "orders", "input": {}, "timeout_seconds": 0.05},
+            "e-timeout",
+        )
+        self.service.advance("run-timeout", {"output": {"reservation": 9}}, "a-timeout")
+        # the checkpoint captured a running execution before the deadline
+        self.assertEqual("running", self.service.checkpoints("run-timeout")["checkpoints"][-1]["state"]["status"])
+        time.sleep(0.1)
+        recovered = self.service.recover("run-timeout", {"from": "latest_checkpoint"}, "r-timeout")
+        self.assertEqual("terminated", recovered["status"])
+        self.assertEqual("timeout", recovered["termination_reason"])
+        # recovery absorbs no input: the pre-deadline boundary is all that exists
+        self.assertEqual(["reserve"], recovered["completed_nodes"])
+        self.assertEqual({"reserve": {"reservation": 9}}, recovered["outputs"])
+
+    def test_events_and_checkpoints_remain_queryable_after_cancellation(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        self.service.cancel("run-1", "c1")
+        checkpoints = self.service.checkpoints("run-1")["checkpoints"]
+        self.assertEqual(1, len(checkpoints))
+        self.assertEqual(["reserve"], checkpoints[-1]["state"]["completed_nodes"])
+        self.assertEqual("cancelled", self.service.events("run-1")[-1]["payload"]["reason"])
+        self.assertTrue(self.service.replay("run-1")["consistent"])
+
+    def test_advancing_terminated_execution_writes_no_checkpoint(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        self.service.cancel("run-1", "c1")
+        self.service.advance("run-1", {"output": {"late": True}}, "a2")
+        self.assertEqual(1, len(self.service.checkpoints("run-1")["checkpoints"]))
+
+    def test_recover_missing_execution_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.recover("ghost", {"from": "latest_checkpoint"}, "r-ghost")
+
+    def test_recover_without_checkpoint_conflicts(self):
+        with self.assertRaisesRegex(ConflictError, "no checkpoint"):
+            self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+
+    def test_unparseable_checkpoint_conflicts(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        self.service.store.connection.execute(
+            "UPDATE checkpoints SET document = ? WHERE execution_id = ?",
+            ("{not valid json", "run-1"),
+        )
+        with self.assertRaisesRegex(ConflictError, "parseable"):
+            self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+
+    def test_malformed_checkpoint_document_conflicts(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        self.service.store.connection.execute(
+            "UPDATE checkpoints SET document = ? WHERE execution_id = ?",
+            ('{"event_sequence": 1}', "run-1"),
+        )
+        with self.assertRaises(ConflictError):
+            self.service.recover("run-1", {"from": "latest_checkpoint"}, "r1")
+
+    def test_checkpoints_preserve_float_precision_and_negative_zero(self):
+        workflow = {
+            "id": "floats",
+            "nodes": [{"id": "only", "kind": "task", "depends_on": []}],
+        }
+        self.service.create_workflow(workflow, "w-floats")
+        self.service.create_execution(
+            {"id": "run-floats", "workflow_id": "floats", "input": {"value": -0.0}},
+            "e-floats",
+        )
+        self.service.advance("run-floats", {"output": {"precise": 0.30000000000000004}}, "af")
+        recovered = self.service.recover("run-floats", {"from": "latest_checkpoint"}, "rf")
+        self.assertEqual(-0.0, recovered["input"]["value"])
+        self.assertTrue(str(recovered["input"]["value"]).startswith("-"))
+        self.assertEqual(0.30000000000000004, recovered["outputs"]["only"]["precise"])
+
+    def test_invalid_recover_bodies_are_rejected(self):
+        for body in ({}, {"from": 5}, {"from": "elsewhere"}, {"from": "latest_checkpoint", "extra": 1}, ["latest_checkpoint"]):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.recover("run-1", body, "r-bad")
+
+    def test_recover_key_cannot_be_reused_for_another_operation(self):
+        self.service.advance("run-1", {"output": {"reservation": 9}}, "a1")
+        self.service.advance("run-1", {"output": {"charge": "ok"}}, "shared")
+        with self.assertRaises(ConflictError):
+            self.service.recover("run-1", {"from": "latest_checkpoint"}, "shared")
+
+    def test_checkpoints_for_missing_execution_are_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.checkpoints("ghost")
+
+
 if __name__ == "__main__":
     unittest.main()
