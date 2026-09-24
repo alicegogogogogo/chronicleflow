@@ -2,12 +2,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
 from .service import ChronicleFlow
+
+
+def _reject_non_finite(constant: str) -> Any:
+    raise ValidationError(f"request body must not contain {constant}")
+
+
+def _assert_finite(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError("request body must not contain non-finite numbers")
+    if isinstance(value, dict):
+        for item in value.values():
+            _assert_finite(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_finite(item)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -17,7 +33,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _json(self, status: int, value: Any) -> None:
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -32,7 +48,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 1_000_000:
                 raise ValueError
-            return json.loads(self.rfile.read(length))
+            parsed = json.loads(self.rfile.read(length), parse_constant=_reject_non_finite)
+            _assert_finite(parsed)
+            return parsed
         except (ValueError, json.JSONDecodeError) as error:
             raise ValidationError("request body must be valid JSON") from error
 

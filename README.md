@@ -6,9 +6,12 @@ SQLite so an execution can be inspected and replayed deterministically.
 
 The initial release intentionally supports a compact public contract:
 
-- workflows are directed acyclic graphs of `task` and `condition` nodes;
+- workflows are directed acyclic graphs of `task`, `condition`, and bounded
+  `loop` nodes;
 - executions advance one ready task at a time, evaluating conditions and
   skipping unmatched branches automatically;
+- loop nodes repeat their body a bounded number of times, re-evaluating a
+  continue condition at the loop boundaries;
 - every state transition is appended to the execution event stream;
 - replay rebuilds execution state from the recorded events;
 - duplicate commands with the same idempotency key return the original result.
@@ -80,6 +83,45 @@ task's `depends_on`. When the condition's result differs from `expected`, the
 task is marked as skipped: it receives no output and still satisfies the
 dependencies of its successors.
 
+A node may also have `kind` set to `loop`, describing a bounded repeated
+segment:
+
+```json
+{"id": "retry", "kind": "loop", "depends_on": ["reserve"], "entry": "attempt", "condition": "keep_trying", "max_iterations": 3}
+```
+
+A loop node contains exactly `id`, `kind`, `depends_on`, `entry`, `condition`,
+and `max_iterations`; any other field is rejected as unknown. `entry` names a
+`task` node, `condition` names a `condition` node, and `max_iterations` is an
+integer between 1 and 100. The loop body is the entry task plus every node
+reachable from it through `depends_on`; the body keeps the usual DAG rules and
+must contain the referenced condition. The loop's own dependencies must be
+completed or skipped before the first iteration may start, they must not
+overlap the body, bodies of different loops must not overlap or nest, and
+nodes outside a body must not depend on nodes inside it (they depend on the
+loop node instead).
+
+When the loop's dependencies are satisfied, the loop evaluates its condition
+against the execution input (same JSON type and value comparison as condition
+nodes; a missing path is `false`). If it is `false`, the loop completes with
+zero iterations and end reason `condition_false`. If it is `true`, the first
+iteration starts and the body advances one ready task per `advance` call in
+the usual deterministic order; conditions and `run_if` skips inside the body
+are re-evaluated every iteration, and task outputs belong only to the current
+iteration. Once every body node is completed or skipped, the condition is
+evaluated again: `true` starts the next iteration, `false` ends the loop with
+`condition_false`, and reaching `max_iterations` ends it with
+`iteration_limit` after that iteration finishes. Ending the loop completes
+the loop node and releases the dependencies of its successors.
+
+Execution state exposes each loop under `loops`: `status`, the
+`current_iteration`, one entry per iteration with its own `completed_nodes`,
+`skipped_nodes`, `condition_results`, and `outputs`, and the single
+`end_reason` (`condition_false` or `iteration_limit`). The event stream
+records `iteration_started`, `loop_condition_evaluated`, and `loop_completed`
+events alongside the usual per-node ones, so replay rebuilds loop state
+exactly.
+
 ### Start an execution
 
 ```http
@@ -141,7 +183,10 @@ Errors use this shape:
 ```
 
 Validation errors return 400, missing resources return 404, and conflicts
-return 409.
+return 409. Request bodies must not contain non-finite numbers (`NaN`,
+`Infinity`, or overflowing values such as `1e400`); they are rejected with
+400. Finite floats keep their full precision, including negative zero
+(`-0.0`), and every response body ends with a single newline.
 
 ## Tests
 
