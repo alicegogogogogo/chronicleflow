@@ -19,6 +19,8 @@ The initial release intentionally supports a compact public contract:
   continue condition at the loop boundaries;
 - every state transition is appended to the execution event stream;
 - replay rebuilds execution state from the recorded events;
+- a checkpoint is written at every node boundary so an execution can recover
+  from the latest one after an interruption, including a service restart;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -172,6 +174,23 @@ GET /executions/run-1/events
 The first endpoint returns the materialized state. The second returns the
 ordered event stream.
 
+### Inspect checkpoints
+
+```http
+GET /executions/run-1/checkpoints
+```
+
+Returns the ordered checkpoints written for the execution. A checkpoint is
+written inside the same transaction as an `advance` call whenever that call
+advances a node boundary — that is, whenever it completes a ready task, or
+submits a failure that retries the node — and the execution is still running.
+Each checkpoint records the state summary at that boundary, the position of
+the last event appended (`event_sequence`), and the unfinished retry attempts
+and loop iterations, so recovery can continue without repeating node output.
+Checkpoints add no fields to the execution state and no events to the stream.
+Executions without retries, timeouts, or loops are checkpointed in exactly the
+same way; the state and event shapes are unchanged.
+
 ### Complete the next ready node
 
 ```http
@@ -239,6 +258,39 @@ POST /executions/run-1/replay
 Rebuilds state solely from the execution event stream and compares it with the
 stored materialized state. A successful response contains `consistent: true`
 and the rebuilt execution.
+
+### Recover from a checkpoint
+
+```http
+POST /executions/run-1/recover
+Idempotency-Key: recover-request-1
+
+{"from":"latest"}
+```
+
+Recovery is a new execution operation: for a running execution it rebuilds the
+materialized state from the most recent checkpoint and returns the rebuilt
+execution. It appends no events and writes no checkpoint itself, and subsequent
+advances continue from the recovered boundary without repeating any node
+output; node output, failure reasons, and attempt and iteration attribution
+stay identical to an uninterrupted run. The rebuilt state is consistent with
+the materialized state, and replay reaches the same conclusion.
+
+A completed or already terminated execution is returned unchanged; recovery
+never absorbs input and never overrides a termination reason. If a timeout or
+cancellation takes effect between checkpoint writes, that termination takes
+precedence over recovery. Events and checkpoints remain queryable after a
+timeout or cancellation, and replay still matches the materialized state.
+
+Recovery persists across service restarts because checkpoints live in SQLite.
+
+Recovering a missing execution returns 404 `not_found`. Recovering an
+execution that has no checkpoint, or whose latest checkpoint is not
+parseable, returns 409 `conflict`. A missing or mistyped `from` field, an
+unknown `from` value, or any extra field returns 400 `validation_error`;
+request bodies containing non-finite numbers are rejected with 400 as for
+every other endpoint. Reusing an idempotency key across different operations
+returns 409 `conflict`.
 
 ## Errors
 

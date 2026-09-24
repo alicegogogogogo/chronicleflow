@@ -39,6 +39,14 @@ class Store:
               operation TEXT NOT NULL,
               response TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+              execution_id TEXT NOT NULL REFERENCES executions(id),
+              sequence INTEGER NOT NULL,
+              event_sequence INTEGER NOT NULL,
+              document TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (execution_id, sequence)
+            );
             """
         )
 
