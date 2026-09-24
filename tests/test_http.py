@@ -136,5 +136,137 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual("conflict", json.loads(data)["error"]["code"])
 
 
+class RetryAndCancellationHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-retry.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        payload = json.dumps(body) if body is not None else None
+        all_headers = {"Content-Type": "application/json"}
+        all_headers.update(headers or {})
+        connection.request(method, path, payload, all_headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def setUp(self):
+        self.request(
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-retry",
+                "nodes": [
+                    {"id": "a", "kind": "task", "depends_on": [], "retries": 1},
+                    {"id": "b", "kind": "task", "depends_on": ["a"]},
+                ],
+            },
+            headers={"Idempotency-Key": "wf-retry"},
+        )
+
+    def test_invalid_retries_returns_400(self):
+        status, data = self.request(
+            "POST",
+            "/workflows",
+            {"id": "wf-bad-retries", "nodes": [{"id": "a", "kind": "task", "depends_on": [], "retries": 11}]},
+            headers={"Idempotency-Key": "wf-bad-retries"},
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_invalid_timeout_returns_400(self):
+        status, data = self.request(
+            "POST",
+            "/executions",
+            {"id": "run-bad-timeout", "workflow_id": "wf-retry", "input": {}, "timeout_seconds": -3},
+            headers={"Idempotency-Key": "run-bad-timeout"},
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_failure_retries_then_terminates(self):
+        self.request(
+            "POST", "/executions", {"id": "run-r", "workflow_id": "wf-retry", "input": {}},
+            headers={"Idempotency-Key": "run-r"},
+        )
+        status, data = self.request(
+            "POST", "/executions/run-r/advance", {"failure": {"reason": "boom"}},
+            headers={"Idempotency-Key": "run-r-a1"},
+        )
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual("running", state["status"])
+        self.assertEqual(2, state["nodes"]["a"]["attempt"])
+        status, data = self.request(
+            "POST", "/executions/run-r/advance", {"failure": {"reason": "boom again"}},
+            headers={"Idempotency-Key": "run-r-a2"},
+        )
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual("failed", state["status"])
+        self.assertEqual("failed", state["termination_reason"])
+        status, data = self.request("GET", "/executions/run-r/events")
+        self.assertEqual(200, status)
+        events = json.loads(data)["events"]
+        self.assertEqual("execution_terminated", events[-1]["type"])
+
+    def test_cancel_running_then_advance_is_idempotent(self):
+        self.request(
+            "POST", "/executions", {"id": "run-c", "workflow_id": "wf-retry", "input": {}},
+            headers={"Idempotency-Key": "run-c"},
+        )
+        status, data = self.request("POST", "/executions/run-c/cancel", {}, headers={"Idempotency-Key": "run-c-c1"})
+        self.assertEqual(200, status)
+        cancelled = json.loads(data)
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertEqual("cancelled", cancelled["termination_reason"])
+        # advancing the cancelled execution returns it unchanged
+        status, data = self.request(
+            "POST", "/executions/run-c/advance", {"output": {"ignored": True}},
+            headers={"Idempotency-Key": "run-c-a1"},
+        )
+        self.assertEqual(cancelled, json.loads(data))
+        # cancelling again returns the same state
+        status, data = self.request("POST", "/executions/run-c/cancel", {}, headers={"Idempotency-Key": "run-c-c2"})
+        self.assertEqual(cancelled, json.loads(data))
+
+    def test_cancel_without_body_is_allowed(self):
+        self.request(
+            "POST", "/executions", {"id": "run-cancel-nobody", "workflow_id": "wf-retry", "input": {}},
+            headers={"Idempotency-Key": "run-cancel-nobody-create"},
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        connection.request(
+            "POST", "/executions/run-cancel-nobody/cancel", None,
+            {"Idempotency-Key": "run-cancel-nobody-cancel", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        self.assertEqual(200, response.status)
+        self.assertEqual("cancelled", json.loads(data)["status"])
+
+    def test_cancel_missing_execution_returns_404(self):
+        status, data = self.request(
+            "POST", "/executions/no-such-execution/cancel", {},
+            headers={"Idempotency-Key": "cancel-missing"},
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+
+
 if __name__ == "__main__":
     unittest.main()

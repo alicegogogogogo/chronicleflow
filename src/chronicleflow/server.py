@@ -54,6 +54,15 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as error:
             raise ValidationError("request body must be valid JSON") from error
 
+    def _optional_body(self) -> Any:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        return self._body()
+
     def _dispatch(self) -> tuple[int, Any]:
         path = urlsplit(self.path).path
         parts = [part for part in path.split("/") if part]
@@ -64,11 +73,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "POST" and parts == ["executions"]:
             return 201, self.service.create_execution(self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 2 and parts[0] == "executions" and self.command == "GET":
-            return 200, self.service.get_execution(parts[1])
+            return 200, self.service.inspect_execution(parts[1])
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "events" and self.command == "GET":
             return 200, {"events": self.service.events(parts[1])}
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
+            return 200, self.service.cancel(parts[1], self._optional_body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "replay" and self.command == "POST":
             return 200, self.service.replay(parts[1])
         raise NotFoundError("route was not found")

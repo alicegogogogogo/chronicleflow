@@ -5,14 +5,15 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 class Store:
-    def __init__(self, path: str):
+    def __init__(self, path: str, clock: Callable[[], datetime] | None = None):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.executescript(
@@ -61,7 +62,9 @@ class Store:
     def decode(value: str) -> Any:
         return json.loads(value)
 
-    @staticmethod
-    def now() -> str:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    def now(self) -> str:
+        return self._clock().astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def current_time(self) -> datetime:
+        return self._clock()
 
