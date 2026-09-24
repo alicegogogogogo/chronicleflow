@@ -209,5 +209,226 @@ class ConditionWorkflowTests(unittest.TestCase):
                     self.service.create_workflow({"id": f"bad-{index}", "nodes": nodes}, f"w-bad-{index}")
 
 
+class LoopWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name) / "test.db")
+        self.service = ChronicleFlow(self.database)
+        self.workflow = {
+            "id": "polling",
+            "nodes": [
+                {"id": "prepare", "kind": "task", "depends_on": []},
+                {"id": "more", "kind": "condition", "depends_on": [], "path": "more", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["more"]},
+                {
+                    "id": "retry",
+                    "kind": "loop",
+                    "depends_on": ["prepare"],
+                    "entry": "attempt",
+                    "condition_id": "more",
+                    "max_iterations": 3,
+                },
+                {"id": "finish", "kind": "task", "depends_on": ["retry"]},
+            ],
+        }
+        self.service.create_workflow(self.workflow, "w1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def start(self, input_data, execution_id="run-1"):
+        return self.service.create_execution({"id": execution_id, "workflow_id": "polling", "input": input_data}, f"e-{execution_id}")
+
+    def test_loop_definition_is_round_tripped(self):
+        document = dict(self.workflow, id="polling-copy")
+        stored = self.service.create_workflow(document, "w-copy")
+        self.assertEqual(document, stored)
+
+    def test_condition_false_ends_with_zero_iterations_without_consuming_output(self):
+        workflow = {
+            "id": "terminal-loop",
+            "nodes": [
+                {"id": "prepare", "kind": "task", "depends_on": []},
+                {"id": "more", "kind": "condition", "depends_on": [], "path": "more", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["more"]},
+                {
+                    "id": "retry",
+                    "kind": "loop",
+                    "depends_on": ["prepare"],
+                    "entry": "attempt",
+                    "condition_id": "more",
+                    "max_iterations": 3,
+                },
+            ],
+        }
+        self.service.create_workflow(workflow, "w-terminal")
+        self.service.create_execution({"id": "run-z", "workflow_id": "terminal-loop", "input": {"more": False}}, "e-z")
+        self.service.advance("run-z", {"output": {"prepared": 1}}, "a1")
+        state = self.service.advance("run-z", {"output": {"never": "used"}}, "a2")
+        self.assertEqual("completed", state["status"])
+        self.assertEqual({"prepare": {"prepared": 1}}, state["outputs"])
+        self.assertEqual(["prepare", "retry"], state["completed_nodes"])
+        self.assertEqual({"retry": {"iteration": 0, "iterations": [], "end_reason": "condition_false"}}, state["loops"])
+        event_types = [event["type"] for event in self.service.events("run-z")]
+        self.assertEqual(["execution_started", "node_completed", "loop_judgment", "loop_ended", "execution_completed"], event_types)
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-z"))
+
+    def test_iterations_run_to_limit_and_outputs_stay_per_iteration(self):
+        self.start({"more": True})
+        self.service.advance("run-1", {"output": {"prepared": 1}}, "a1")
+        self.service.advance("run-1", {"output": {"n": 1}}, "a2")
+        self.service.advance("run-1", {"output": {"n": 2}}, "a3")
+        self.service.advance("run-1", {"output": {"n": 3}}, "a4")
+        state = self.service.advance("run-1", {"output": {"done": True}}, "a5")
+        self.assertEqual("completed", state["status"])
+        self.assertEqual(["prepare", "retry", "finish"], state["completed_nodes"])
+        self.assertEqual({"prepare": {"prepared": 1}, "finish": {"done": True}}, state["outputs"])
+        loop = state["loops"]["retry"]
+        self.assertEqual(3, loop["iteration"])
+        self.assertEqual("iteration_limit", loop["end_reason"])
+        self.assertEqual([1, 2, 3], [iteration["number"] for iteration in loop["iterations"]])
+        for index, iteration in enumerate(loop["iterations"], start=1):
+            self.assertEqual(["more", "attempt"], iteration["nodes"])
+            self.assertEqual([], iteration["skipped"])
+            self.assertEqual({"attempt": {"n": index}}, iteration["outputs"])
+            self.assertEqual({"more": True}, iteration["conditions"])
+        self.assertEqual({}, state["condition_results"])
+        event_types = [event["type"] for event in self.service.events("run-1")]
+        self.assertEqual(
+            [
+                "execution_started",
+                "node_completed",
+                "loop_judgment",
+                "loop_iteration_started",
+                "condition_evaluated",
+                "node_completed",
+                "loop_judgment",
+                "loop_iteration_started",
+                "condition_evaluated",
+                "node_completed",
+                "loop_judgment",
+                "loop_iteration_started",
+                "condition_evaluated",
+                "node_completed",
+                "loop_ended",
+                "node_completed",
+                "execution_completed",
+            ],
+            event_types,
+        )
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+        again = self.service.advance("run-1", {"output": {"extra": 1}}, "a6")
+        self.assertEqual(state, again)
+        self.assertEqual(17, len(self.service.events("run-1")))
+
+    def test_guarded_body_task_is_skipped_each_iteration(self):
+        workflow = {
+            "id": "guarded",
+            "nodes": [
+                {"id": "judge", "kind": "condition", "depends_on": [], "path": "go", "equals": True},
+                {"id": "flag", "kind": "condition", "depends_on": [], "path": "flag", "equals": True},
+                {
+                    "id": "extra",
+                    "kind": "task",
+                    "depends_on": ["flag"],
+                    "run_if": {"condition_id": "flag", "expected": True},
+                },
+                {"id": "attempt", "kind": "task", "depends_on": ["judge", "extra"]},
+                {"id": "loop", "kind": "loop", "depends_on": [], "entry": "attempt", "condition_id": "judge", "max_iterations": 2},
+            ],
+        }
+        self.service.create_workflow(workflow, "w-guarded")
+        self.service.create_execution({"id": "run-g", "workflow_id": "guarded", "input": {"go": True, "flag": False}}, "e-g")
+        self.service.advance("run-g", {"output": {"n": 1}}, "a1")
+        self.service.advance("run-g", {"output": {"n": 2}}, "a2")
+        state = self.service.advance("run-g", {"output": {"never": "used"}}, "a3")
+        self.assertEqual("completed", state["status"])
+        loop = state["loops"]["loop"]
+        self.assertEqual("iteration_limit", loop["end_reason"])
+        self.assertEqual(2, len(loop["iterations"]))
+        for index, iteration in enumerate(loop["iterations"], start=1):
+            self.assertEqual(["flag", "judge", "extra", "attempt"], iteration["nodes"])
+            self.assertEqual(["extra"], iteration["skipped"])
+            self.assertEqual({"attempt": {"n": index}}, iteration["outputs"])
+            self.assertEqual({"flag": False, "judge": True}, iteration["conditions"])
+        self.assertEqual({}, state["outputs"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-g"))
+
+    def test_restart_continues_unfinished_iterations(self):
+        self.start({"more": True})
+        self.service.advance("run-1", {"output": {"prepared": 1}}, "a1")
+        self.service.advance("run-1", {"output": {"n": 1}}, "a2")
+        reopened = ChronicleFlow(self.database)
+        state = reopened.advance("run-1", {"output": {"n": 2}}, "a3")
+        self.assertEqual(2, state["loops"]["retry"]["iteration"])
+        self.assertEqual({"attempt": {"n": 2}}, state["loops"]["retry"]["iterations"][1]["outputs"])
+
+    def test_idempotent_advance_returns_original_result(self):
+        self.start({"more": True})
+        self.service.advance("run-1", {"output": {"prepared": 1}}, "a1")
+        first = self.service.advance("run-1", {"output": {"n": 1}}, "same")
+        repeated = self.service.advance("run-1", {"output": {"n": 999}}, "same")
+        self.assertEqual(first, repeated)
+        self.assertEqual({"attempt": {"n": 1}}, first["loops"]["retry"]["iterations"][0]["outputs"])
+
+    def test_invalid_loop_definitions_are_rejected(self):
+        base = [
+            {"id": "more", "kind": "condition", "depends_on": [], "path": "more", "equals": True},
+            {"id": "attempt", "kind": "task", "depends_on": ["more"]},
+            {"id": "retry", "kind": "loop", "depends_on": [], "entry": "attempt", "condition_id": "more", "max_iterations": 2},
+        ]
+        loop = base[2]
+        invalid_workflows = [
+            # unknown field on a loop
+            [dict(loop, note="x")] + base[:2],
+            # missing max_iterations
+            [{key: value for key, value in loop.items() if key != "max_iterations"}] + base[:2],
+            # entry not found
+            [dict(loop, entry="ghost")] + base[:2],
+            # entry is not a task
+            [dict(loop, entry="more")] + base[:2],
+            # judgment is not a condition
+            [dict(loop, condition_id="attempt")] + base[:2],
+            # judgment outside the body
+            [dict(loop, condition_id="other")]
+            + base[:2]
+            + [{"id": "other", "kind": "condition", "depends_on": [], "path": "x", "equals": 1}],
+            # zero iterations
+            [dict(loop, max_iterations=0)] + base[:2],
+            # negative iterations
+            [dict(loop, max_iterations=-2)] + base[:2],
+            # iterations above the limit
+            [dict(loop, max_iterations=101)] + base[:2],
+            # non-finite iterations
+            [dict(loop, max_iterations=float("nan"))] + base[:2],
+            [dict(loop, max_iterations=float("inf"))] + base[:2],
+            # non-integer iterations
+            [dict(loop, max_iterations=2.5)] + base[:2],
+            [dict(loop, max_iterations="3")] + base[:2],
+            [dict(loop, max_iterations=True)] + base[:2],
+            # outside node depends on a body node
+            base + [{"id": "spy", "kind": "task", "depends_on": ["attempt"]}],
+            # loop depends on its own body node
+            [dict(loop, depends_on=["attempt"])] + base[:2],
+            # entry depends on the loop itself
+            [dict(base[1], depends_on=["more", "retry"]), base[0], base[2]],
+            # overlapping loop bodies
+            base + [dict(loop, id="again")],
+            # loop body contains another loop
+            [
+                {"id": "c2", "kind": "condition", "depends_on": [], "path": "m", "equals": 1},
+                {"id": "t2", "kind": "task", "depends_on": ["c2"]},
+                {"id": "inner", "kind": "loop", "depends_on": [], "entry": "t2", "condition_id": "c2", "max_iterations": 1},
+                {"id": "more", "kind": "condition", "depends_on": [], "path": "more", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["inner", "more"]},
+                dict(loop, depends_on=[]),
+            ],
+        ]
+        for index, nodes in enumerate(invalid_workflows):
+            with self.subTest(index=index):
+                with self.assertRaises(ValidationError):
+                    self.service.create_workflow({"id": f"bad-loop-{index}", "nodes": nodes}, f"w-bad-loop-{index}")
+
+
 if __name__ == "__main__":
     unittest.main()

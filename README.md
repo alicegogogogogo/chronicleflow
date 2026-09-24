@@ -30,6 +30,7 @@ has bound the port.
 ## HTTP API
 
 All request and response bodies are JSON. Unknown fields are rejected.
+Responses end with a single newline.
 
 ### Health
 
@@ -79,6 +80,42 @@ A task may carry an optional `run_if` guard:
 task's `depends_on`. When the condition's result differs from `expected`, the
 task is marked as skipped: it receives no output and still satisfies the
 dependencies of its successors.
+
+A node may also have `kind` set to `loop` to repeat a group of nodes while a
+condition holds:
+
+```json
+{"id": "retry", "kind": "loop", "depends_on": ["prepare"], "entry": "attempt", "condition_id": "more", "max_iterations": 3}
+```
+
+- `entry` is a task node. The entry and every node reachable from it through
+  `depends_on` form the loop body. The body must be acyclic, must not contain
+  the loop node itself or another loop, and no node outside the body may
+  depend on a body node.
+- `condition_id` is a `condition` node inside the body. The judgment compares
+  it with the execution input using the usual condition comparison.
+- `max_iterations` is a positive integer no greater than 100.
+
+The loop's own `depends_on` must complete before the first judgment; until
+then the execution stays `running` and the loop consumes no submitted output.
+A `false` judgment ends the loop immediately with end reason
+`condition_false` and zero iterations, consuming no output. A `true` judgment
+starts an iteration: body tasks advance one per advance call in the usual
+deterministic order, guards skip body tasks as usual (skips still satisfy
+successors inside the iteration), and each iteration's outputs belong only to
+that iteration. When an iteration finishes, the judgment is evaluated again:
+`false` ends the loop with `condition_false`, `true` starts the next
+iteration, and reaching `max_iterations` ends the loop with `iteration_limit`
+after that final iteration completes. Ending the loop releases its
+successors.
+
+Execution state records loops under `loops`: the current `iteration`, the
+`iterations` (each with its ordered `nodes`, `skipped`, `outputs`, and
+`conditions`), and the single `end_reason`. The event stream records
+`loop_judgment`, `loop_iteration_started`, body `node_completed` /
+`node_skipped` / `condition_evaluated` events (tagged with `loop_id` and
+`iteration`), and `loop_ended`, so replay rebuilds the same state and an
+interrupted execution resumes unfinished iterations after a restart.
 
 ### Start an execution
 

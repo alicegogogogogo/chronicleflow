@@ -17,7 +17,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _json(self, status: int, value: Any) -> None:
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        body = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
