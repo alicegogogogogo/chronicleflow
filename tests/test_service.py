@@ -1,8 +1,9 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from chronicleflow.errors import ConflictError, ValidationError
+from chronicleflow.errors import ConflictError, NotFoundError, ValidationError
 from chronicleflow.service import ChronicleFlow
 
 
@@ -464,6 +465,277 @@ class LoopWorkflowTests(unittest.TestCase):
             with self.subTest(index=index):
                 with self.assertRaises(ValidationError):
                     self.service.create_workflow({"id": f"bad-loop-{index}", "nodes": nodes}, f"w-bad-loop-{index}")
+
+
+class RetryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name) / "test.db")
+        self.service = ChronicleFlow(self.database)
+        self.workflow = {
+            "id": "flaky",
+            "nodes": [
+                {"id": "fetch", "kind": "task", "depends_on": [], "retries": 2},
+                {"id": "report", "kind": "task", "depends_on": ["fetch"]},
+            ],
+        }
+        self.service.create_workflow(self.workflow, "w1")
+        self.service.create_execution({"id": "run-1", "workflow_id": "flaky", "input": {}}, "e1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_failed_node_is_retried_and_event_stream_records_attempts(self):
+        state = self.service.advance("run-1", {"failure": {"reason": "timeout"}}, "a1")
+        self.assertEqual("running", state["status"])
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, state["attempts"])
+        self.assertEqual([], state["completed_nodes"])
+        state = self.service.advance("run-1", {"output": {"page": 1}}, "a2")
+        self.assertEqual(["fetch"], state["completed_nodes"])
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, state["attempts"])
+        event_types = [event["type"] for event in self.service.events("run-1")]
+        self.assertEqual(["execution_started", "node_failed", "node_retried", "node_completed"], event_types)
+        failed = self.service.events("run-1")[1]
+        self.assertEqual({"node_id": "fetch", "attempt": 1, "reason": "timeout"}, failed["payload"])
+        retried = self.service.events("run-1")[2]
+        self.assertEqual({"node_id": "fetch", "attempt": 2, "reason": "timeout"}, retried["payload"])
+
+    def test_retries_exhausted_terminates_execution(self):
+        self.service.advance("run-1", {"failure": {"reason": "boom-1"}}, "a1")
+        self.service.advance("run-1", {"failure": {"reason": "boom-2"}}, "a2")
+        state = self.service.advance("run-1", {"failure": {"reason": "boom-3"}}, "a3")
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("retries_exhausted", state["termination_reason"])
+        self.assertEqual(["fetch"], state["failed_nodes"])
+        self.assertEqual({"fetch": {"attempt": 3, "failures": 3}}, state["attempts"])
+        event_types = [event["type"] for event in self.service.events("run-1")]
+        self.assertEqual(
+            [
+                "execution_started",
+                "node_failed",
+                "node_retried",
+                "node_failed",
+                "node_retried",
+                "node_failed",
+                "execution_terminated",
+            ],
+            event_types,
+        )
+        terminated = self.service.events("run-1")[-1]
+        self.assertEqual({"reason": "retries_exhausted", "node_id": "fetch"}, terminated["payload"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+
+    def test_terminated_execution_does_not_absorb_output(self):
+        self.service.advance("run-1", {"failure": {"reason": "x"}}, "a1")
+        self.service.advance("run-1", {"failure": {"reason": "x"}}, "a2")
+        state = self.service.advance("run-1", {"failure": {"reason": "x"}}, "a3")
+        again = self.service.advance("run-1", {"output": {"late": True}}, "a4")
+        self.assertEqual(state, again)
+        self.assertEqual({}, again["outputs"])
+        self.assertEqual(7, len(self.service.events("run-1")))
+
+    def test_restart_continues_unfinished_retries(self):
+        self.service.advance("run-1", {"failure": {"reason": "boom"}}, "a1")
+        resumed = ChronicleFlow(self.database)
+        state = resumed.advance("run-1", {"output": {"page": 1}}, "a2")
+        self.assertEqual(["fetch"], state["completed_nodes"])
+        self.assertEqual({"fetch": {"attempt": 2, "failures": 1}}, state["attempts"])
+        state = resumed.advance("run-1", {"output": {"done": True}}, "a3")
+        self.assertEqual("completed", state["status"])
+        self.assertEqual({"consistent": True, "execution": state}, resumed.replay("run-1"))
+
+    def test_zero_retries_is_the_default_and_fails_permanently(self):
+        workflow = {
+            "id": "once",
+            "nodes": [{"id": "only", "kind": "task", "depends_on": []}],
+        }
+        self.service.create_workflow(workflow, "w-once")
+        self.service.create_execution({"id": "run-once", "workflow_id": "once", "input": {}}, "e-once")
+        state = self.service.advance("run-once", {"failure": {"reason": "nope"}}, "a-once")
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("retries_exhausted", state["termination_reason"])
+        self.assertEqual(["only"], state["failed_nodes"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-once"))
+
+    def test_retry_definition_is_round_tripped(self):
+        document = dict(self.workflow, id="flaky-copy")
+        stored = self.service.create_workflow(document, "w-copy")
+        self.assertEqual(document, stored)
+
+    def test_invalid_retries_are_rejected(self):
+        for index, retries in enumerate((-1, 11, 1.5, "2", True)):
+            with self.subTest(retries=retries):
+                with self.assertRaises(ValidationError):
+                    self.service.create_workflow(
+                        {"id": f"bad-retry-{index}", "nodes": [{"id": "a", "kind": "task", "depends_on": [], "retries": retries}]},
+                        f"w-bad-retry-{index}",
+                    )
+
+    def test_invalid_failure_bodies_are_rejected(self):
+        for body in ({"failure": {"note": "x"}}, {"failure": "x"}, {"failure": {"reason": 1}}, {"output": {}, "failure": {"reason": "x"}}):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.advance("run-1", body, "a-bad")
+
+
+class TimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = ChronicleFlow(str(Path(self.directory.name) / "test.db"))
+        self.service.create_workflow(
+            {"id": "slow", "nodes": [{"id": "work", "kind": "task", "depends_on": []}]},
+            "w1",
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_timeout_terminates_execution_and_rejects_output(self):
+        self.service.create_execution(
+            {"id": "run-1", "workflow_id": "slow", "input": {}, "timeout_seconds": 0.05},
+            "e1",
+        )
+        time.sleep(0.1)
+        state = self.service.advance("run-1", {"output": {"late": True}}, "a1")
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("timeout", state["termination_reason"])
+        self.assertEqual({}, state["outputs"])
+        self.assertEqual([], state["completed_nodes"])
+        event_types = [event["type"] for event in self.service.events("run-1")]
+        self.assertEqual(["execution_started", "execution_terminated"], event_types)
+        self.assertEqual({"reason": "timeout"}, self.service.events("run-1")[-1]["payload"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+
+    def test_execution_without_timeout_is_unaffected(self):
+        created = self.service.create_execution({"id": "run-2", "workflow_id": "slow", "input": {}}, "e2")
+        self.assertIsNone(created["timeout_seconds"])
+        self.assertIsNone(created["deadline_at"])
+        state = self.service.advance("run-2", {"output": {"ok": 1}}, "a2")
+        self.assertEqual("completed", state["status"])
+        self.assertIsNone(state["termination_reason"])
+
+    def test_invalid_timeouts_are_rejected(self):
+        for index, timeout in enumerate((0, -1, -0.5, "5", True)):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValidationError):
+                    self.service.create_execution(
+                        {"id": f"run-bad-{index}", "workflow_id": "slow", "input": {}, "timeout_seconds": timeout},
+                        f"e-bad-{index}",
+                    )
+
+
+class CancelTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = ChronicleFlow(str(Path(self.directory.name) / "test.db"))
+        self.service.create_workflow(
+            {"id": "plain", "nodes": [{"id": "work", "kind": "task", "depends_on": []}]},
+            "w1",
+        )
+        self.service.create_execution({"id": "run-1", "workflow_id": "plain", "input": {}}, "e1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_cancel_terminates_running_execution(self):
+        state = self.service.cancel("run-1", "c1")
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("cancelled", state["termination_reason"])
+        event_types = [event["type"] for event in self.service.events("run-1")]
+        self.assertEqual(["execution_started", "execution_terminated"], event_types)
+        self.assertEqual({"reason": "cancelled"}, self.service.events("run-1")[-1]["payload"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+        again = self.service.advance("run-1", {"output": {"late": 1}}, "a1")
+        self.assertEqual(state, again)
+        self.assertEqual({}, again["outputs"])
+
+    def test_cancel_is_idempotent_and_returns_same_state_for_terminated(self):
+        first = self.service.cancel("run-1", "c1")
+        repeated = self.service.cancel("run-1", "c1")
+        self.assertEqual(first, repeated)
+        other_key = self.service.cancel("run-1", "c2")
+        self.assertEqual(first, other_key)
+        self.assertEqual(2, len(self.service.events("run-1")))
+
+    def test_cancel_completed_execution_returns_it_unchanged(self):
+        self.service.advance("run-1", {"output": {"ok": 1}}, "a1")
+        state = self.service.cancel("run-1", "c1")
+        self.assertEqual("completed", state["status"])
+        self.assertIsNone(state["termination_reason"])
+        self.assertEqual("node_completed", self.service.events("run-1")[-2]["type"])
+        self.assertEqual("execution_completed", self.service.events("run-1")[-1]["type"])
+
+    def test_cancel_missing_execution_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.cancel("ghost", "c-ghost")
+
+    def test_cancel_key_cannot_be_reused_for_another_operation(self):
+        self.service.cancel("run-1", "shared-cancel")
+        with self.assertRaises(ConflictError):
+            self.service.advance("run-1", {"output": {}}, "shared-cancel")
+
+
+class LoopRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = ChronicleFlow(str(Path(self.directory.name) / "test.db"))
+        self.workflow = {
+            "id": "loop-retry",
+            "nodes": [
+                {"id": "check", "kind": "condition", "depends_on": [], "path": "again", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["check"], "retries": 1},
+                {
+                    "id": "loop",
+                    "kind": "loop",
+                    "depends_on": [],
+                    "entry": "attempt",
+                    "condition": "check",
+                    "max_iterations": 2,
+                },
+            ],
+        }
+        self.service.create_workflow(self.workflow, "w1")
+        self.service.create_execution({"id": "run-1", "workflow_id": "loop-retry", "input": {"again": True}}, "e1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_failure_inside_loop_retries_within_iteration(self):
+        state = self.service.advance("run-1", {"failure": {"reason": "flaky"}}, "a1")
+        self.assertEqual("running", state["status"])
+        iteration = state["loops"]["loop"]["iterations"][0]
+        self.assertEqual({"attempt": {"attempt": 2, "failures": 1}}, iteration["attempts"])
+        self.assertNotIn("attempt", iteration["completed_nodes"])
+        state = self.service.advance("run-1", {"output": {"try": 1}}, "a2")
+        iteration = state["loops"]["loop"]["iterations"][0]
+        self.assertEqual({"attempt": {"try": 1}}, iteration["outputs"])
+        failed = next(event for event in self.service.events("run-1") if event["type"] == "node_failed")
+        self.assertEqual({"node_id": "attempt", "attempt": 1, "reason": "flaky", "loop_id": "loop", "iteration": 1}, failed["payload"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+
+    def test_exhausted_retries_inside_loop_terminate_execution(self):
+        workflow = {
+            "id": "loop-fatal",
+            "nodes": [
+                {"id": "check", "kind": "condition", "depends_on": [], "path": "again", "equals": True},
+                {"id": "attempt", "kind": "task", "depends_on": ["check"]},
+                {
+                    "id": "loop",
+                    "kind": "loop",
+                    "depends_on": [],
+                    "entry": "attempt",
+                    "condition": "check",
+                    "max_iterations": 2,
+                },
+            ],
+        }
+        self.service.create_workflow(workflow, "w-fatal")
+        self.service.create_execution({"id": "run-fatal", "workflow_id": "loop-fatal", "input": {"again": True}}, "e-fatal")
+        state = self.service.advance("run-fatal", {"failure": {"reason": "dead"}}, "a-fatal")
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("retries_exhausted", state["termination_reason"])
+        self.assertEqual(["attempt"], state["failed_nodes"])
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-fatal"))
 
 
 if __name__ == "__main__":

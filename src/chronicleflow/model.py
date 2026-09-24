@@ -7,6 +7,7 @@ from typing import Any
 from .errors import ValidationError
 
 MAX_LOOP_ITERATIONS = 100
+MAX_RETRIES = 10
 
 
 def _identifier(value: Any, field: str) -> str:
@@ -67,6 +68,7 @@ class Node:
     path: str | None = None
     equals: Any = None
     run_if: RunIf | None = None
+    retries: int | None = None
     entry: str | None = None
     condition: str | None = None
     max_iterations: int | None = None
@@ -89,10 +91,16 @@ class Node:
             raise ValidationError("depends_on must not contain duplicates")
         depends_on = tuple(dependencies)
         if kind == "task":
-            if not set(raw) - base <= {"run_if"}:
-                raise ValidationError("task nodes may only contain id, kind, depends_on, and run_if")
+            if not set(raw) - base <= {"run_if", "retries"}:
+                raise ValidationError("task nodes may only contain id, kind, depends_on, run_if, and retries")
             run_if = RunIf.parse(raw["run_if"]) if "run_if" in raw else None
-            return cls(node_id, "task", depends_on, run_if=run_if)
+            retries = raw.get("retries")
+            if retries is not None:
+                if isinstance(retries, bool) or not isinstance(retries, int):
+                    raise ValidationError("retries must be an integer")
+                if not 0 <= retries <= MAX_RETRIES:
+                    raise ValidationError(f"retries must be between 0 and {MAX_RETRIES}")
+            return cls(node_id, "task", depends_on, run_if=run_if, retries=retries)
         if kind == "loop":
             if set(raw) != base | {"entry", "condition", "max_iterations"}:
                 raise ValidationError("loop nodes must contain exactly id, kind, depends_on, entry, condition, and max_iterations")
@@ -128,8 +136,11 @@ class Node:
             document["entry"] = self.entry
             document["condition"] = self.condition
             document["max_iterations"] = self.max_iterations
-        elif self.run_if is not None:
-            document["run_if"] = self.run_if.as_dict()
+        else:
+            if self.run_if is not None:
+                document["run_if"] = self.run_if.as_dict()
+            if self.retries is not None:
+                document["retries"] = self.retries
         return document
 
 

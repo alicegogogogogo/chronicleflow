@@ -69,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"events": self.service.events(parts[1])}
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
+            return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "replay" and self.command == "POST":
             return 200, self.service.replay(parts[1])
         raise NotFoundError("route was not found")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -29,7 +31,7 @@ def _evaluate_condition(node: Node, input_data: Any) -> bool:
 
 
 def _new_iteration() -> dict[str, Any]:
-    return {"completed_nodes": [], "skipped_nodes": [], "condition_results": {}, "outputs": {}}
+    return {"completed_nodes": [], "skipped_nodes": [], "condition_results": {}, "outputs": {}, "attempts": {}}
 
 
 def _new_loop_state() -> dict[str, Any]:
@@ -74,13 +76,19 @@ class ChronicleFlow:
         return self._idempotent(key, f"create-workflow:{workflow.id}", create)
 
     def create_execution(self, raw: Any, key: str | None) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) != {"id", "workflow_id", "input"}:
-            raise ValidationError("execution must contain exactly id, workflow_id, and input")
+        if not isinstance(raw, dict) or set(raw) not in ({"id", "workflow_id", "input"}, {"id", "workflow_id", "input", "timeout_seconds"}):
+            raise ValidationError("execution must contain exactly id, workflow_id, input, and optionally timeout_seconds")
         execution_id = _identifier(raw["id"], "execution id")
         workflow_id = _identifier(raw["workflow_id"], "workflow id")
         if not isinstance(raw["input"], dict):
             raise ValidationError("input must be an object")
         _finite_json(raw["input"], "input")
+        timeout = raw.get("timeout_seconds")
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise ValidationError("timeout_seconds must be a positive number of seconds")
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValidationError("timeout_seconds must be a positive number of seconds")
 
         def create() -> dict[str, Any]:
             workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
@@ -88,15 +96,21 @@ class ChronicleFlow:
                 raise NotFoundError(f"workflow {workflow_id} was not found")
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
             loops = {node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"}
+            deadline = time.time() + timeout if timeout is not None else None
             state = {
                 "id": execution_id,
                 "workflow_id": workflow_id,
                 "status": "running",
+                "termination_reason": None,
+                "timeout_seconds": timeout,
+                "deadline_at": deadline,
                 "input": raw["input"],
                 "completed_nodes": [],
                 "skipped_nodes": [],
+                "failed_nodes": [],
                 "condition_results": {},
                 "outputs": {},
+                "attempts": {},
                 "loops": loops,
             }
             try:
@@ -108,7 +122,17 @@ class ChronicleFlow:
                 if "UNIQUE constraint" in str(error):
                     raise ConflictError(f"execution {execution_id} already exists") from error
                 raise
-            self._append(execution_id, "execution_started", {"workflow_id": workflow_id, "input": raw["input"], "loops": loops})
+            self._append(
+                execution_id,
+                "execution_started",
+                {
+                    "workflow_id": workflow_id,
+                    "input": raw["input"],
+                    "loops": loops,
+                    "timeout_seconds": timeout,
+                    "deadline_at": deadline,
+                },
+            )
             return state
 
         return self._idempotent(key, f"create-execution:{execution_id}", create)
@@ -117,7 +141,23 @@ class ChronicleFlow:
         row = self.store.connection.execute("SELECT state FROM executions WHERE id = ?", (execution_id,)).fetchone()
         if not row:
             raise NotFoundError(f"execution {execution_id} was not found")
-        return self.store.decode(row["state"])
+        state = self.store.decode(row["state"])
+        self._maybe_timeout(execution_id, state)
+        return state
+
+    def _maybe_timeout(self, execution_id: str, state: dict[str, Any]) -> None:
+        deadline = state.get("deadline_at")
+        if state["status"] == "running" and deadline is not None and time.time() >= deadline:
+            self._terminate(execution_id, state, "timeout")
+            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+
+    def _terminate(self, execution_id: str, state: dict[str, Any], reason: str, extra: dict[str, Any] | None = None) -> None:
+        state["status"] = "terminated"
+        state["termination_reason"] = reason
+        payload = {"reason": reason}
+        if extra:
+            payload.update(extra)
+        self._append(execution_id, "execution_terminated", payload)
 
     def events(self, execution_id: str) -> list[dict[str, Any]]:
         self.get_execution(execution_id)
@@ -131,9 +171,16 @@ class ChronicleFlow:
         ]
 
     def advance(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) != {"output"} or not isinstance(raw["output"], dict):
-            raise ValidationError("advance body must contain exactly an output object")
-        _finite_json(raw["output"], "output")
+        if not isinstance(raw, dict) or set(raw) not in ({"output"}, {"failure"}):
+            raise ValidationError("advance body must contain exactly an output object or a failure object")
+        if "output" in raw:
+            if not isinstance(raw["output"], dict):
+                raise ValidationError("advance output must be an object")
+            _finite_json(raw["output"], "output")
+        else:
+            failure = raw["failure"]
+            if not isinstance(failure, dict) or set(failure) != {"reason"} or not isinstance(failure["reason"], str):
+                raise ValidationError("advance failure must contain exactly a reason string")
 
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id)
@@ -147,26 +194,56 @@ class ChronicleFlow:
                 if not ready:
                     raise ConflictError("execution has no ready node")
                 node_id = ready[0]
-                loop_id = self._active_loop(workflow, state, node_id)
-                if loop_id is None:
-                    state["completed_nodes"].append(node_id)
-                    state["outputs"][node_id] = raw["output"]
-                    self._append(execution_id, "node_completed", {"node_id": node_id, "output": raw["output"]})
+                if "failure" in raw:
+                    self._fail_node(execution_id, workflow, state, node_id, raw["failure"]["reason"])
                 else:
-                    loop_state = state["loops"][loop_id]
-                    iteration = loop_state["iterations"][-1]
-                    iteration["completed_nodes"].append(node_id)
-                    iteration["outputs"][node_id] = raw["output"]
-                    self._append(
-                        execution_id,
-                        "node_completed",
-                        {"node_id": node_id, "output": raw["output"], "loop_id": loop_id, "iteration": loop_state["current_iteration"]},
-                    )
-                self._auto_process(execution_id, workflow, state)
+                    self._complete_node(execution_id, workflow, state, node_id, raw["output"])
+                if state["status"] == "running":
+                    self._auto_process(execution_id, workflow, state)
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
             return state
 
         return self._idempotent(key, f"advance:{execution_id}", apply)
+
+    def cancel(self, execution_id: str, key: str | None) -> dict[str, Any]:
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id)
+            if state["status"] != "running":
+                return state
+            self._terminate(execution_id, state, "cancelled")
+            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+            return state
+
+        return self._idempotent(key, f"cancel:{execution_id}", apply)
+
+    def _node_container(self, workflow: Workflow, state: dict[str, Any], node_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return the state fragment holding the node's progress and its event context."""
+        loop_id = self._active_loop(workflow, state, node_id)
+        if loop_id is None:
+            return state, {}
+        loop_state = state["loops"][loop_id]
+        return loop_state["iterations"][-1], {"loop_id": loop_id, "iteration": loop_state["current_iteration"]}
+
+    def _complete_node(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, output: Any) -> None:
+        container, context = self._node_container(workflow, state, node_id)
+        container["completed_nodes"].append(node_id)
+        container["outputs"][node_id] = output
+        container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
+        self._append(execution_id, "node_completed", {"node_id": node_id, "output": output, **context})
+
+    def _fail_node(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, reason: str) -> None:
+        by_id = {node.id: node for node in workflow.nodes}
+        retries = by_id[node_id].retries or 0
+        container, context = self._node_container(workflow, state, node_id)
+        entry = container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
+        entry["failures"] += 1
+        self._append(execution_id, "node_failed", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context})
+        if entry["failures"] <= retries:
+            entry["attempt"] += 1
+            self._append(execution_id, "node_retried", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context})
+        else:
+            state["failed_nodes"].append(node_id)
+            self._terminate(execution_id, state, "retries_exhausted", {"node_id": node_id})
 
     def _ready_tasks(self, workflow: Workflow, state: dict[str, Any]) -> list[str]:
         bodies = workflow.loop_bodies()
@@ -327,11 +404,16 @@ class ChronicleFlow:
                     "id": execution_id,
                     "workflow_id": payload["workflow_id"],
                     "status": "running",
+                    "termination_reason": None,
+                    "timeout_seconds": payload.get("timeout_seconds"),
+                    "deadline_at": payload.get("deadline_at"),
                     "input": payload["input"],
                     "completed_nodes": [],
                     "skipped_nodes": [],
+                    "failed_nodes": [],
                     "condition_results": {},
                     "outputs": {},
+                    "attempts": {},
                     "loops": {loop_id: _new_loop_state() for loop_id in payload.get("loops", {})},
                 }
             elif event_type == "condition_evaluated" and rebuilt is not None:
@@ -354,9 +436,27 @@ class ChronicleFlow:
                     iteration = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
                     iteration["completed_nodes"].append(node_id)
                     iteration["outputs"][node_id] = payload["output"]
+                    iteration["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
                 else:
                     rebuilt["completed_nodes"].append(node_id)
                     rebuilt["outputs"][node_id] = payload["output"]
+                    rebuilt["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
+            elif event_type == "node_failed" and rebuilt is not None:
+                node_id = payload["node_id"]
+                if "loop_id" in payload:
+                    container = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
+                else:
+                    container = rebuilt
+                entry = container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
+                entry["attempt"] = payload["attempt"]
+                entry["failures"] += 1
+            elif event_type == "node_retried" and rebuilt is not None:
+                node_id = payload["node_id"]
+                if "loop_id" in payload:
+                    container = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
+                else:
+                    container = rebuilt
+                container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})["attempt"] = payload["attempt"]
             elif event_type == "iteration_started" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 loop_state["status"] = "running"
@@ -369,6 +469,11 @@ class ChronicleFlow:
                 rebuilt["completed_nodes"].append(payload["loop_id"])
             elif event_type == "execution_completed" and rebuilt is not None:
                 rebuilt["status"] = "completed"
+            elif event_type == "execution_terminated" and rebuilt is not None:
+                rebuilt["status"] = "terminated"
+                rebuilt["termination_reason"] = payload["reason"]
+                if payload["reason"] == "retries_exhausted" and "node_id" in payload:
+                    rebuilt["failed_nodes"].append(payload["node_id"])
         if rebuilt is None:
             raise ConflictError("execution event stream has no start event")
         return {"consistent": rebuilt == stored, "execution": rebuilt}

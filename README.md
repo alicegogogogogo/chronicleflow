@@ -10,6 +10,11 @@ The initial release intentionally supports a compact public contract:
   `loop` nodes;
 - executions advance one ready task at a time, evaluating conditions and
   skipping unmatched branches automatically;
+- task nodes may declare a bounded number of retries: a submitted failure
+  re-queues the node until the retries are exhausted, which terminates the
+  execution;
+- executions may declare a timeout in seconds, after which they terminate and
+  no longer accept output, and they may be cancelled explicitly;
 - loop nodes repeat their body a bounded number of times, re-evaluating a
   continue condition at the loop boundaries;
 - every state transition is appended to the execution event stream;
@@ -83,6 +88,19 @@ task's `depends_on`. When the condition's result differs from `expected`, the
 task is marked as skipped: it receives no output and still satisfies the
 dependencies of its successors.
 
+A task may declare how many times it is retried after a failure:
+
+```json
+{"id": "charge", "kind": "task", "depends_on": ["reserve"], "retries": 3}
+```
+
+`retries` is an integer between 0 and 10 and defaults to 0, meaning the task
+is attempted only once. Each failure submitted through `advance` consumes one
+attempt; while retries remain, the task returns to the ready set and is
+advanced again. When a failure arrives with no retries left, the task is
+permanently failed and the whole execution terminates with termination reason
+`retries_exhausted`.
+
 A node may also have `kind` set to `loop`, describing a bounded repeated
 segment:
 
@@ -133,6 +151,17 @@ Idempotency-Key: execution-request-1
 
 Returns HTTP 201. The execution starts in `running` state.
 
+An execution may declare a timeout:
+
+```json
+{"id":"run-2","workflow_id":"order-flow","input":{},"timeout_seconds":30}
+```
+
+`timeout_seconds` is a positive number of seconds counted from the moment the
+execution starts. Once the deadline passes, the execution terminates with
+termination reason `timeout` and no longer accepts output. Executions without
+a timeout never expire.
+
 ### Inspect an execution
 
 ```http
@@ -159,10 +188,47 @@ automatic processing finishes the execution, the current state is returned and
 the submitted output is not consumed. When every node is completed or skipped,
 the status becomes `completed`.
 
+Instead of an output, a failure can be submitted for the same ready task:
+
+```http
+POST /executions/run-1/advance
+Idempotency-Key: advance-request-2
+
+{"failure":{"reason":"gateway timeout"}}
+```
+
+The body must contain exactly one of `output` or `failure`, and `failure`
+carries exactly a `reason` string. A failed task appends a `node_failed`
+event recording the attempt number and reason. While the task has retries
+left it returns to the ready set and a `node_retried` event records the next
+attempt number; otherwise the task is permanently failed and the execution
+terminates with reason `retries_exhausted`. The same rules apply to tasks
+inside loop bodies, which are retried within their current iteration.
+
 Execution state includes `completed_nodes` (which also lists evaluated
-conditions), `skipped_nodes`, `condition_results`, and `outputs`. Each
-condition evaluation appends a `condition_evaluated` event and each skip a
-`node_skipped` event to the execution stream.
+conditions), `skipped_nodes`, `failed_nodes`, `condition_results`, `outputs`,
+and `attempts`. `attempts` maps each attempted task to its current `attempt`
+number and its `failures` count; loop body tasks track the same per iteration.
+Each condition evaluation appends a `condition_evaluated` event and each skip
+a `node_skipped` event to the execution stream.
+
+### Cancel an execution
+
+```http
+POST /executions/run-1/cancel
+Idempotency-Key: cancel-request-1
+```
+
+A running execution is terminated immediately with termination reason
+`cancelled`. Cancelling a completed or already terminated execution returns
+its state unchanged, and cancelling a missing execution returns 404.
+
+Execution status is `running`, `completed`, or `terminated`. A terminated
+execution records exactly one `termination_reason` — `retries_exhausted`,
+`timeout`, or `cancelled` — and appends a single `execution_terminated`
+event; completed executions keep a `null` termination reason and their own
+`execution_completed` event. Advancing a terminated execution returns its
+state unchanged without consuming the submitted output or failure.
 
 ### Replay
 
@@ -183,9 +249,12 @@ Errors use this shape:
 ```
 
 Validation errors return 400, missing resources return 404, and conflicts
-return 409. Request bodies must not contain non-finite numbers (`NaN`,
-`Infinity`, or overflowing values such as `1e400`); they are rejected with
-400. Finite floats keep their full precision, including negative zero
+return 409. A `retries` value that is negative, non-integer, or greater than
+10, and a non-positive `timeout_seconds`, are validation errors. Reusing a
+workflow or execution identifier, or reusing an idempotency key across
+different operations, is a conflict. Request bodies must not contain
+non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
+they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.
 
 ## Tests
