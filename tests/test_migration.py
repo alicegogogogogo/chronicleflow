@@ -119,10 +119,16 @@ class MigrationServiceTests(unittest.TestCase):
         self.service.advance("run-done", {"output": {}}, "d2")
         with self.assertRaises(ConflictError):
             self.service.migrate("run-done", {"version": "v2"}, "mig-done")
+        # Even when the target is the version the execution is already bound
+        # to, a finished execution conflicts rather than taking the no-op path.
+        with self.assertRaises(ConflictError):
+            self.service.migrate("run-done", {"version": "v1"}, "mig-done-same")
         self.start("run-term", "orders", version="v1", key="ex-run-term")
         self.service.cancel("run-term", "cancel-run-term")
         with self.assertRaises(ConflictError):
             self.service.migrate("run-term", {"version": "v2"}, "mig-term")
+        with self.assertRaises(ConflictError):
+            self.service.migrate("run-term", {"version": "v1"}, "mig-term-same")
         # Nothing was written.
         self.assertNotIn("version_migrated",
                          [event["type"] for event in self.service.events("run-done")])

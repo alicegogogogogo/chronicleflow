@@ -148,6 +148,73 @@ schedule is left unchanged — its cursor, `last_triggered_at`, and
 pass once capacity exists, under the usual per-period idempotence. Delivery
 history follows the tenant of the execution it belongs to.
 
+### Usage and billing
+
+Four kinds of tenant action are metered, and each genuinely performed action
+leaves one usage record:
+
+- `workflow_created` — creating a workflow definition; appending a new
+  workflow version counts as one workflow creation;
+- `execution_started` — starting an execution; an execution created by a
+  schedule firing counts as one execution start;
+- `schedule_triggered` — a schedule firing that creates an execution for a due
+  period;
+- `delivery_attempted` — one webhook delivery, counted once whether it is
+  ultimately delivered or failed (its bounded retries are the attempts within
+  that single delivery, not separate usage).
+
+A schedule-created execution therefore records both one `execution_started`
+and one `schedule_triggered`. Usage is recorded only for requests carrying a
+tenant: requests in the legacy namespace (no `X-Tenant-Id`) leave no usage
+records, with their behavior, state shapes, and event content unchanged. A
+write rejected by validation or by a quota leaves no record, a request
+replayed through an existing idempotency key returns the first result without
+metering again, and a repeated trigger for the same schedule period (or a
+period blocked by the execution quota) meters at most once. Replay and
+recovery never create usage, and recorded usage and bill conclusions never
+change because of them.
+
+```http
+GET /usage
+X-Tenant-Id: acme
+```
+
+Returns the cumulative count of each usage type:
+
+```json
+{"usage":[{"type":"delivery_attempted","count":2},{"type":"execution_started","count":3}]}
+```
+
+Entries are sorted ascending by the type identifier, and only types with at
+least one record are listed; a tenant with no usage gets the definite empty
+result `{"usage":[]}`. Both queries require a tenant — omitting
+`X-Tenant-Id` or sending an empty value is a `400 validation_error`.
+
+```http
+GET /bill
+X-Tenant-Id: acme
+```
+
+Returns the per-type count, unit price, and subtotal together with the total:
+
+```json
+{"bill":[{"type":"delivery_attempted","count":2,"unit_price":1,"subtotal":2},
+         {"type":"execution_started","count":3,"unit_price":2,"subtotal":6}],"total":8}
+```
+
+All amounts are integer cents. Each `subtotal` is the entry's `count` times
+its positive-integer `unit_price` (the price is always given in the response),
+and `total` is the sum of every subtotal. Entries use the same ascending type
+order as `/usage`; a tenant with no usage gets `{"bill":[],"total":0}`. The
+fixed unit prices are:
+
+| type | unit price (cents) |
+| --- | --- |
+| `workflow_created` | 1 |
+| `execution_started` | 2 |
+| `schedule_triggered` | 3 |
+| `delivery_attempted` | 1 |
+
 ### Health
 
 ```http
@@ -331,7 +398,13 @@ iteration. Once every body node is completed or skipped, the condition is
 evaluated again: `true` starts the next iteration, `false` ends the loop with
 `condition_false`, and reaching `max_iterations` ends it with
 `iteration_limit` after that iteration finishes. Ending the loop completes
-the loop node and releases the dependencies of its successors.
+the loop node and releases the dependencies of its successors. When it does,
+the execution-level `completed_nodes` list also includes the body nodes that
+completed across the rounds — each listed once, in a deterministic order,
+immediately before the loop node itself — while the per-iteration records keep
+their own `completed_nodes`. A body node that was only ever skipped is not
+added, and a loop that completes with zero iterations contributes only the
+loop node.
 
 Execution state exposes each loop under `loops`: `status`, the
 `current_iteration`, one entry per iteration with its own `completed_nodes`,
@@ -472,10 +545,12 @@ The response is the updated execution state. Migrating a `completed` or
 execution or a target version that does not exist for the workflow returns
 `404 not_found`; a cross-tenant reference is the same missing resource. A
 missing or mistyped `version`, an unknown field, or a non-finite number is a
-`400 validation_error`. Migrating to the version the execution is already
-bound to returns the current state as-is, appending no event and writing no
-checkpoint; reusing an idempotency key for another operation is a `409
-conflict`. The migration event is listed directly by the per-execution
+`400 validation_error`. While the execution is still running, migrating to
+the version it is already bound to returns the current state as-is, appending
+no event and writing no checkpoint; a `completed` or `terminated` execution
+cannot be migrated to any target — including the version it is already bound
+to — and answers `409 conflict`. Reusing an idempotency key for another
+operation is a `409 conflict`. The migration event is listed directly by the per-execution
 events query, and node outputs produced after the migration belong to the
 target version's definition. Approver-list validation, lease renewal, and
 delivery history keep their existing semantics before and after a migration.
@@ -930,9 +1005,10 @@ different operations (within the same tenant), is a conflict. Starting an
 execution against a missing workflow or a missing workflow version is a
 missing resource (`404 not_found`). Migrating an execution to a missing
 version is likewise a missing resource, while migrating a completed or
-terminated execution is a conflict; a malformed migration body is a
-validation error, and a migration to the version already bound is a
-state-returning no-op rather than an error.
+terminated execution is a conflict even when the target is the version it is
+already bound to; a malformed migration body is a validation error, and
+while an execution is still running a migration to the version already bound
+is a state-returning no-op rather than an error.
 Exceeding a tenant's declared workflow or execution quota is also a `409
 conflict`, with the word "quota" in the message so it can be distinguished
 from an identifier conflict; the rejected request writes nothing. Referencing

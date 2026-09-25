@@ -119,6 +119,13 @@ CREATE TABLE IF NOT EXISTS quotas (
   executions INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage_records (
+  tenant TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  usage_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, sequence)
+);
 """
 
 # Legacy (pre-tenancy) column layouts, used only when migrating an old file.
