@@ -61,6 +61,27 @@ class RunIf:
 
 
 @dataclass(frozen=True)
+class Approval:
+    approvers: tuple[str, ...]
+
+    @classmethod
+    def parse(cls, raw: Any) -> "Approval":
+        if not isinstance(raw, dict) or set(raw) != {"approvers"}:
+            raise ValidationError("approval must contain exactly approvers")
+        approvers = raw["approvers"]
+        if not isinstance(approvers, list) or not approvers:
+            raise ValidationError("approval approvers must be a non-empty array")
+        if any(not isinstance(item, str) for item in approvers):
+            raise ValidationError("approval approvers must be strings")
+        if len(approvers) != len(set(approvers)):
+            raise ValidationError("approval approvers must not contain duplicates")
+        return cls(tuple(approvers))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"approvers": list(self.approvers)}
+
+
+@dataclass(frozen=True)
 class Node:
     id: str
     kind: str
@@ -69,6 +90,7 @@ class Node:
     equals: Any = None
     run_if: RunIf | None = None
     retries: int | None = None
+    approval: Approval | None = None
     entry: str | None = None
     condition: str | None = None
     max_iterations: int | None = None
@@ -91,8 +113,8 @@ class Node:
             raise ValidationError("depends_on must not contain duplicates")
         depends_on = tuple(dependencies)
         if kind == "task":
-            if not set(raw) - base <= {"run_if", "retries"}:
-                raise ValidationError("task nodes may only contain id, kind, depends_on, run_if, and retries")
+            if not set(raw) - base <= {"run_if", "retries", "approval"}:
+                raise ValidationError("task nodes may only contain id, kind, depends_on, run_if, retries, and approval")
             run_if = RunIf.parse(raw["run_if"]) if "run_if" in raw else None
             retries = raw.get("retries")
             if retries is not None:
@@ -100,7 +122,8 @@ class Node:
                     raise ValidationError("retries must be an integer")
                 if not 0 <= retries <= MAX_RETRIES:
                     raise ValidationError(f"retries must be between 0 and {MAX_RETRIES}")
-            return cls(node_id, "task", depends_on, run_if=run_if, retries=retries)
+            approval = Approval.parse(raw["approval"]) if "approval" in raw else None
+            return cls(node_id, "task", depends_on, run_if=run_if, retries=retries, approval=approval)
         if kind == "loop":
             if set(raw) != base | {"entry", "condition", "max_iterations"}:
                 raise ValidationError("loop nodes must contain exactly id, kind, depends_on, entry, condition, and max_iterations")
@@ -141,6 +164,8 @@ class Node:
                 document["run_if"] = self.run_if.as_dict()
             if self.retries is not None:
                 document["retries"] = self.retries
+            if self.approval is not None:
+                document["approval"] = self.approval.as_dict()
         return document
 
 

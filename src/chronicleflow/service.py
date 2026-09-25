@@ -99,6 +99,7 @@ class ChronicleFlow:
                 raise NotFoundError(f"workflow {workflow_id} was not found")
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
             loops = {node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"}
+            has_approvals = any(node.approval is not None for node in workflow.nodes)
             deadline = time.time() + timeout if timeout is not None else None
             state = {
                 "id": execution_id,
@@ -116,6 +117,11 @@ class ChronicleFlow:
                 "attempts": {},
                 "loops": loops,
             }
+            # Approval state exists only for workflows that declare approval
+            # points, so every other execution keeps its baseline state shape.
+            if has_approvals:
+                state["waiting_approval"] = None
+                state["approvals"] = []
             try:
                 self.store.connection.execute(
                     "INSERT INTO executions(id, workflow_id, state) VALUES (?, ?, ?)",
@@ -125,16 +131,20 @@ class ChronicleFlow:
                 if "UNIQUE constraint" in str(error):
                     raise ConflictError(f"execution {execution_id} already exists") from error
                 raise
+            started_payload: dict[str, Any] = {
+                "workflow_id": workflow_id,
+                "input": raw["input"],
+                "loops": loops,
+                "timeout_seconds": timeout,
+                "deadline_at": deadline,
+            }
+            if has_approvals:
+                started_payload["waiting_approval"] = None
+                started_payload["approvals"] = []
             self._append(
                 execution_id,
                 "execution_started",
-                {
-                    "workflow_id": workflow_id,
-                    "input": raw["input"],
-                    "loops": loops,
-                    "timeout_seconds": timeout,
-                    "deadline_at": deadline,
-                },
+                started_payload,
             )
             return state
 
@@ -157,6 +167,11 @@ class ChronicleFlow:
     def _terminate(self, execution_id: str, state: dict[str, Any], reason: str, extra: dict[str, Any] | None = None) -> None:
         state["status"] = "terminated"
         state["termination_reason"] = reason
+        # A termination (rejection, timeout, or cancellation) dismisses any
+        # approval point the execution was parked at; its request event remains
+        # in the stream as the record of the wait.
+        if "waiting_approval" in state:
+            state["waiting_approval"] = None
         payload = {"reason": reason}
         if extra:
             payload.update(extra)
@@ -198,6 +213,12 @@ class ChronicleFlow:
             if state["status"] != "running":
                 return state
             self._assert_submission_allowed(execution_id, worker_id)
+            # Parked at an approval point: the decision operation is the only
+            # way forward, so an advance absorbs its output or failure and
+            # returns the current state unchanged. Lease ownership is still
+            # enforced, exactly as for any other running-execution submission.
+            if state.get("waiting_approval") is not None:
+                return state
             workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
             self._auto_process(execution_id, workflow, state)
@@ -206,19 +227,126 @@ class ChronicleFlow:
                 if not ready:
                     raise ConflictError("execution has no ready node")
                 node_id = ready[0]
-                if "failure" in raw:
+                node = next(node for node in workflow.nodes if node.id == node_id)
+                if node.approval is not None:
+                    self._request_approval(execution_id, workflow, state, node)
+                elif "failure" in raw:
                     self._fail_node(execution_id, workflow, state, node_id, raw["failure"]["reason"])
                 else:
                     self._complete_node(execution_id, workflow, state, node_id, raw["output"])
-                if state["status"] == "running":
+                if state["status"] == "running" and state.get("waiting_approval") is None:
                     self._auto_process(execution_id, workflow, state)
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
             # Every path from a running start that reaches here settled at least
-            # one node boundary, so checkpoint it in the same transaction.
+            # one node boundary (completed, failed, or parked at an approval),
+            # so checkpoint it in the same transaction.
             self._write_checkpoint(execution_id, state)
             return state
 
         return self._idempotent(key, f"advance:{execution_id}", apply)
+
+    def decision(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or not {"approver", "decision"} <= set(raw) <= {"approver", "decision", "output", "reason"}:
+            raise ValidationError("decision body must contain approver and decision, plus output or reason")
+        approver = raw["approver"]
+        if not isinstance(approver, str):
+            raise ValidationError("approver must be a string")
+        verdict = raw["decision"]
+        if verdict not in ("approved", "rejected"):
+            raise ValidationError("decision must be \"approved\" or \"rejected\"")
+        if verdict == "approved":
+            if set(raw) != {"approver", "decision", "output"}:
+                raise ValidationError("an approved decision must contain exactly approver, decision, and output")
+            if not isinstance(raw["output"], dict):
+                raise ValidationError("decision output must be an object")
+            _finite_json(raw["output"], "output")
+            output = raw["output"]
+            reason = None
+        else:
+            if set(raw) != {"approver", "decision", "reason"}:
+                raise ValidationError("a rejected decision must contain exactly approver, decision, and reason")
+            if not isinstance(raw["reason"], str):
+                raise ValidationError("decision reason must be a string")
+            output = None
+            reason = raw["reason"]
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id)
+            waiting = state.get("waiting_approval")
+            workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
+            workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+            if waiting is None:
+                # A duplicate of the decision that already resolved the most
+                # recent approval point returns that first result; it neither
+                # advances the node again nor appends another event. Any other
+                # decision against an execution with no pending point conflicts.
+                if self._is_repeated_decision(state, approver, verdict, output, reason):
+                    return state
+                raise ConflictError("execution has no pending approval decision")
+            if approver not in waiting["approvers"]:
+                raise ConflictError(f"approver {approver} is not allowed to decide this approval point")
+            node_id = waiting["node_id"]
+            context = self._approval_context(waiting)
+            state["waiting_approval"] = None
+            state["approvals"].append(
+                {"node_id": node_id, "approver": approver, "decision": verdict, "reason": reason, **context}
+            )
+            payload: dict[str, Any] = {"node_id": node_id, "approver": approver, "decision": verdict, **context}
+            if verdict == "rejected":
+                payload["reason"] = reason
+            self._append(execution_id, "approval_decided", payload)
+            if verdict == "approved":
+                self._complete_node(execution_id, workflow, state, node_id, output)
+                if state["status"] == "running":
+                    self._auto_process(execution_id, workflow, state)
+            else:
+                state["failed_nodes"].append(node_id)
+                self._terminate(execution_id, state, "rejected", {"node_id": node_id})
+            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+            # The decision settles the parked node boundary: completion on
+            # approval, permanent failure on rejection.
+            self._write_checkpoint(execution_id, state)
+            return state
+
+        return self._idempotent(key, f"decision:{execution_id}", apply)
+
+    @staticmethod
+    def _is_repeated_decision(
+        state: dict[str, Any], approver: str, verdict: str, output: Any, reason: str | None
+    ) -> bool:
+        records = state.get("approvals") or []
+        if not records:
+            return False
+        record = records[-1]
+        if record["approver"] != approver or record["decision"] != verdict:
+            return False
+        if verdict == "rejected":
+            return record["reason"] == reason
+        return ChronicleFlow._recorded_output(state, record) == output
+
+    @staticmethod
+    def _recorded_output(state: dict[str, Any], record: dict[str, Any]) -> Any:
+        if "loop_id" in record:
+            iteration = state["loops"][record["loop_id"]]["iterations"][record["iteration"] - 1]
+            return iteration["outputs"].get(record["node_id"])
+        return state["outputs"].get(record["node_id"])
+
+    @staticmethod
+    def _approval_context(waiting: dict[str, Any]) -> dict[str, Any]:
+        return {key: waiting[key] for key in ("loop_id", "iteration") if key in waiting}
+
+    def _request_approval(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node: Node) -> None:
+        waiting: dict[str, Any] = {"node_id": node.id, "approvers": list(node.approval.approvers)}
+        loop_id = self._active_loop(workflow, state, node.id)
+        if loop_id is not None:
+            waiting["loop_id"] = loop_id
+            waiting["iteration"] = state["loops"][loop_id]["current_iteration"]
+        state["waiting_approval"] = waiting
+        self._append(
+            execution_id,
+            "approval_requested",
+            {"node_id": node.id, "approvers": list(node.approval.approvers), **self._approval_context(waiting)},
+        )
 
     def cancel(self, execution_id: str, key: str | None) -> dict[str, Any]:
         def apply() -> dict[str, Any]:
@@ -587,6 +715,9 @@ class ChronicleFlow:
                     "attempts": {},
                     "loops": {loop_id: _new_loop_state() for loop_id in payload.get("loops", {})},
                 }
+                if "approvals" in payload:
+                    rebuilt["waiting_approval"] = payload.get("waiting_approval")
+                    rebuilt["approvals"] = []
             elif event_type == "condition_evaluated" and rebuilt is not None:
                 node_id = payload["node_id"]
                 if "loop_id" in payload:
@@ -638,12 +769,33 @@ class ChronicleFlow:
                 loop_state["status"] = "completed"
                 loop_state["end_reason"] = payload["reason"]
                 rebuilt["completed_nodes"].append(payload["loop_id"])
+            elif event_type == "approval_requested" and rebuilt is not None:
+                rebuilt["waiting_approval"] = {
+                    "node_id": payload["node_id"],
+                    "approvers": list(payload["approvers"]),
+                    **({"loop_id": payload["loop_id"], "iteration": payload["iteration"]} if "loop_id" in payload else {}),
+                }
+            elif event_type == "approval_decided" and rebuilt is not None:
+                verdict = payload["decision"]
+                record = {
+                    "node_id": payload["node_id"],
+                    "approver": payload["approver"],
+                    "decision": verdict,
+                    "reason": payload.get("reason"),
+                }
+                if "loop_id" in payload:
+                    record["loop_id"] = payload["loop_id"]
+                    record["iteration"] = payload["iteration"]
+                rebuilt["waiting_approval"] = None
+                rebuilt["approvals"].append(record)
             elif event_type == "execution_completed" and rebuilt is not None:
                 rebuilt["status"] = "completed"
             elif event_type == "execution_terminated" and rebuilt is not None:
                 rebuilt["status"] = "terminated"
                 rebuilt["termination_reason"] = payload["reason"]
-                if payload["reason"] == "retries_exhausted" and "node_id" in payload:
+                if "waiting_approval" in rebuilt:
+                    rebuilt["waiting_approval"] = None
+                if payload["reason"] in ("retries_exhausted", "rejected") and "node_id" in payload:
                     rebuilt["failed_nodes"].append(payload["node_id"])
         if rebuilt is None:
             raise ConflictError("execution event stream has no start event")

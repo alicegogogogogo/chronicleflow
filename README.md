@@ -13,6 +13,10 @@ The initial release intentionally supports a compact public contract:
 - task nodes may declare a bounded number of retries: a submitted failure
   re-queues the node until the retries are exhausted, which terminates the
   execution;
+- a task node may declare an approval point with the people allowed to decide
+  it; advancing parks the task in a waiting state until an approver approves
+  (completing it with the submitted output) or rejects (terminating the
+  execution with reason `rejected`);
 - executions may declare a timeout in seconds, after which they terminate and
   no longer accept output, and they may be cancelled explicitly;
 - loop nodes repeat their body a bounded number of times, re-evaluating a
@@ -107,6 +111,63 @@ attempt; while retries remain, the task returns to the ready set and is
 advanced again. When a failure arrives with no retries left, the task is
 permanently failed and the whole execution terminates with termination reason
 `retries_exhausted`.
+
+A task may instead declare an approval point:
+
+```json
+{"id": "charge", "kind": "task", "depends_on": ["reserve"], "approval": {"approvers": ["alice", "bob"]}}
+```
+
+`approval` contains exactly `approvers`, a non-empty array of approver
+identifier strings without duplicates; an empty list, a duplicate entry, or a
+non-string entry is a validation error, and only `task` nodes may carry an
+approval point. When an `advance` reaches a ready task with an approval point,
+the task does not complete and the submitted output or failure is not
+consumed: an `approval_requested` event is appended (recording the node, its
+approvers, and, inside a loop body, the loop id and iteration) and the
+execution stays `running`, parked in a waiting state returned under
+`waiting_approval`. Further `advance` calls return the current state without
+writing output, completing the node, or appending events; only a decision can
+move the task.
+
+### Submit an approval decision
+
+```http
+POST /executions/run-1/decision
+Idempotency-Key: decision-request-1
+
+{"approver":"alice","decision":"approved","output":{"charge_id":"c-3"}}
+```
+
+`decision` is either `approved` or `rejected`. An approved decision carries
+exactly `approver`, `decision`, and an `output` object; the task completes with
+that output and its successors become available in the usual way. A rejected
+decision carries exactly `approver`, `decision`, and a `reason` string; the
+task is permanently failed (it is listed under `failed_nodes`) and the
+execution terminates with termination reason `rejected`. Either decision
+appends an `approval_decided` event with the node, approver, decision, and (on
+rejection) the reason, and the approval record is kept under `approvals`. A
+request whose approver is not in the point's approver list is a 409
+`conflict`, and a malformed body or a decision value other than `approved` or
+`rejected` is a 400 `validation_error`; neither changes execution state.
+Repeating the decision that already resolved the most recent approval point —
+the same approver and decision with the same output or rejection reason —
+returns the first result and neither advances the node again nor appends
+another event; any other decision against an execution with no pending
+approval point is a 409 `conflict`, and deciding a missing execution returns
+404.
+
+While an execution is parked at an approval point it remains `running`, so a
+cancellation takes effect immediately with the usual `cancelled` termination
+reason, and a reached timeout terminates it with `timeout`; both dismiss the
+pending point and the execution then no longer accepts decisions or output.
+The waiting point, its request and decision events, and the termination
+reason are rebuilt solely from the event stream on replay, and the parked and
+decided node boundaries are checkpointed like every other boundary, so
+waiting points and recorded decisions remain valid after a restart. Approval
+state is added to an execution only when its workflow declares at least one
+approval point; workflows without approvals keep exactly the previous state
+shape and event stream.
 
 A node may also have `kind` set to `loop`, describing a bounded repeated
 segment:
@@ -238,8 +299,11 @@ Execution state includes `completed_nodes` (which also lists evaluated
 conditions), `skipped_nodes`, `failed_nodes`, `condition_results`, `outputs`,
 and `attempts`. `attempts` maps each attempted task to its current `attempt`
 number and its `failures` count; loop body tasks track the same per iteration.
-Each condition evaluation appends a `condition_evaluated` event and each skip
-a `node_skipped` event to the execution stream.
+Executions of workflows that declare approval points additionally expose
+`waiting_approval` (`null`, or the pending point's `node_id`, `approvers`, and
+loop context) and the `approvals` record list. Each condition evaluation
+appends a `condition_evaluated` event and each skip a `node_skipped` event to
+the execution stream.
 
 ### Cancel an execution
 
@@ -254,10 +318,12 @@ its state unchanged, and cancelling a missing execution returns 404.
 
 Execution status is `running`, `completed`, or `terminated`. A terminated
 execution records exactly one `termination_reason` — `retries_exhausted`,
-`timeout`, or `cancelled` — and appends a single `execution_terminated`
-event; completed executions keep a `null` termination reason and their own
-`execution_completed` event. Advancing a terminated execution returns its
-state unchanged without consuming the submitted output or failure.
+`rejected`, `timeout`, or `cancelled` — and appends a single
+`execution_terminated` event; completed executions keep a `null` termination
+reason and their own `execution_completed` event. Advancing a terminated
+execution returns its state unchanged without consuming the submitted output
+or failure; a decision against one only succeeds as a repeat of the decision
+that rejected it, and otherwise conflicts.
 
 ### Claim a work item
 
@@ -395,9 +461,15 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. A `retries` value that is negative, non-integer, or greater than
-10, and a non-positive `timeout_seconds`, are validation errors. Reusing a
-workflow or execution identifier, or reusing an idempotency key across
-different operations, is a conflict. Claiming a work item whose lease is
+10, and a non-positive `timeout_seconds`, are validation errors. An approval
+point with an empty approver list, a duplicate or non-string approver, an
+approval on a non-task node, and a decision body that is malformed or carries
+a decision other than `approved` or `rejected` are validation errors.
+Reusing a workflow or execution identifier, or reusing an idempotency key
+across different operations, is a conflict. A decision by an approver who is
+not listed for the pending point, or any decision against an execution that
+has no pending approval point (other than a repeat of the decision that
+resolved the latest one), is a conflict. Claiming a work item whose lease is
 still active, submitting results for a work item held by another worker or
 after the lease expired, and heartbeating or releasing a lease held by
 another worker are conflicts, while heartbeating or releasing an execution

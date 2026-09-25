@@ -414,5 +414,193 @@ class WorkerLeaseHttpTests(unittest.TestCase):
         self.assertEqual(409, status)
 
 
+class ApprovalHttpTests(unittest.TestCase):
+    @staticmethod
+    def _request(port, method, path, body=None, raw=None, key=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        payload = raw if raw is not None else (json.dumps(body) if body is not None else None)
+        headers = {"Content-Type": "application/json"}
+        if key is not None:
+            headers["Idempotency-Key"] = key
+        connection.request(method, path, payload, headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-approvals.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls._request(
+            cls.port,
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-approval",
+                "nodes": [
+                    {"id": "a", "kind": "task", "depends_on": []},
+                    {
+                        "id": "b",
+                        "kind": "task",
+                        "depends_on": ["a"],
+                        "approval": {"approvers": ["alice", "bob"]},
+                    },
+                ],
+            },
+            key="wf-approval",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, raw=None):
+        return self._request(self.port, method, path, body=body, raw=raw, key=key)
+
+    def park(self, execution_id, key_prefix):
+        self.call("POST", f"/executions/{execution_id}/advance", {"output": {}}, f"{key_prefix}-a1")
+        status, data = self.call("POST", f"/executions/{execution_id}/advance", {"output": {}}, f"{key_prefix}-a2")
+        self.assertEqual(200, status, data)
+        return json.loads(data)
+
+    def test_approve_and_reject_over_http(self):
+        self.call("POST", "/executions", {"id": "run-ok", "workflow_id": "wf-approval", "input": {}}, "ex-ok")
+        parked = self.park("run-ok", "ok")
+        self.assertEqual({"node_id": "b", "approvers": ["alice", "bob"]}, parked["waiting_approval"])
+        status, data = self.call(
+            "POST",
+            "/executions/run-ok/decision",
+            {"approver": "alice", "decision": "approved", "output": {"v": 1}},
+            "dec-ok",
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        state = json.loads(data)
+        self.assertEqual(["a", "b"], state["completed_nodes"])
+
+    def test_rejection_terminates(self):
+        self.call("POST", "/executions", {"id": "run-no", "workflow_id": "wf-approval", "input": {}}, "ex-no")
+        self.park("run-no", "no")
+        status, data = self.call(
+            "POST",
+            "/executions/run-no/decision",
+            {"approver": "bob", "decision": "rejected", "reason": "denied"},
+            "dec-no",
+        )
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("rejected", state["termination_reason"])
+
+    def test_non_approver_conflicts(self):
+        self.call("POST", "/executions", {"id": "run-who", "workflow_id": "wf-approval", "input": {}}, "ex-who")
+        self.park("run-who", "who")
+        status, data = self.call(
+            "POST",
+            "/executions/run-who/decision",
+            {"approver": "carol", "decision": "approved", "output": {}},
+            "dec-who",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_decision_without_waiting_point_conflicts(self):
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-plain-http", "nodes": [{"id": "x", "kind": "task", "depends_on": []}]},
+            "wf-plain-http",
+        )
+        self.call(
+            "POST",
+            "/executions",
+            {"id": "run-plain-http", "workflow_id": "wf-plain-http", "input": {}},
+            "ex-plain-http",
+        )
+        status, data = self.call(
+            "POST",
+            "/executions/run-plain-http/decision",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "dec-plain-http",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_missing_execution_decision_is_not_found(self):
+        status, data = self.call(
+            "POST",
+            "/executions/nope/decision",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "dec-nope",
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+
+    def test_invalid_decision_bodies_are_validation_errors(self):
+        self.call("POST", "/executions", {"id": "run-bad-dec", "workflow_id": "wf-approval", "input": {}}, "ex-bad-dec")
+        self.park("run-bad-dec", "baddec")
+        for index, raw in enumerate(
+            (
+                b"{}",
+                b'{"approver":"alice","decision":"maybe","output":{}}',
+                b'{"approver":"alice","decision":"approved"}',
+                b'{"approver":"alice","decision":"rejected"}',
+                b'{"approver":7,"decision":"approved","output":{}}',
+                b'{"approver":"alice","decision":"approved","output":[]}',
+            )
+        ):
+            status, data = self.call("POST", "/executions/run-bad-dec/decision", raw=raw, key=f"dec-bad-{index}")
+            self.assertEqual(400, status, raw)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_non_finite_decision_output_is_rejected(self):
+        self.call("POST", "/executions", {"id": "run-nan-dec", "workflow_id": "wf-approval", "input": {}}, "ex-nan-dec")
+        self.park("run-nan-dec", "nandec")
+        status, data = self.call(
+            "POST",
+            "/executions/run-nan-dec/decision",
+            raw=b'{"approver":"alice","decision":"approved","output":{"v":NaN}}',
+            key="dec-nan",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_decision_key_reused_across_operations_conflicts(self):
+        self.call("POST", "/executions", {"id": "run-key-dec", "workflow_id": "wf-approval", "input": {}}, "ex-key-dec")
+        self.park("run-key-dec", "keydec")
+        self.call(
+            "POST",
+            "/executions/run-key-dec/decision",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "shared-decision-key",
+        )
+        status, data = self.call(
+            "POST",
+            "/executions/run-key-dec/advance",
+            {"output": {}},
+            "shared-decision-key",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_invalid_approval_definition_is_rejected(self):
+        status, data = self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-bad-approval", "nodes": [{"id": "a", "kind": "task", "depends_on": [], "approval": {"approvers": []}}]},
+            key="wf-bad-approval",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+
 if __name__ == "__main__":
     unittest.main()
