@@ -8,6 +8,10 @@ The initial release intentionally supports a compact public contract:
 
 - workflows are directed acyclic graphs of `task`, `condition`, and bounded
   `loop` nodes;
+- a workflow may declare named versions: every declared version is kept and
+  each execution is bound to the version that was current (or explicitly
+  named) when it started, so upgrading a workflow never changes a running
+  execution;
 - executions advance one ready task at a time, evaluating conditions and
   skipping unmatched branches automatically;
 - task nodes may declare a bounded number of retries: a submitted failure
@@ -158,6 +162,11 @@ Idempotency-Key: workflow-request-1
 Returns HTTP 201 with the stored workflow. Node identifiers must be unique,
 dependencies must exist, and cycles are rejected.
 
+A workflow definition may carry an optional `version` tag; declaring one
+enables upgrades and keeps every version. Versioning is described under
+"Workflow versions" below, and a workflow's stored versions and current
+version are available through `GET /workflows/{id}`.
+
 A workflow may also declare webhook `subscriptions` alongside its nodes:
 
 ```json
@@ -169,7 +178,8 @@ A workflow may also declare webhook `subscriptions` alongside its nodes:
 ```
 
 See "Webhook notifications" below for the subscription shape and delivery
-semantics; the subscriptions apply to every execution of the workflow.
+semantics; the subscriptions apply to every execution of the workflow (for a
+versioned workflow, to executions bound to that version).
 
 A workflow may also declare a `schedule` alongside its nodes:
 
@@ -315,6 +325,91 @@ records `iteration_started`, `loop_condition_evaluated`, and `loop_completed`
 events alongside the usual per-node ones, so replay rebuilds loop state
 exactly.
 
+### Workflow versions
+
+A workflow can declare a version tag alongside its nodes:
+
+```json
+{
+  "id": "order-flow",
+  "version": "2026-09-25",
+  "nodes": [
+    {"id": "reserve", "kind": "task", "depends_on": []},
+    {"id": "ship", "kind": "task", "depends_on": ["reserve"]}
+  ]
+}
+```
+
+`version` is an optional non-empty string of at most 100 characters, validated
+like every other identifier. Posting it when the workflow does not yet exist
+creates the workflow with that version; posting another definition with a new
+`version` to the same `id` adds a new version without touching the previous
+ones — the workflow keeps its entire history, and every stored version remains
+usable. The most recently added version becomes the workflow's current
+version. Posting a definition without a `version` to an existing workflow
+still conflicts, and reusing a version tag already stored for the same
+workflow is a `409 conflict`; either rejection writes nothing.
+
+A version declaration may also carry `subscriptions` and a `schedule`,
+validated exactly like at creation. Subscriptions are attached to the
+declared version and apply only to executions bound to it; a version without
+subscriptions replaces none, and other versions' subscriptions stay intact.
+Declaring a `schedule` on an added version replaces the workflow's single
+schedule plan in the usual way (re-anchored, pause flag kept).
+
+An execution created without an explicit `version` binds to the workflow's
+current version at the moment it starts:
+
+```http
+POST /executions
+Idempotency-Key: execution-versioned
+
+{"id":"run-v2","workflow_id":"order-flow","input":{}}
+```
+
+An execution may instead name the version it wants:
+
+```json
+{"id":"run-v1","workflow_id":"order-flow","version":"2026-08-01","input":{}}
+```
+
+Naming a version that does not exist for the workflow is a missing-resource
+`404 not_found`, exactly like naming a workflow that does not exist; the
+execution is not created. Everything about an execution follows its bound
+version: ready-node selection, condition evaluation, loop rounds, approval
+points, retry counts, leases, and the subscriptions that fire for its events.
+Adding a new version never interrupts an execution already running: an
+execution started before the upgrade keeps advancing on its old version to
+completion or termination. Its checkpoints are snapshots of the same state,
+recovery rebuilds from the bound version, and replay rebuilds state and the
+version binding solely from its event stream; recorded events and historical
+conclusions never change.
+
+A versioned execution's state carries its `version` tag, and its
+`execution_started` event records the same tag; querying it therefore shows
+which version it is bound to. A workflow that never declares a version, and an
+execution of one, keep exactly the previous behavior, state shape, and event
+stream with no added field.
+
+The definition query lists every version and the current one:
+
+```http
+GET /workflows/order-flow
+```
+
+```json
+{"current_version":"2026-09-25","id":"order-flow","versions":[
+  {"id":"order-flow","nodes":[...],"version":"2026-08-01"},
+  {"id":"order-flow","nodes":[...],"version":"2026-09-25"}
+]}
+```
+
+Versions are returned in declaration order; each entry is the stored
+definition with its `version` tag. A workflow that never declared a version
+returns a single untagged entry and `current_version: null`. A missing
+workflow returns 404 `not_found`. Cross-tenant references are missing
+resources as usual.
+
 ### Start an execution
 
 ```http
@@ -324,7 +419,10 @@ Idempotency-Key: execution-request-1
 {"id":"run-1","workflow_id":"order-flow","input":{"order_id":"o-7"}}
 ```
 
-Returns HTTP 201. The execution starts in `running` state.
+Returns HTTP 201. The execution starts in `running` state. Without an
+explicit `version`, it binds to the workflow's current version at start time;
+naming a `version` binds to that one instead (and a missing version is a
+`404 not_found`). See "Workflow versions" for the binding and upgrade rules.
 
 An execution may declare a timeout:
 
@@ -735,8 +833,11 @@ Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
 declarations require a tenant and positive integer limits, validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
-Reusing a workflow or execution identifier, or reusing an idempotency key
-across different operations (within the same tenant), is a conflict.
+Reusing a workflow or execution identifier, adding a workflow version whose
+tag already exists for that workflow, or reusing an idempotency key across
+different operations (within the same tenant), is a conflict. Starting an
+execution against a missing workflow or a missing workflow version is a
+missing resource (`404 not_found`).
 Exceeding a tenant's declared workflow or execution quota is also a `409
 conflict`, with the word "quota" in the message so it can be distinguished
 from an identifier conflict; the rejected request writes nothing. Referencing

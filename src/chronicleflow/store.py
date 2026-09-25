@@ -16,13 +16,25 @@ CREATE TABLE IF NOT EXISTS workflows (
   tenant TEXT NOT NULL DEFAULT '',
   id TEXT NOT NULL,
   document TEXT NOT NULL,
+  current_version TEXT,
   PRIMARY KEY (tenant, id)
+);
+CREATE TABLE IF NOT EXISTS workflow_versions (
+  tenant TEXT NOT NULL DEFAULT '',
+  workflow_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, workflow_id, version),
+  FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
 );
 CREATE TABLE IF NOT EXISTS executions (
   tenant TEXT NOT NULL DEFAULT '',
   id TEXT NOT NULL,
   workflow_id TEXT NOT NULL,
   state TEXT NOT NULL,
+  workflow_version TEXT,
   PRIMARY KEY (tenant, id),
   FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
 );
@@ -67,9 +79,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   tenant TEXT NOT NULL DEFAULT '',
   owner_type TEXT NOT NULL,
   owner_id TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL,
   document TEXT NOT NULL,
-  PRIMARY KEY (tenant, owner_type, owner_id, position)
+  PRIMARY KEY (tenant, owner_type, owner_id, version, position)
 );
 CREATE TABLE IF NOT EXISTS deliveries (
   tenant TEXT NOT NULL DEFAULT '',
@@ -110,18 +123,26 @@ CREATE TABLE IF NOT EXISTS quotas (
 
 # Legacy (pre-tenancy) column layouts, used only when migrating an old file.
 LEGACY_COLUMNS = {
-    "workflows": "id, document",
-    "executions": "id, workflow_id, state",
+    "workflows": "id, document, NULL",
+    "executions": "id, workflow_id, state, NULL",
     "events": "execution_id, sequence, type, payload, occurred_at",
     "idempotency": "key, operation, response",
     "checkpoints": "execution_id, sequence, event_sequence, document, created_at",
     "leases": "execution_id, worker_id, lease_seconds, expires_at, heartbeat_at",
-    "subscriptions": "owner_type, owner_id, position, document",
+    "subscriptions": "owner_type, owner_id, '', position, document",
     "deliveries": "execution_id, sequence, document",
     "schedules": (
         "workflow_id, document, paused, anchor_at, cursor, last_triggered_at, last_execution_id"
     ),
     "schedule_triggers": "workflow_id, period_key, execution_id, triggered_at",
+}
+
+# Columns introduced after a table first existed; added additively so databases
+# created on the baseline schema keep working without a table rebuild.
+ADDED_COLUMNS = {
+    "workflows": ("current_version", "TEXT"),
+    "executions": ("workflow_version", "TEXT"),
+    "subscriptions": ("version", "TEXT NOT NULL DEFAULT ''"),
 }
 
 
@@ -135,7 +156,40 @@ class Store:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self._migrate_legacy_schema()
+        self._migrate_added_columns()
         self.connection.executescript(SCHEMA)
+        self._backfill_versions()
+        self._normalize_delivery_attempts()
+
+    def _normalize_delivery_attempts(self) -> None:
+        """Align persisted delivery attempts with the documented field set.
+
+        Older builds recorded an ``attempt`` number inside each entry of the
+        ``attempts`` list; the documented record carries only the try's
+        ``status_code`` or ``error``. Rewrite stored entries once so the
+        delivery history is consistent across upgrades.
+        """
+        rows = self.connection.execute("SELECT rowid, document FROM deliveries").fetchall()
+        for row in rows:
+            try:
+                document = json.loads(row["document"])
+            except ValueError:
+                continue
+            attempts = document.get("attempts")
+            if not isinstance(attempts, list):
+                continue
+            changed = False
+            for attempt in attempts:
+                if isinstance(attempt, dict) and attempt.pop("attempt", None) is not None:
+                    changed = True
+            if changed:
+                self.connection.execute(
+                    "UPDATE deliveries SET document = ? WHERE rowid = ?",
+                    (
+                        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                        row["rowid"],
+                    ),
+                )
 
     def _migrate_legacy_schema(self) -> None:
         """Rebuild tables created before tenancy, moving every row to the default namespace."""
@@ -172,6 +226,23 @@ class Store:
             self.connection.execute("COMMIT")
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_added_columns(self) -> None:
+        """Add columns introduced after a table first existed to an existing database."""
+        for table, (column, declaration) in ADDED_COLUMNS.items():
+            existing = [info["name"] for info in self.connection.execute(f'PRAGMA table_info("{table}")')]
+            if not existing or column in existing:
+                continue
+            self.connection.execute(f'ALTER TABLE "{table}" ADD COLUMN {column} {declaration}')
+
+    def _backfill_versions(self) -> None:
+        """Give workflows created before versioning an immutable unversioned revision."""
+        self.connection.execute(
+            "INSERT INTO workflow_versions(tenant, workflow_id, version, position, document, created_at) "
+            "SELECT w.tenant, w.id, '', 0, w.document, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "FROM workflows w WHERE NOT EXISTS ( "
+            "SELECT 1 FROM workflow_versions v WHERE v.tenant = w.tenant AND v.workflow_id = w.id)"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
