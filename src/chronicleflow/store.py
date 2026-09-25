@@ -21,70 +21,97 @@ class Store:
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS workflows (
-              id TEXT PRIMARY KEY,
-              document TEXT NOT NULL
+              tenant TEXT NOT NULL DEFAULT '',
+              id TEXT NOT NULL,
+              document TEXT NOT NULL,
+              PRIMARY KEY (tenant, id)
             );
             CREATE TABLE IF NOT EXISTS executions (
-              id TEXT PRIMARY KEY,
-              workflow_id TEXT NOT NULL REFERENCES workflows(id),
-              state TEXT NOT NULL
+              tenant TEXT NOT NULL DEFAULT '',
+              id TEXT NOT NULL,
+              workflow_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              PRIMARY KEY (tenant, id),
+              FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS events (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              execution_id TEXT NOT NULL,
               sequence INTEGER NOT NULL,
               type TEXT NOT NULL,
               payload TEXT NOT NULL,
               occurred_at TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
+              PRIMARY KEY (tenant, execution_id, sequence),
+              FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS idempotency (
-              key TEXT PRIMARY KEY,
+              tenant TEXT NOT NULL DEFAULT '',
+              key TEXT NOT NULL,
               operation TEXT NOT NULL,
-              response TEXT NOT NULL
+              response TEXT NOT NULL,
+              PRIMARY KEY (tenant, key)
             );
             CREATE TABLE IF NOT EXISTS checkpoints (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              execution_id TEXT NOT NULL,
               sequence INTEGER NOT NULL,
               event_sequence INTEGER NOT NULL,
               document TEXT NOT NULL,
               created_at TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
+              PRIMARY KEY (tenant, execution_id, sequence),
+              FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS leases (
-              execution_id TEXT PRIMARY KEY REFERENCES executions(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              execution_id TEXT NOT NULL,
               worker_id TEXT NOT NULL,
               lease_seconds REAL NOT NULL,
               expires_at REAL NOT NULL,
-              heartbeat_at REAL NOT NULL
+              heartbeat_at REAL NOT NULL,
+              PRIMARY KEY (tenant, execution_id),
+              FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS subscriptions (
+              tenant TEXT NOT NULL DEFAULT '',
               owner_type TEXT NOT NULL,
               owner_id TEXT NOT NULL,
               position INTEGER NOT NULL,
               document TEXT NOT NULL,
-              PRIMARY KEY (owner_type, owner_id, position)
+              PRIMARY KEY (tenant, owner_type, owner_id, position)
             );
             CREATE TABLE IF NOT EXISTS deliveries (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              execution_id TEXT NOT NULL,
               sequence INTEGER NOT NULL,
               document TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
+              PRIMARY KEY (tenant, execution_id, sequence),
+              FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS schedules (
-              workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              workflow_id TEXT NOT NULL,
               document TEXT NOT NULL,
               paused INTEGER NOT NULL DEFAULT 0,
               anchor_at REAL NOT NULL,
               cursor TEXT NOT NULL DEFAULT '',
               last_triggered_at TEXT,
-              last_execution_id TEXT
+              last_execution_id TEXT,
+              PRIMARY KEY (tenant, workflow_id),
+              FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
             );
             CREATE TABLE IF NOT EXISTS schedule_triggers (
-              workflow_id TEXT NOT NULL REFERENCES workflows(id),
+              tenant TEXT NOT NULL DEFAULT '',
+              workflow_id TEXT NOT NULL,
               period_key TEXT NOT NULL,
               execution_id TEXT NOT NULL,
               triggered_at TEXT NOT NULL,
-              PRIMARY KEY (workflow_id, period_key)
+              PRIMARY KEY (tenant, workflow_id, period_key),
+              FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
+            );
+            CREATE TABLE IF NOT EXISTS tenant_quotas (
+              tenant TEXT PRIMARY KEY,
+              max_workflows INTEGER NOT NULL,
+              max_executions INTEGER NOT NULL
             );
             """
         )

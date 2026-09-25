@@ -15,6 +15,10 @@ from .notify import NOTIFY_EVENT_TYPES, parse_subscriptions
 from .schedule import Cron, parse_schedule
 from .store import Store
 
+# Requests that declare no tenant live in the default namespace, identified
+# internally by the empty string; it behaves exactly as the baseline service.
+DEFAULT_TENANT = ""
+
 
 def _json_type(value: Any) -> str:
     if value is None:
@@ -71,19 +75,23 @@ class ChronicleFlow:
                 pass
             time.sleep(SCHEDULER_TICK_SECONDS)
 
-    def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def _idempotent(
+        self, key: str | None, tenant: str, operation: str, action: Callable[[], dict[str, Any]]
+    ) -> dict[str, Any]:
         if not key:
             raise ValidationError("Idempotency-Key header is required")
         with self.store.transaction() as connection:
-            existing = connection.execute("SELECT operation, response FROM idempotency WHERE key = ?", (key,)).fetchone()
+            existing = connection.execute(
+                "SELECT operation, response FROM idempotency WHERE tenant = ? AND key = ?", (tenant, key)
+            ).fetchone()
             if existing:
                 if existing["operation"] != operation:
                     raise ConflictError("idempotency key was already used for another operation")
                 return self.store.decode(existing["response"])
             response = action()
             connection.execute(
-                "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
-                (key, operation, self.store.encode(response)),
+                "INSERT INTO idempotency(tenant, key, operation, response) VALUES (?, ?, ?, ?)",
+                (tenant, key, operation, self.store.encode(response)),
             )
             return response
 
@@ -110,38 +118,50 @@ class ChronicleFlow:
                         except Exception:
                             pass
 
-    def _subscriptions_for(self, execution_id: str) -> list[tuple[str, dict[str, Any]]]:
+    def _subscriptions_for(self, tenant: str, execution_id: str) -> list[tuple[str, dict[str, Any]]]:
         """Return (label, subscription) pairs for an execution, workflow first."""
-        row = self.store.connection.execute("SELECT workflow_id FROM executions WHERE id = ?", (execution_id,)).fetchone()
+        row = self.store.connection.execute(
+            "SELECT workflow_id FROM executions WHERE tenant = ? AND id = ?", (tenant, execution_id)
+        ).fetchone()
         if not row:
             return []
         pairs: list[tuple[str, dict[str, Any]]] = []
         for owner_type, owner_id in (("workflow", row["workflow_id"]), ("execution", execution_id)):
             rows = self.store.connection.execute(
-                "SELECT position, document FROM subscriptions WHERE owner_type = ? AND owner_id = ? ORDER BY position",
-                (owner_type, owner_id),
+                "SELECT position, document FROM subscriptions WHERE tenant = ? AND owner_type = ? AND owner_id = ? "
+                "ORDER BY position",
+                (tenant, owner_type, owner_id),
             ).fetchall()
             for sub_row in rows:
                 pairs.append((f"{owner_type}:{sub_row['position']}", self.store.decode(sub_row["document"])))
         return pairs
 
     def _deliver_notice(self, notice: dict[str, Any]) -> None:
-        for label, subscription in self._subscriptions_for(notice["execution_id"]):
+        for label, subscription in self._subscriptions_for(notice["tenant"], notice["execution_id"]):
             if notice["type"] not in subscription["events"]:
                 continue
             # The idempotency key is deterministic per event and subscription:
             # retries of this delivery reuse it, other events never share it.
             key = f"{notice['execution_id']}:{notice['sequence']}:{label}"
             record = self._attempt_delivery(subscription, notice, key)
-            with self.store.transaction() as connection:
-                sequence_row = connection.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM deliveries WHERE execution_id = ?",
-                    (notice["execution_id"],),
-                ).fetchone()
-                connection.execute(
-                    "INSERT INTO deliveries(execution_id, sequence, document) VALUES (?, ?, ?)",
-                    (notice["execution_id"], sequence_row["sequence"], self.store.encode(record)),
-                )
+            try:
+                self._insert_delivery(notice, record)
+            except Exception:
+                # A failed write must not erase the attempt from the history:
+                # record it explicitly as failed so every attempt stays visible.
+                record["status"] = "failed"
+                self._insert_delivery(notice, record)
+
+    def _insert_delivery(self, notice: dict[str, Any], record: dict[str, Any]) -> None:
+        with self.store.transaction() as connection:
+            sequence_row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM deliveries WHERE tenant = ? AND execution_id = ?",
+                (notice["tenant"], notice["execution_id"]),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO deliveries(tenant, execution_id, sequence, document) VALUES (?, ?, ?, ?)",
+                (notice["tenant"], notice["execution_id"], sequence_row["sequence"], self.store.encode(record)),
+            )
 
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
         message = {"event_type": notice["type"], "execution_id": notice["execution_id"], **notice["payload"]}
@@ -179,15 +199,70 @@ class ChronicleFlow:
             "occurred_at": self.store.now(),
         }
 
-    def deliveries(self, execution_id: str) -> dict[str, Any]:
-        self.get_execution(execution_id)
+    def deliveries(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        self.get_execution(execution_id, tenant)
         rows = self.store.connection.execute(
-            "SELECT sequence, document FROM deliveries WHERE execution_id = ? ORDER BY sequence",
-            (execution_id,),
+            "SELECT sequence, document FROM deliveries WHERE tenant = ? AND execution_id = ? ORDER BY sequence",
+            (tenant, execution_id),
         ).fetchall()
         return {"deliveries": [{"sequence": row["sequence"], **self.store.decode(row["document"])} for row in rows]}
 
-    def create_workflow(self, raw: Any, key: str | None) -> dict[str, Any]:
+    # --- tenants and quotas ----------------------------------------------
+
+    def _quota_row(self, tenant: str) -> Any:
+        return self.store.connection.execute(
+            "SELECT max_workflows, max_executions FROM tenant_quotas WHERE tenant = ?", (tenant,)
+        ).fetchone()
+
+    def _workflow_quota_exceeded(self, tenant: str) -> bool:
+        row = self._quota_row(tenant)
+        if row is None:
+            return False
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM workflows WHERE tenant = ?", (tenant,)
+        ).fetchone()["count"]
+        return count >= row["max_workflows"]
+
+    def _execution_quota_exceeded(self, tenant: str) -> bool:
+        row = self._quota_row(tenant)
+        if row is None:
+            return False
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM executions WHERE tenant = ?", (tenant,)
+        ).fetchone()["count"]
+        return count >= row["max_executions"]
+
+    def put_quota(self, tenant: str, raw: Any, key: str | None) -> dict[str, Any]:
+        tenant = _identifier(tenant, "tenant id")
+        if not isinstance(raw, dict) or set(raw) != {"workflows", "executions"}:
+            raise ValidationError("quota must contain exactly workflows and executions")
+        for field in ("workflows", "executions"):
+            value = raw[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError(f"quota {field} must be a positive integer")
+
+        def apply() -> dict[str, Any]:
+            # Replacing a quota never deletes held resources; a limit below the
+            # current holdings only rejects writes that would exceed it later.
+            self.store.connection.execute(
+                "INSERT INTO tenant_quotas(tenant, max_workflows, max_executions) VALUES (?, ?, ?) "
+                "ON CONFLICT(tenant) DO UPDATE SET max_workflows = excluded.max_workflows, "
+                "max_executions = excluded.max_executions",
+                (tenant, raw["workflows"], raw["executions"]),
+            )
+            return {"quota": {"workflows": raw["workflows"], "executions": raw["executions"]}}
+
+        return self._idempotent(key, tenant, f"declare-quota:{tenant}", apply)
+
+    def get_quota(self, tenant: str) -> dict[str, Any]:
+        tenant = _identifier(tenant, "tenant id")
+        row = self._quota_row(tenant)
+        if row is None:
+            # A tenant that never declared a quota has a definite empty result.
+            return {"quota": None}
+        return {"quota": {"workflows": row["max_workflows"], "executions": row["max_executions"]}}
+
+    def create_workflow(self, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         subscriptions = None
         schedule = None
         if isinstance(raw, dict):
@@ -203,10 +278,14 @@ class ChronicleFlow:
         workflow = Workflow.parse(raw)
 
         def create() -> dict[str, Any]:
+            # The quota check and the inserts share one transaction, so an
+            # over-quota request is rejected whole with no partial write.
+            if self._workflow_quota_exceeded(tenant):
+                raise ConflictError(f"tenant {tenant} has reached its workflow quota")
             try:
                 self.store.connection.execute(
-                    "INSERT INTO workflows(id, document) VALUES (?, ?)",
-                    (workflow.id, self.store.encode(workflow.as_dict())),
+                    "INSERT INTO workflows(tenant, id, document) VALUES (?, ?, ?)",
+                    (tenant, workflow.id, self.store.encode(workflow.as_dict())),
                 )
             except Exception as error:
                 if "UNIQUE constraint" in str(error):
@@ -214,28 +293,30 @@ class ChronicleFlow:
                 raise
             for position, subscription in enumerate(subscriptions or []):
                 self.store.connection.execute(
-                    "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
-                    ("workflow", workflow.id, position, self.store.encode(subscription)),
+                    "INSERT INTO subscriptions(tenant, owner_type, owner_id, position, document) VALUES (?, ?, ?, ?, ?)",
+                    (tenant, "workflow", workflow.id, position, self.store.encode(subscription)),
                 )
             if schedule is not None:
-                self._insert_schedule(workflow.id, schedule)
+                self._insert_schedule(tenant, workflow.id, schedule)
             return workflow.as_dict()
 
-        return self._idempotent(key, f"create-workflow:{workflow.id}", create)
+        return self._idempotent(key, tenant, f"create-workflow:{workflow.id}", create)
 
-    def _insert_schedule(self, workflow_id: str, schedule: dict[str, Any]) -> None:
+    def _insert_schedule(self, tenant: str, workflow_id: str, schedule: dict[str, Any]) -> None:
         """Attach a fresh schedule declaration to a workflow; it is due from now on."""
         self.store.connection.execute(
-            "INSERT INTO schedules(workflow_id, document, paused, anchor_at, cursor) VALUES (?, ?, 0, ?, '') "
-            "ON CONFLICT(workflow_id) DO UPDATE SET document = excluded.document, "
+            "INSERT INTO schedules(tenant, workflow_id, document, paused, anchor_at, cursor) VALUES (?, ?, ?, 0, ?, '') "
+            "ON CONFLICT(tenant, workflow_id) DO UPDATE SET document = excluded.document, "
             "anchor_at = excluded.anchor_at, cursor = '', last_triggered_at = NULL, last_execution_id = NULL",
-            (workflow_id, self.store.encode(schedule), time.time()),
+            (tenant, workflow_id, self.store.encode(schedule), time.time()),
         )
         # A new declaration starts a fresh period lineage, so trigger records
         # of a previous plan never make a new period look already fired.
-        self.store.connection.execute("DELETE FROM schedule_triggers WHERE workflow_id = ?", (workflow_id,))
+        self.store.connection.execute(
+            "DELETE FROM schedule_triggers WHERE tenant = ? AND workflow_id = ?", (tenant, workflow_id)
+        )
 
-    def create_execution(self, raw: Any, key: str | None) -> dict[str, Any]:
+    def create_execution(self, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or not {"id", "workflow_id", "input"} <= set(raw) <= {
             "id",
             "workflow_id",
@@ -260,12 +341,15 @@ class ChronicleFlow:
                 raise ValidationError("timeout_seconds must be a positive number of seconds")
 
         def create() -> dict[str, Any]:
-            return self._insert_execution(execution_id, workflow_id, raw["input"], timeout, subscriptions)
+            if self._execution_quota_exceeded(tenant):
+                raise ConflictError(f"tenant {tenant} has reached its execution quota")
+            return self._insert_execution(tenant, execution_id, workflow_id, raw["input"], timeout, subscriptions)
 
-        return self._idempotent(key, f"create-execution:{execution_id}", create)
+        return self._idempotent(key, tenant, f"create-execution:{execution_id}", create)
 
     def _insert_execution(
         self,
+        tenant: str,
         execution_id: str,
         workflow_id: str,
         input_data: dict[str, Any],
@@ -273,7 +357,9 @@ class ChronicleFlow:
         subscriptions: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         """Insert a running execution and its start event; caller holds a transaction."""
-        workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+        workflow_row = self.store.connection.execute(
+            "SELECT document FROM workflows WHERE tenant = ? AND id = ?", (tenant, workflow_id)
+        ).fetchone()
         if not workflow_row:
             raise NotFoundError(f"workflow {workflow_id} was not found")
         workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
@@ -303,8 +389,8 @@ class ChronicleFlow:
             state["approvals"] = []
         try:
             self.store.connection.execute(
-                "INSERT INTO executions(id, workflow_id, state) VALUES (?, ?, ?)",
-                (execution_id, workflow_id, self.store.encode(state)),
+                "INSERT INTO executions(tenant, id, workflow_id, state) VALUES (?, ?, ?, ?)",
+                (tenant, execution_id, workflow_id, self.store.encode(state)),
             )
         except Exception as error:
             if "UNIQUE constraint" in str(error):
@@ -312,8 +398,8 @@ class ChronicleFlow:
             raise
         for position, subscription in enumerate(subscriptions or []):
             self.store.connection.execute(
-                "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
-                ("execution", execution_id, position, self.store.encode(subscription)),
+                "INSERT INTO subscriptions(tenant, owner_type, owner_id, position, document) VALUES (?, ?, ?, ?, ?)",
+                (tenant, "execution", execution_id, position, self.store.encode(subscription)),
             )
         started_payload: dict[str, Any] = {
             "workflow_id": workflow_id,
@@ -326,28 +412,35 @@ class ChronicleFlow:
             started_payload["waiting_approval"] = None
             started_payload["approvals"] = []
         self._append(
+            tenant,
             execution_id,
             "execution_started",
             started_payload,
         )
         return state
 
-    def get_execution(self, execution_id: str) -> dict[str, Any]:
+    def get_execution(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         with self._operation():
-            row = self.store.connection.execute("SELECT state FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            row = self.store.connection.execute(
+                "SELECT state FROM executions WHERE tenant = ? AND id = ?", (tenant, execution_id)
+            ).fetchone()
             if not row:
                 raise NotFoundError(f"execution {execution_id} was not found")
             state = self.store.decode(row["state"])
-            self._maybe_timeout(execution_id, state)
+            self._maybe_timeout(tenant, execution_id, state)
             return state
 
-    def _maybe_timeout(self, execution_id: str, state: dict[str, Any]) -> None:
+    def _maybe_timeout(self, tenant: str, execution_id: str, state: dict[str, Any]) -> None:
         deadline = state.get("deadline_at")
         if state["status"] == "running" and deadline is not None and time.time() >= deadline:
-            self._terminate(execution_id, state, "timeout")
-            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+            self._terminate(tenant, execution_id, state, "timeout")
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?", (self.store.encode(state), tenant, execution_id)
+            )
 
-    def _terminate(self, execution_id: str, state: dict[str, Any], reason: str, extra: dict[str, Any] | None = None) -> None:
+    def _terminate(
+        self, tenant: str, execution_id: str, state: dict[str, Any], reason: str, extra: dict[str, Any] | None = None
+    ) -> None:
         state["status"] = "terminated"
         state["termination_reason"] = reason
         # A termination (rejection, timeout, or cancellation) dismisses any
@@ -358,20 +451,20 @@ class ChronicleFlow:
         payload = {"reason": reason}
         if extra:
             payload.update(extra)
-        self._append(execution_id, "execution_terminated", payload)
+        self._append(tenant, execution_id, "execution_terminated", payload)
 
-    def events(self, execution_id: str) -> list[dict[str, Any]]:
-        self.get_execution(execution_id)
+    def events(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> list[dict[str, Any]]:
+        self.get_execution(execution_id, tenant)
         rows = self.store.connection.execute(
-            "SELECT sequence, type, payload, occurred_at FROM events WHERE execution_id = ? ORDER BY sequence",
-            (execution_id,),
+            "SELECT sequence, type, payload, occurred_at FROM events WHERE tenant = ? AND execution_id = ? ORDER BY sequence",
+            (tenant, execution_id),
         ).fetchall()
         return [
             {"sequence": row["sequence"], "type": row["type"], "payload": self.store.decode(row["payload"]), "occurred_at": row["occurred_at"]}
             for row in rows
         ]
 
-    def advance(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def advance(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or set(raw) not in (
             {"output"},
             {"failure"},
@@ -392,19 +485,21 @@ class ChronicleFlow:
                 raise ValidationError("advance failure must contain exactly a reason string")
 
         def apply() -> dict[str, Any]:
-            state = self.get_execution(execution_id)
+            state = self.get_execution(execution_id, tenant)
             if state["status"] != "running":
                 return state
-            self._assert_submission_allowed(execution_id, worker_id)
+            self._assert_submission_allowed(tenant, execution_id, worker_id)
             # Parked at an approval point: the decision operation is the only
             # way forward, so an advance absorbs its output or failure and
             # returns the current state unchanged. Lease ownership is still
             # enforced, exactly as for any other running-execution submission.
             if state.get("waiting_approval") is not None:
                 return state
-            workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
+            workflow_row = self.store.connection.execute(
+                "SELECT document FROM workflows WHERE tenant = ? AND id = ?", (tenant, state["workflow_id"])
+            ).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
-            self._auto_process(execution_id, workflow, state)
+            self._auto_process(tenant, execution_id, workflow, state)
             if state["status"] == "running":
                 ready = self._ready_tasks(workflow, state)
                 if not ready:
@@ -412,24 +507,26 @@ class ChronicleFlow:
                 node_id = ready[0]
                 node = next(node for node in workflow.nodes if node.id == node_id)
                 if node.approval is not None:
-                    self._request_approval(execution_id, workflow, state, node)
+                    self._request_approval(tenant, execution_id, workflow, state, node)
                 elif "failure" in raw:
-                    self._fail_node(execution_id, workflow, state, node_id, raw["failure"]["reason"])
+                    self._fail_node(tenant, execution_id, workflow, state, node_id, raw["failure"]["reason"])
                 else:
-                    self._complete_node(execution_id, workflow, state, node_id, raw["output"])
+                    self._complete_node(tenant, execution_id, workflow, state, node_id, raw["output"])
                 if state["status"] == "running" and state.get("waiting_approval") is None:
-                    self._auto_process(execution_id, workflow, state)
-            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+                    self._auto_process(tenant, execution_id, workflow, state)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?", (self.store.encode(state), tenant, execution_id)
+            )
             # Every path from a running start that reaches here settled at least
             # one node boundary (completed, failed, or parked at an approval),
             # so checkpoint it in the same transaction.
-            self._write_checkpoint(execution_id, state)
+            self._write_checkpoint(tenant, execution_id, state)
             return state
 
         with self._operation():
-            return self._idempotent(key, f"advance:{execution_id}", apply)
+            return self._idempotent(key, tenant, f"advance:{execution_id}", apply)
 
-    def decision(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def decision(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or not {"approver", "decision"} <= set(raw) <= {"approver", "decision", "output", "reason"}:
             raise ValidationError("decision body must contain approver and decision, plus output or reason")
         approver = raw["approver"]
@@ -455,9 +552,11 @@ class ChronicleFlow:
             reason = raw["reason"]
 
         def apply() -> dict[str, Any]:
-            state = self.get_execution(execution_id)
+            state = self.get_execution(execution_id, tenant)
             waiting = state.get("waiting_approval")
-            workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
+            workflow_row = self.store.connection.execute(
+                "SELECT document FROM workflows WHERE tenant = ? AND id = ?", (tenant, state["workflow_id"])
+            ).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
             if waiting is None:
                 # A duplicate of the decision that already resolved the most
@@ -478,22 +577,24 @@ class ChronicleFlow:
             payload: dict[str, Any] = {"node_id": node_id, "approver": approver, "decision": verdict, **context}
             if verdict == "rejected":
                 payload["reason"] = reason
-            self._append(execution_id, "approval_decided", payload)
+            self._append(tenant, execution_id, "approval_decided", payload)
             if verdict == "approved":
-                self._complete_node(execution_id, workflow, state, node_id, output)
+                self._complete_node(tenant, execution_id, workflow, state, node_id, output)
                 if state["status"] == "running":
-                    self._auto_process(execution_id, workflow, state)
+                    self._auto_process(tenant, execution_id, workflow, state)
             else:
                 state["failed_nodes"].append(node_id)
-                self._terminate(execution_id, state, "rejected", {"node_id": node_id})
-            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+                self._terminate(tenant, execution_id, state, "rejected", {"node_id": node_id})
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?", (self.store.encode(state), tenant, execution_id)
+            )
             # The decision settles the parked node boundary: completion on
             # approval, permanent failure on rejection.
-            self._write_checkpoint(execution_id, state)
+            self._write_checkpoint(tenant, execution_id, state)
             return state
 
         with self._operation():
-            return self._idempotent(key, f"decision:{execution_id}", apply)
+            return self._idempotent(key, tenant, f"decision:{execution_id}", apply)
 
     @staticmethod
     def _is_repeated_decision(
@@ -520,7 +621,7 @@ class ChronicleFlow:
     def _approval_context(waiting: dict[str, Any]) -> dict[str, Any]:
         return {key: waiting[key] for key in ("loop_id", "iteration") if key in waiting}
 
-    def _request_approval(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node: Node) -> None:
+    def _request_approval(self, tenant: str, execution_id: str, workflow: Workflow, state: dict[str, Any], node: Node) -> None:
         waiting: dict[str, Any] = {"node_id": node.id, "approvers": list(node.approval.approvers)}
         loop_id = self._active_loop(workflow, state, node.id)
         if loop_id is not None:
@@ -528,27 +629,30 @@ class ChronicleFlow:
             waiting["iteration"] = state["loops"][loop_id]["current_iteration"]
         state["waiting_approval"] = waiting
         self._append(
+            tenant,
             execution_id,
             "approval_requested",
             {"node_id": node.id, "approvers": list(node.approval.approvers), **self._approval_context(waiting)},
         )
 
-    def cancel(self, execution_id: str, key: str | None) -> dict[str, Any]:
+    def cancel(self, execution_id: str, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         def apply() -> dict[str, Any]:
-            state = self.get_execution(execution_id)
+            state = self.get_execution(execution_id, tenant)
             if state["status"] != "running":
                 return state
-            self._terminate(execution_id, state, "cancelled")
-            self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
+            self._terminate(tenant, execution_id, state, "cancelled")
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?", (self.store.encode(state), tenant, execution_id)
+            )
             return state
 
         with self._operation():
-            return self._idempotent(key, f"cancel:{execution_id}", apply)
+            return self._idempotent(key, tenant, f"cancel:{execution_id}", apply)
 
-    def _lease_row(self, execution_id: str) -> Any:
+    def _lease_row(self, tenant: str, execution_id: str) -> Any:
         return self.store.connection.execute(
-            "SELECT worker_id, lease_seconds, expires_at, heartbeat_at FROM leases WHERE execution_id = ?",
-            (execution_id,),
+            "SELECT worker_id, lease_seconds, expires_at, heartbeat_at FROM leases WHERE tenant = ? AND execution_id = ?",
+            (tenant, execution_id),
         ).fetchone()
 
     @staticmethod
@@ -560,9 +664,9 @@ class ChronicleFlow:
             "heartbeat_at": heartbeat_at,
         }
 
-    def _assert_submission_allowed(self, execution_id: str, worker_id: str | None) -> None:
+    def _assert_submission_allowed(self, tenant: str, execution_id: str, worker_id: str | None) -> None:
         """Once a work item is claimed, only the active lease holder may submit results."""
-        row = self._lease_row(execution_id)
+        row = self._lease_row(tenant, execution_id)
         if row is None:
             return
         if time.time() >= row["expires_at"]:
@@ -570,7 +674,7 @@ class ChronicleFlow:
         if worker_id != row["worker_id"]:
             raise ConflictError(f"work item for execution {execution_id} is held by another worker")
 
-    def claim(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def claim(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or "worker_id" not in raw or not set(raw) <= {"worker_id", "lease_seconds"}:
             raise ValidationError("claim body must contain a worker_id and optionally lease_seconds")
         worker_id = _identifier(raw["worker_id"], "worker id")
@@ -581,37 +685,37 @@ class ChronicleFlow:
             raise ValidationError("lease_seconds must be a positive number of seconds")
 
         def apply() -> dict[str, Any]:
-            state = self.get_execution(execution_id)
+            state = self.get_execution(execution_id, tenant)
             if state["status"] != "running":
                 # A finished execution has no claimable work item; the request
                 # is a definite empty result and absorbs no input.
                 return {"work_item": None, "lease": None}
             now = time.time()
-            row = self._lease_row(execution_id)
+            row = self._lease_row(tenant, execution_id)
             if row is not None and now < row["expires_at"]:
                 raise ConflictError(f"work item for execution {execution_id} is already claimed")
             expires_at = now + lease_seconds
             self.store.connection.execute(
-                "INSERT INTO leases(execution_id, worker_id, lease_seconds, expires_at, heartbeat_at) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(execution_id) DO UPDATE SET worker_id = excluded.worker_id, "
+                "INSERT INTO leases(tenant, execution_id, worker_id, lease_seconds, expires_at, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(tenant, execution_id) DO UPDATE SET worker_id = excluded.worker_id, "
                 "lease_seconds = excluded.lease_seconds, expires_at = excluded.expires_at, heartbeat_at = excluded.heartbeat_at",
-                (execution_id, worker_id, lease_seconds, expires_at, now),
+                (tenant, execution_id, worker_id, lease_seconds, expires_at, now),
             )
             return {
                 "work_item": {"execution_id": execution_id, "workflow_id": state["workflow_id"]},
                 "lease": self._lease_payload(worker_id, lease_seconds, expires_at, now),
             }
 
-        return self._idempotent(key, f"claim:{execution_id}", apply)
+        return self._idempotent(key, tenant, f"claim:{execution_id}", apply)
 
-    def heartbeat(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def heartbeat(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
             raise ValidationError("heartbeat body must contain exactly a worker_id")
         worker_id = _identifier(raw["worker_id"], "worker id")
 
         def apply() -> dict[str, Any]:
-            state = self.get_execution(execution_id)
-            row = self._lease_row(execution_id)
+            state = self.get_execution(execution_id, tenant)
+            row = self._lease_row(tenant, execution_id)
             if row is None:
                 raise NotFoundError(f"execution {execution_id} has no claimed work item")
             now = time.time()
@@ -625,37 +729,40 @@ class ChronicleFlow:
             # it never advances nodes, writes outputs, or appends node events.
             expires_at = now + row["lease_seconds"]
             self.store.connection.execute(
-                "UPDATE leases SET expires_at = ?, heartbeat_at = ? WHERE execution_id = ?",
-                (expires_at, now, execution_id),
+                "UPDATE leases SET expires_at = ?, heartbeat_at = ? WHERE tenant = ? AND execution_id = ?",
+                (expires_at, now, tenant, execution_id),
             )
             return {"lease": self._lease_payload(worker_id, row["lease_seconds"], expires_at, now)}
 
-        return self._idempotent(key, f"heartbeat:{execution_id}", apply)
+        return self._idempotent(key, tenant, f"heartbeat:{execution_id}", apply)
 
-    def release(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def release(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
             raise ValidationError("release body must contain exactly a worker_id")
         worker_id = _identifier(raw["worker_id"], "worker id")
 
         def apply() -> dict[str, Any]:
-            self.get_execution(execution_id)
-            row = self._lease_row(execution_id)
+            self.get_execution(execution_id, tenant)
+            row = self._lease_row(tenant, execution_id)
             if row is None:
                 raise NotFoundError(f"execution {execution_id} has no claimed work item")
             if time.time() >= row["expires_at"]:
                 raise ConflictError(f"lease for execution {execution_id} has expired")
             if row["worker_id"] != worker_id:
                 raise ConflictError(f"work item for execution {execution_id} is held by another worker")
-            self.store.connection.execute("DELETE FROM leases WHERE execution_id = ?", (execution_id,))
+            self.store.connection.execute(
+                "DELETE FROM leases WHERE tenant = ? AND execution_id = ?", (tenant, execution_id)
+            )
             return {"released": True}
 
-        return self._idempotent(key, f"release:{execution_id}", apply)
+        return self._idempotent(key, tenant, f"release:{execution_id}", apply)
 
-    def checkpoints(self, execution_id: str) -> dict[str, Any]:
-        self.get_execution(execution_id)
+    def checkpoints(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        self.get_execution(execution_id, tenant)
         rows = self.store.connection.execute(
-            "SELECT sequence, event_sequence, document, created_at FROM checkpoints WHERE execution_id = ? ORDER BY sequence",
-            (execution_id,),
+            "SELECT sequence, event_sequence, document, created_at FROM checkpoints WHERE tenant = ? AND execution_id = ? "
+            "ORDER BY sequence",
+            (tenant, execution_id),
         ).fetchall()
         return {
             "checkpoints": [
@@ -669,7 +776,7 @@ class ChronicleFlow:
             ]
         }
 
-    def recover(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def recover(self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         if not isinstance(raw, dict) or set(raw) != {"from"} or not isinstance(raw["from"], str):
             raise ValidationError("recover body must contain exactly a from string")
         if raw["from"] != "latest_checkpoint":
@@ -678,12 +785,12 @@ class ChronicleFlow:
         def apply() -> dict[str, Any]:
             # get_execution applies a due timeout first, so termination always
             # takes precedence over recovery.
-            state = self.get_execution(execution_id)
+            state = self.get_execution(execution_id, tenant)
             if state["status"] != "running":
                 return state
             row = self.store.connection.execute(
-                "SELECT document FROM checkpoints WHERE execution_id = ? ORDER BY sequence DESC LIMIT 1",
-                (execution_id,),
+                "SELECT document FROM checkpoints WHERE tenant = ? AND execution_id = ? ORDER BY sequence DESC LIMIT 1",
+                (tenant, execution_id),
             ).fetchone()
             if not row:
                 raise ConflictError("execution has no checkpoint to recover from")
@@ -699,19 +806,21 @@ class ChronicleFlow:
                 raise ConflictError("latest checkpoint does not match the materialized state")
             return snapshot
 
-        return self._idempotent(key, f"recover:{execution_id}", apply)
+        return self._idempotent(key, tenant, f"recover:{execution_id}", apply)
 
     # --- schedules ------------------------------------------------------
 
-    def _schedule_row(self, workflow_id: str) -> Any:
+    def _schedule_row(self, tenant: str, workflow_id: str) -> Any:
         return self.store.connection.execute(
             "SELECT workflow_id, document, paused, anchor_at, cursor, last_triggered_at, last_execution_id "
-            "FROM schedules WHERE workflow_id = ?",
-            (workflow_id,),
+            "FROM schedules WHERE tenant = ? AND workflow_id = ?",
+            (tenant, workflow_id),
         ).fetchone()
 
-    def _assert_workflow_exists(self, workflow_id: str) -> None:
-        row = self.store.connection.execute("SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+    def _assert_workflow_exists(self, tenant: str, workflow_id: str) -> None:
+        row = self.store.connection.execute(
+            "SELECT 1 FROM workflows WHERE tenant = ? AND id = ?", (tenant, workflow_id)
+        ).fetchone()
         if not row:
             raise NotFoundError(f"workflow {workflow_id} was not found")
 
@@ -726,76 +835,83 @@ class ChronicleFlow:
             "last_execution_id": row["last_execution_id"],
         }
 
-    def schedule_status(self, workflow_id: str) -> dict[str, Any]:
+    def schedule_status(self, workflow_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         with self._operation():
             with self.store.transaction():
-                self._assert_workflow_exists(workflow_id)
+                self._assert_workflow_exists(tenant, workflow_id)
                 # Settle any due periods first so the answer reflects the
                 # schedule as of now, not as of the last background tick.
-                self._process_schedules(workflow_id)
-                return self._schedule_status(self._schedule_row(workflow_id))
+                self._process_schedules(tenant, workflow_id)
+                return self._schedule_status(self._schedule_row(tenant, workflow_id))
 
     @staticmethod
     def _empty_body(raw: Any, operation: str) -> None:
         if not isinstance(raw, dict) or raw:
             raise ValidationError(f"{operation} body must be an empty object")
 
-    def pause_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def pause_schedule(self, workflow_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         self._empty_body(raw, "pause schedule")
 
         def apply() -> dict[str, Any]:
-            self._assert_workflow_exists(workflow_id)
-            if self._schedule_row(workflow_id) is None:
+            self._assert_workflow_exists(tenant, workflow_id)
+            if self._schedule_row(tenant, workflow_id) is None:
                 raise NotFoundError(f"workflow {workflow_id} has no schedule")
-            self.store.connection.execute("UPDATE schedules SET paused = 1 WHERE workflow_id = ?", (workflow_id,))
-            return self._schedule_status(self._schedule_row(workflow_id))
+            self.store.connection.execute(
+                "UPDATE schedules SET paused = 1 WHERE tenant = ? AND workflow_id = ?", (tenant, workflow_id)
+            )
+            return self._schedule_status(self._schedule_row(tenant, workflow_id))
 
         with self._operation():
-            return self._idempotent(key, f"pause-schedule:{workflow_id}", apply)
+            return self._idempotent(key, tenant, f"pause-schedule:{workflow_id}", apply)
 
-    def resume_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def resume_schedule(self, workflow_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         self._empty_body(raw, "resume schedule")
 
         def apply() -> dict[str, Any]:
-            self._assert_workflow_exists(workflow_id)
-            if self._schedule_row(workflow_id) is None:
+            self._assert_workflow_exists(tenant, workflow_id)
+            if self._schedule_row(tenant, workflow_id) is None:
                 raise NotFoundError(f"workflow {workflow_id} has no schedule")
-            self.store.connection.execute("UPDATE schedules SET paused = 0 WHERE workflow_id = ?", (workflow_id,))
+            self.store.connection.execute(
+                "UPDATE schedules SET paused = 0 WHERE tenant = ? AND workflow_id = ?", (tenant, workflow_id)
+            )
             # Periods that came due while paused are settled immediately
             # according to the missed policy.
-            self._process_schedules(workflow_id)
-            return self._schedule_status(self._schedule_row(workflow_id))
+            self._process_schedules(tenant, workflow_id)
+            return self._schedule_status(self._schedule_row(tenant, workflow_id))
 
         with self._operation():
-            return self._idempotent(key, f"resume-schedule:{workflow_id}", apply)
+            return self._idempotent(key, tenant, f"resume-schedule:{workflow_id}", apply)
 
-    def update_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+    def update_schedule(self, workflow_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         # The whole plan is validated before anything is written, so an
         # invalid declaration never partially replaces the stored one.
         schedule = parse_schedule(raw)
 
         def apply() -> dict[str, Any]:
-            self._assert_workflow_exists(workflow_id)
-            self._insert_schedule(workflow_id, schedule)
-            return self._schedule_status(self._schedule_row(workflow_id))
+            self._assert_workflow_exists(tenant, workflow_id)
+            self._insert_schedule(tenant, workflow_id, schedule)
+            return self._schedule_status(self._schedule_row(tenant, workflow_id))
 
         with self._operation():
-            return self._idempotent(key, f"update-schedule:{workflow_id}", apply)
+            return self._idempotent(key, tenant, f"update-schedule:{workflow_id}", apply)
 
-    def _set_schedule_cursor(self, workflow_id: str, cursor: str) -> None:
-        self.store.connection.execute("UPDATE schedules SET cursor = ? WHERE workflow_id = ?", (cursor, workflow_id))
+    def _set_schedule_cursor(self, tenant: str, workflow_id: str, cursor: str) -> None:
+        self.store.connection.execute(
+            "UPDATE schedules SET cursor = ? WHERE tenant = ? AND workflow_id = ?", (cursor, tenant, workflow_id)
+        )
 
-    def _process_schedules(self, workflow_id: str | None = None) -> None:
+    def _process_schedules(self, tenant: str | None = None, workflow_id: str | None = None) -> None:
         """Settle every due schedule period once; caller holds a transaction."""
         now = time.time()
-        if workflow_id is None:
+        if tenant is None:
             rows = self.store.connection.execute(
-                "SELECT workflow_id, document, paused, anchor_at, cursor FROM schedules"
+                "SELECT tenant, workflow_id, document, paused, anchor_at, cursor FROM schedules"
             ).fetchall()
         else:
             rows = self.store.connection.execute(
-                "SELECT workflow_id, document, paused, anchor_at, cursor FROM schedules WHERE workflow_id = ?",
-                (workflow_id,),
+                "SELECT tenant, workflow_id, document, paused, anchor_at, cursor FROM schedules "
+                "WHERE tenant = ? AND workflow_id = ?",
+                (tenant, workflow_id),
             ).fetchall()
         for row in rows:
             self._process_schedule(row, now)
@@ -809,6 +925,7 @@ class ChronicleFlow:
         periods it sleeps through, a "catch_up" schedule keeps them pending
         and fires only the most recent one when it is resumed.
         """
+        tenant = row["tenant"]
         workflow_id = row["workflow_id"]
         document = self.store.decode(row["document"])
         paused = bool(row["paused"])
@@ -837,7 +954,7 @@ class ChronicleFlow:
                 following = cron.next_after(following)
             if latest is None:
                 if candidate is not None and str(candidate) != cursor:
-                    self._set_schedule_cursor(workflow_id, str(candidate))
+                    self._set_schedule_cursor(tenant, workflow_id, str(candidate))
                 return
             period_key = f"c:{latest}"
             fire_at = float(latest)
@@ -847,37 +964,49 @@ class ChronicleFlow:
             new_cursor = str(following) if following is not None else str(horizon + 60)
         if paused:
             if document["missed_policy"] == "skip":
-                self._set_schedule_cursor(workflow_id, new_cursor)
+                self._set_schedule_cursor(tenant, workflow_id, new_cursor)
             return
         if document["missed_policy"] == "catch_up" or now - fire_at < granularity:
-            self._fire_schedule(workflow_id, document, period_key)
-        self._set_schedule_cursor(workflow_id, new_cursor)
+            if self._fire_schedule(tenant, workflow_id, document, period_key) is None:
+                # Over the tenant's execution quota: the period creates no
+                # execution and the schedule is left exactly as it was.
+                return
+        self._set_schedule_cursor(tenant, workflow_id, new_cursor)
 
-    def _fire_schedule(self, workflow_id: str, document: dict[str, Any], period_key: str) -> str:
-        """Create the execution for one schedule period, or return the existing one."""
+    def _fire_schedule(self, tenant: str, workflow_id: str, document: dict[str, Any], period_key: str) -> str | None:
+        """Create the execution for one schedule period, or return the existing one.
+
+        Returns None when the tenant's execution quota is already exhausted:
+        nothing is created and no trigger is recorded for the period.
+        """
         existing = self.store.connection.execute(
-            "SELECT execution_id, triggered_at FROM schedule_triggers WHERE workflow_id = ? AND period_key = ?",
-            (workflow_id, period_key),
+            "SELECT execution_id, triggered_at FROM schedule_triggers WHERE tenant = ? AND workflow_id = ? AND period_key = ?",
+            (tenant, workflow_id, period_key),
         ).fetchone()
         if existing:
             execution_id = existing["execution_id"]
             triggered_at = existing["triggered_at"]
         else:
             execution_id = f"{workflow_id}-scheduled-{period_key}"
-            claimed = self.store.connection.execute("SELECT 1 FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            claimed = self.store.connection.execute(
+                "SELECT 1 FROM executions WHERE tenant = ? AND id = ?", (tenant, execution_id)
+            ).fetchone()
             if not claimed:
+                if self._execution_quota_exceeded(tenant):
+                    return None
                 # The created execution is exactly a manually created one:
                 # same state shape and the usual execution_started event,
                 # with nothing schedule-specific added to its stream.
-                self._insert_execution(execution_id, workflow_id, document["input"], None, None)
+                self._insert_execution(tenant, execution_id, workflow_id, document["input"], None, None)
             triggered_at = self.store.now()
             self.store.connection.execute(
-                "INSERT INTO schedule_triggers(workflow_id, period_key, execution_id, triggered_at) VALUES (?, ?, ?, ?)",
-                (workflow_id, period_key, execution_id, triggered_at),
+                "INSERT INTO schedule_triggers(tenant, workflow_id, period_key, execution_id, triggered_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tenant, workflow_id, period_key, execution_id, triggered_at),
             )
         self.store.connection.execute(
-            "UPDATE schedules SET last_triggered_at = ?, last_execution_id = ? WHERE workflow_id = ?",
-            (triggered_at, execution_id, workflow_id),
+            "UPDATE schedules SET last_triggered_at = ?, last_execution_id = ? WHERE tenant = ? AND workflow_id = ?",
+            (triggered_at, execution_id, tenant, workflow_id),
         )
         return execution_id
 
@@ -889,26 +1018,34 @@ class ChronicleFlow:
         loop_state = state["loops"][loop_id]
         return loop_state["iterations"][-1], {"loop_id": loop_id, "iteration": loop_state["current_iteration"]}
 
-    def _complete_node(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, output: Any) -> None:
+    def _complete_node(
+        self, tenant: str, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, output: Any
+    ) -> None:
         container, context = self._node_container(workflow, state, node_id)
         container["completed_nodes"].append(node_id)
         container["outputs"][node_id] = output
         container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
-        self._append(execution_id, "node_completed", {"node_id": node_id, "output": output, **context})
+        self._append(tenant, execution_id, "node_completed", {"node_id": node_id, "output": output, **context})
 
-    def _fail_node(self, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, reason: str) -> None:
+    def _fail_node(
+        self, tenant: str, execution_id: str, workflow: Workflow, state: dict[str, Any], node_id: str, reason: str
+    ) -> None:
         by_id = {node.id: node for node in workflow.nodes}
         retries = by_id[node_id].retries or 0
         container, context = self._node_container(workflow, state, node_id)
         entry = container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
         entry["failures"] += 1
-        self._append(execution_id, "node_failed", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context})
+        self._append(
+            tenant, execution_id, "node_failed", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context}
+        )
         if entry["failures"] <= retries:
             entry["attempt"] += 1
-            self._append(execution_id, "node_retried", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context})
+            self._append(
+                tenant, execution_id, "node_retried", {"node_id": node_id, "attempt": entry["attempt"], "reason": reason, **context}
+            )
         else:
             state["failed_nodes"].append(node_id)
-            self._terminate(execution_id, state, "retries_exhausted", {"node_id": node_id})
+            self._terminate(tenant, execution_id, state, "retries_exhausted", {"node_id": node_id})
 
     def _ready_tasks(self, workflow: Workflow, state: dict[str, Any]) -> list[str]:
         bodies = workflow.loop_bodies()
@@ -941,7 +1078,7 @@ class ChronicleFlow:
                 return loop_id
         return None
 
-    def _auto_process(self, execution_id: str, workflow: Workflow, state: dict[str, Any]) -> None:
+    def _auto_process(self, tenant: str, execution_id: str, workflow: Workflow, state: dict[str, Any]) -> None:
         by_id = {node.id: node for node in workflow.nodes}
         bodies = workflow.loop_bodies()
         body_members = set().union(*bodies.values()) if bodies else set()
@@ -962,12 +1099,12 @@ class ChronicleFlow:
                     state["condition_results"][node.id] = result
                     state["completed_nodes"].append(node.id)
                     completed.add(node.id)
-                    self._append(execution_id, "condition_evaluated", {"node_id": node.id, "result": result})
+                    self._append(tenant, execution_id, "condition_evaluated", {"node_id": node.id, "result": result})
                     changed = True
                 elif node.run_if is not None and state["condition_results"][node.run_if.condition_id] != node.run_if.expected:
                     state["skipped_nodes"].append(node.id)
                     skipped.add(node.id)
-                    self._append(execution_id, "node_skipped", {"node_id": node.id})
+                    self._append(tenant, execution_id, "node_skipped", {"node_id": node.id})
                     changed = True
             for loop_node in sorted((node for node in workflow.nodes if node.kind == "loop"), key=lambda item: item.id):
                 loop_state = state["loops"][loop_node.id]
@@ -976,6 +1113,7 @@ class ChronicleFlow:
                         continue
                     result = _evaluate_condition(by_id[loop_node.condition], state["input"])
                     self._append(
+                        tenant,
                         execution_id,
                         "loop_condition_evaluated",
                         {"loop_id": loop_node.id, "node_id": loop_node.condition, "iteration": 0, "result": result},
@@ -984,9 +1122,9 @@ class ChronicleFlow:
                         loop_state["status"] = "running"
                         loop_state["current_iteration"] = 1
                         loop_state["iterations"].append(_new_iteration())
-                        self._append(execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": 1})
+                        self._append(tenant, execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": 1})
                     else:
-                        self._finish_loop(execution_id, state, loop_node.id, loop_state, "condition_false")
+                        self._finish_loop(tenant, execution_id, state, loop_node.id, loop_state, "condition_false")
                         completed.add(loop_node.id)
                     changed = True
                 elif loop_state["status"] == "running":
@@ -1005,6 +1143,7 @@ class ChronicleFlow:
                             iteration["completed_nodes"].append(node_id)
                             iteration_completed.add(node_id)
                             self._append(
+                                tenant,
                                 execution_id,
                                 "condition_evaluated",
                                 {
@@ -1019,6 +1158,7 @@ class ChronicleFlow:
                             iteration["skipped_nodes"].append(node_id)
                             iteration_skipped.add(node_id)
                             self._append(
+                                tenant,
                                 execution_id,
                                 "node_skipped",
                                 {"node_id": node_id, "loop_id": loop_node.id, "iteration": loop_state["current_iteration"]},
@@ -1028,40 +1168,46 @@ class ChronicleFlow:
                         current = loop_state["current_iteration"]
                         result = _evaluate_condition(by_id[loop_node.condition], state["input"])
                         self._append(
+                            tenant,
                             execution_id,
                             "loop_condition_evaluated",
                             {"loop_id": loop_node.id, "node_id": loop_node.condition, "iteration": current, "result": result},
                         )
                         if not result:
-                            self._finish_loop(execution_id, state, loop_node.id, loop_state, "condition_false")
+                            self._finish_loop(tenant, execution_id, state, loop_node.id, loop_state, "condition_false")
                             completed.add(loop_node.id)
                         elif current >= loop_node.max_iterations:
-                            self._finish_loop(execution_id, state, loop_node.id, loop_state, "iteration_limit")
+                            self._finish_loop(tenant, execution_id, state, loop_node.id, loop_state, "iteration_limit")
                             completed.add(loop_node.id)
                         else:
                             loop_state["current_iteration"] = current + 1
                             loop_state["iterations"].append(_new_iteration())
-                            self._append(execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": current + 1})
+                            self._append(
+                                tenant, execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": current + 1}
+                            )
                         changed = True
         finished = completed | skipped
         if all(node.id in finished for node in workflow.nodes if node.id not in body_members):
             state["status"] = "completed"
-            self._append(execution_id, "execution_completed", {})
+            self._append(tenant, execution_id, "execution_completed", {})
 
-    def _finish_loop(self, execution_id: str, state: dict[str, Any], loop_id: str, loop_state: dict[str, Any], reason: str) -> None:
+    def _finish_loop(
+        self, tenant: str, execution_id: str, state: dict[str, Any], loop_id: str, loop_state: dict[str, Any], reason: str
+    ) -> None:
         loop_state["status"] = "completed"
         loop_state["end_reason"] = reason
         state["completed_nodes"].append(loop_id)
         self._append(
+            tenant,
             execution_id,
             "loop_completed",
             {"loop_id": loop_id, "reason": reason, "iterations": loop_state["current_iteration"]},
         )
 
-    def replay(self, execution_id: str) -> dict[str, Any]:
-        stored = self.get_execution(execution_id)
+    def replay(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        stored = self.get_execution(execution_id, tenant)
         rebuilt: dict[str, Any] | None = None
-        for event in self.events(execution_id):
+        for event in self.events(execution_id, tenant):
             event_type = event["type"]
             payload = event["payload"]
             if event_type == "execution_started":
@@ -1167,34 +1313,41 @@ class ChronicleFlow:
             raise ConflictError("execution event stream has no start event")
         return {"consistent": rebuilt == stored, "execution": rebuilt}
 
-    def _append(self, execution_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    def _append(self, tenant: str, execution_id: str, event_type: str, payload: dict[str, Any]) -> None:
         row = self.store.connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE execution_id = ?",
-            (execution_id,),
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE tenant = ? AND execution_id = ?",
+            (tenant, execution_id),
         ).fetchone()
         self.store.connection.execute(
-            "INSERT INTO events(execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
-            (execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
+            "INSERT INTO events(tenant, execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (tenant, execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
         )
         if event_type in NOTIFY_EVENT_TYPES:
             # Buffered, not delivered: the surrounding operation may still roll
             # back. The outermost _operation scope delivers after the commit.
             self._local.pending = getattr(self._local, "pending", []) + [
-                {"execution_id": execution_id, "sequence": row["sequence"], "type": event_type, "payload": payload}
+                {
+                    "tenant": tenant,
+                    "execution_id": execution_id,
+                    "sequence": row["sequence"],
+                    "type": event_type,
+                    "payload": payload,
+                }
             ]
 
-    def _write_checkpoint(self, execution_id: str, state: dict[str, Any]) -> None:
+    def _write_checkpoint(self, tenant: str, execution_id: str, state: dict[str, Any]) -> None:
         """Persist the state summary and event position at a node boundary."""
         event_row = self.store.connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE execution_id = ?",
-            (execution_id,),
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE tenant = ? AND execution_id = ?",
+            (tenant, execution_id),
         ).fetchone()
         checkpoint_row = self.store.connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM checkpoints WHERE execution_id = ?",
-            (execution_id,),
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM checkpoints WHERE tenant = ? AND execution_id = ?",
+            (tenant, execution_id),
         ).fetchone()
         document = {"state": state, "event_sequence": event_row["sequence"]}
         self.store.connection.execute(
-            "INSERT INTO checkpoints(execution_id, sequence, event_sequence, document, created_at) VALUES (?, ?, ?, ?, ?)",
-            (execution_id, checkpoint_row["sequence"], event_row["sequence"], self.store.encode(document), self.store.now()),
+            "INSERT INTO checkpoints(tenant, execution_id, sequence, event_sequence, document, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (tenant, execution_id, checkpoint_row["sequence"], event_row["sequence"], self.store.encode(document), self.store.now()),
         )

@@ -38,7 +38,11 @@ The initial release intentionally supports a compact public contract:
   five-field cron plan — and the service automatically creates one execution
   per due period with the declared input; schedules can be paused and
   resumed, and periods missed while paused are either caught up once or
-  skipped, according to the declared missed policy.
+  skipped, according to the declared missed policy;
+- requests may declare a tenant, and every tenant's workflows, executions,
+  schedules, and delivery history are isolated from every other tenant's;
+- each tenant may declare a quota limiting how many workflows and executions
+  it can hold, and writes that would exceed the quota are rejected whole.
 
 ## Requirements
 
@@ -338,6 +342,9 @@ gives its `sequence`, the subscription `url`, the `event_type`, the
 recording each try's `status_code` or `error` (so a retry that eventually
 succeeds is visible attempt by attempt), and `occurred_at`. Querying the
 history of a missing execution returns 404 `not_found` and records nothing.
+If recording a delivery in the history itself fails, the attempt is still
+recorded explicitly with status `failed` rather than vanishing silently, so
+every triggered delivery is visible in the history.
 
 ### Schedules
 
@@ -644,6 +651,77 @@ Rebuilds state solely from the execution event stream and compares it with the
 stored materialized state. A successful response contains `consistent: true`
 and the rebuilt execution.
 
+### Tenants
+
+Any request may declare a tenant by sending an `X-Tenant` header:
+
+```http
+POST /workflows
+Idempotency-Key: workflow-request-1
+X-Tenant: acme
+
+{"id":"order-flow","nodes":[{"id":"reserve","kind":"task","depends_on":[]}]}
+```
+
+The tenant identifier is a non-empty string; an empty `X-Tenant` header is a
+400 `validation_error`. Every endpoint accepts the header — creating
+workflows, starting executions, declaring or replacing schedules, advancing,
+deciding, claiming, heartbeating, releasing, cancelling, recovering,
+replaying, and querying executions, events, checkpoints, schedules, and
+delivery history.
+
+Everything a request touches is scoped to its tenant: workflows, executions,
+schedules and their status, leases, subscriptions, and delivery history.
+Different tenants may reuse the same workflow or execution identifier without
+conflict, and idempotency keys are scoped per tenant as well. Querying or
+operating on another tenant's resource behaves exactly as if the resource did
+not exist — a 404 `not_found` that reveals nothing about whether the
+identifier exists elsewhere — and an execution can only be started against a
+workflow of the same tenant. A schedule fires executions into its own tenant,
+and a delivery history belongs to the tenant of its execution.
+
+Requests without an `X-Tenant` header keep using the original shared
+namespace, whose behavior is unchanged: advancement, approvals, leases,
+retries, timeouts, cancellation, checkpoints, recovery, schedules, and replay
+behave exactly as before, and state fields and event contents gain nothing
+new. The default namespace is one more isolated scope: it cannot see any
+tenant's data, and no tenant can see its data.
+
+### Tenant quotas
+
+Each tenant may declare a quota limiting how many workflows and how many
+executions it can hold:
+
+```http
+PUT /tenants/acme/quota
+Idempotency-Key: quota-request-1
+
+{"workflows":10,"executions":100}
+```
+
+`POST` to the same path is accepted as well. The body contains exactly
+`workflows` and `executions`, both positive integers; a missing or unknown
+field, a non-integer, or a non-positive value is a 400 `validation_error`
+and writes nothing. Declaring again replaces both limits; lowering a limit
+below what the tenant currently holds is allowed and deletes nothing — only
+later writes that would exceed the quota are rejected. The response is the
+stored quota.
+
+```http
+GET /tenants/acme/quota
+```
+
+Returns `{"quota":{"workflows":10,"executions":100}}`, or the definite empty
+result `{"quota":null}` when the tenant never declared a quota.
+
+When creating a workflow or an execution would push the tenant past its
+declared limit, the whole request is rejected with a 409 `conflict` whose
+message names the quota as the cause — no workflow, execution, subscription,
+or schedule is partially written, and existing data is untouched. A schedule
+that comes due while its tenant is at the execution quota creates no
+execution for that period and the schedule is left exactly as it was; it
+fires again once the quota allows it.
+
 ## Errors
 
 Errors use this shape:
@@ -681,7 +759,12 @@ policy, or an unknown field — is a validation error that rejects the whole
 request without partial writes; pausing, resuming, or updating the schedule
 of a missing workflow, or pausing and resuming a workflow that has no
 schedule, is a missing resource, and a malformed pause or resume body is a
-validation error. Request bodies must not contain
+validation error. An empty `X-Tenant` header is a validation error; querying
+or operating on another tenant's resource is a missing resource. A quota
+declaration with a missing or unknown field, a non-integer, or a
+non-positive limit is a validation error, and a write that would exceed a
+tenant's declared quota is a conflict whose message names the quota.
+Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
 they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.
