@@ -738,6 +738,194 @@ class LoopRetryTests(unittest.TestCase):
         self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-fatal"))
 
 
+class WorkerLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name) / "test.db")
+        self.service = ChronicleFlow(self.database)
+        self.workflow = {
+            "id": "orders",
+            "nodes": [
+                {"id": "reserve", "kind": "task", "depends_on": []},
+                {"id": "charge", "kind": "task", "depends_on": ["reserve"]},
+            ],
+        }
+        self.service.create_workflow(self.workflow, "w1")
+        self.service.create_execution({"id": "run-1", "workflow_id": "orders", "input": {}}, "e1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def event_types(self, execution_id="run-1"):
+        return [event["type"] for event in self.service.events(execution_id)]
+
+    def test_claim_returns_work_item_and_lease_without_touching_state_or_events(self):
+        state_before = self.service.get_execution("run-1")
+        result = self.service.claim("run-1", {"worker_id": "worker-1", "lease_seconds": 30}, "cl1")
+        self.assertEqual({"execution_id": "run-1", "workflow_id": "orders"}, result["work_item"])
+        lease = result["lease"]
+        self.assertEqual("worker-1", lease["worker_id"])
+        self.assertEqual(30, lease["lease_seconds"])
+        self.assertGreater(lease["expires_at"], lease["heartbeat_at"])
+        self.assertEqual(state_before, self.service.get_execution("run-1"))
+        self.assertEqual(["execution_started"], self.event_types())
+
+    def test_claim_defaults_lease_seconds(self):
+        result = self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        self.assertEqual(30.0, result["lease"]["lease_seconds"])
+
+    def test_claim_missing_execution_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.claim("ghost", {"worker_id": "worker-1"}, "cl-ghost")
+
+    def test_claim_on_completed_execution_returns_empty_result(self):
+        self.service.advance("run-1", {"output": {}}, "a1")
+        self.service.advance("run-1", {"output": {}}, "a2")
+        result = self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        self.assertEqual({"work_item": None, "lease": None}, result)
+        self.assertEqual(["execution_started", "node_completed", "node_completed", "execution_completed"], self.event_types())
+
+    def test_claim_on_terminated_execution_returns_empty_result(self):
+        self.service.cancel("run-1", "c1")
+        result = self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        self.assertEqual({"work_item": None, "lease": None}, result)
+        self.assertEqual(["execution_started", "execution_terminated"], self.event_types())
+
+    def test_repeated_claim_while_held_conflicts(self):
+        self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        with self.assertRaises(ConflictError):
+            self.service.claim("run-1", {"worker_id": "worker-2"}, "cl2")
+        with self.assertRaises(ConflictError):
+            self.service.claim("run-1", {"worker_id": "worker-1"}, "cl3")
+
+    def test_invalid_claim_bodies_are_rejected(self):
+        for body in (
+            {},
+            {"lease_seconds": 30},
+            {"worker_id": ""},
+            {"worker_id": 7},
+            {"worker_id": "worker-1", "lease_seconds": 0},
+            {"worker_id": "worker-1", "lease_seconds": -1},
+            {"worker_id": "worker-1", "lease_seconds": "30"},
+            {"worker_id": "worker-1", "lease_seconds": True},
+            {"worker_id": "worker-1", "lease_seconds": float("inf")},
+            {"worker_id": "worker-1", "extra": 1},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.claim("run-1", body, "cl-bad")
+
+    def test_heartbeat_extends_lease_without_events_or_state_changes(self):
+        claimed = self.service.claim("run-1", {"worker_id": "worker-1", "lease_seconds": 30}, "cl1")
+        state_before = self.service.get_execution("run-1")
+        renewed = self.service.heartbeat("run-1", {"worker_id": "worker-1"}, "hb1")
+        self.assertEqual("worker-1", renewed["lease"]["worker_id"])
+        self.assertGreaterEqual(renewed["lease"]["expires_at"], claimed["lease"]["expires_at"])
+        self.assertGreaterEqual(renewed["lease"]["heartbeat_at"], claimed["lease"]["heartbeat_at"])
+        self.assertEqual(state_before, self.service.get_execution("run-1"))
+        self.assertEqual(["execution_started"], self.event_types())
+
+    def test_heartbeat_errors(self):
+        with self.assertRaises(NotFoundError):
+            self.service.heartbeat("ghost", {"worker_id": "worker-1"}, "hb-ghost")
+        with self.assertRaises(NotFoundError):
+            self.service.heartbeat("run-1", {"worker_id": "worker-1"}, "hb-none")
+        self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        with self.assertRaises(ConflictError):
+            self.service.heartbeat("run-1", {"worker_id": "worker-2"}, "hb-other")
+        for body in ({}, {"worker_id": "worker-1", "extra": 1}, {"worker_id": 5}):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.heartbeat("run-1", body, "hb-bad")
+
+    def test_release_returns_work_item_to_claimable_set(self):
+        self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        result = self.service.release("run-1", {"worker_id": "worker-1"}, "rl1")
+        self.assertEqual({"released": True}, result)
+        reclaimed = self.service.claim("run-1", {"worker_id": "worker-2"}, "cl2")
+        self.assertEqual("worker-2", reclaimed["lease"]["worker_id"])
+        self.assertEqual(["execution_started"], self.event_types())
+
+    def test_release_errors(self):
+        with self.assertRaises(NotFoundError):
+            self.service.release("ghost", {"worker_id": "worker-1"}, "rl-ghost")
+        with self.assertRaises(NotFoundError):
+            self.service.release("run-1", {"worker_id": "worker-1"}, "rl-none")
+        self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        with self.assertRaises(ConflictError):
+            self.service.release("run-1", {"worker_id": "worker-2"}, "rl-other")
+        for body in ({}, {"worker_id": "worker-1", "extra": 1}):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.release("run-1", body, "rl-bad")
+
+    def test_advance_requires_the_lease_holder(self):
+        self.service.claim("run-1", {"worker_id": "worker-1"}, "cl1")
+        with self.assertRaises(ConflictError):
+            self.service.advance("run-1", {"output": {"x": 1}}, "a1")
+        with self.assertRaises(ConflictError):
+            self.service.advance("run-1", {"output": {"x": 1}, "worker_id": "worker-2"}, "a2")
+        state = self.service.advance("run-1", {"output": {"x": 1}, "worker_id": "worker-1"}, "a3")
+        self.assertEqual({"reserve": {"x": 1}}, state["outputs"])
+        self.assertEqual(["reserve"], state["completed_nodes"])
+
+    def test_expired_lease_blocks_submission_and_failover_does_not_duplicate(self):
+        self.service.claim("run-1", {"worker_id": "worker-1", "lease_seconds": 0.05}, "cl1")
+        first = self.service.advance("run-1", {"output": {"r": 1}, "worker_id": "worker-1"}, "a1")
+        self.assertEqual(["reserve"], first["completed_nodes"])
+        time.sleep(0.1)
+        with self.assertRaises(ConflictError):
+            self.service.advance("run-1", {"output": {"late": True}, "worker_id": "worker-1"}, "a2")
+        with self.assertRaises(ConflictError):
+            self.service.heartbeat("run-1", {"worker_id": "worker-1"}, "hb1")
+        reclaimed = self.service.claim("run-1", {"worker_id": "worker-2"}, "cl2")
+        self.assertEqual("worker-2", reclaimed["lease"]["worker_id"])
+        state = self.service.advance("run-1", {"output": {"c": 2}, "worker_id": "worker-2"}, "a3")
+        self.assertEqual("completed", state["status"])
+        self.assertEqual({"reserve": {"r": 1}, "charge": {"c": 2}}, state["outputs"])
+        self.assertEqual(
+            ["execution_started", "node_completed", "node_completed", "execution_completed"],
+            self.event_types(),
+        )
+        self.assertEqual({"consistent": True, "execution": state}, self.service.replay("run-1"))
+
+    def test_expired_lease_can_be_reclaimed_by_the_same_worker(self):
+        self.service.claim("run-1", {"worker_id": "worker-1", "lease_seconds": 0.05}, "cl1")
+        time.sleep(0.1)
+        reclaimed = self.service.claim("run-1", {"worker_id": "worker-1"}, "cl2")
+        self.assertEqual("worker-1", reclaimed["lease"]["worker_id"])
+
+    def test_unexpired_lease_and_ownership_survive_restart(self):
+        self.service.claim("run-1", {"worker_id": "worker-1", "lease_seconds": 30}, "cl1")
+        resumed = ChronicleFlow(self.database)
+        with self.assertRaises(ConflictError):
+            resumed.claim("run-1", {"worker_id": "worker-2"}, "cl2")
+        renewed = resumed.heartbeat("run-1", {"worker_id": "worker-1"}, "hb1")
+        self.assertEqual("worker-1", renewed["lease"]["worker_id"])
+        state = resumed.advance("run-1", {"output": {"r": 1}, "worker_id": "worker-1"}, "a1")
+        self.assertEqual(["reserve"], state["completed_nodes"])
+
+    def test_claim_heartbeat_release_idempotency(self):
+        first = self.service.claim("run-1", {"worker_id": "worker-1"}, "same-claim")
+        repeated = self.service.claim("run-1", {"worker_id": "worker-1"}, "same-claim")
+        self.assertEqual(first, repeated)
+        heartbeat = self.service.heartbeat("run-1", {"worker_id": "worker-1"}, "same-heartbeat")
+        self.assertEqual(heartbeat, self.service.heartbeat("run-1", {"worker_id": "worker-1"}, "same-heartbeat"))
+        with self.assertRaises(ConflictError):
+            self.service.release("run-1", {"worker_id": "worker-1"}, "same-claim")
+        with self.assertRaises(ConflictError):
+            self.service.advance("run-1", {"output": {}, "worker_id": "worker-1"}, "same-heartbeat")
+
+    def test_unclaimed_execution_keeps_baseline_shape_and_advance(self):
+        state = self.service.advance("run-1", {"output": {"r": 1}}, "a1")
+        self.assertNotIn("lease", state)
+        self.assertNotIn("work_item", state)
+        self.assertEqual(["execution_started", "node_completed"], self.event_types())
+        final = self.service.advance("run-1", {"output": {"c": 2}}, "a2")
+        self.assertEqual("completed", final["status"])
+        self.assertEqual({"consistent": True, "execution": final}, self.service.replay("run-1"))
+
+
 class CheckpointRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

@@ -71,6 +71,12 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.checkpoints(parts[1])
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "claim" and self.command == "POST":
+            return 200, self.service.claim(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "heartbeat" and self.command == "POST":
+            return 200, self.service.heartbeat(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "release" and self.command == "POST":
+            return 200, self.service.release(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
             return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "recover" and self.command == "POST":

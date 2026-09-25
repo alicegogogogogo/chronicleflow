@@ -38,6 +38,9 @@ def _new_loop_state() -> dict[str, Any]:
     return {"status": "pending", "current_iteration": 0, "iterations": [], "end_reason": None}
 
 
+DEFAULT_LEASE_SECONDS = 30.0
+
+
 class ChronicleFlow:
     def __init__(self, database: str):
         self.store = Store(database)
@@ -171,8 +174,16 @@ class ChronicleFlow:
         ]
 
     def advance(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) not in ({"output"}, {"failure"}):
+        if not isinstance(raw, dict) or set(raw) not in (
+            {"output"},
+            {"failure"},
+            {"output", "worker_id"},
+            {"failure", "worker_id"},
+        ):
             raise ValidationError("advance body must contain exactly an output object or a failure object")
+        worker_id = raw.get("worker_id")
+        if worker_id is not None:
+            worker_id = _identifier(worker_id, "worker id")
         if "output" in raw:
             if not isinstance(raw["output"], dict):
                 raise ValidationError("advance output must be an object")
@@ -186,6 +197,7 @@ class ChronicleFlow:
             state = self.get_execution(execution_id)
             if state["status"] != "running":
                 return state
+            self._assert_submission_allowed(execution_id, worker_id)
             workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (state["workflow_id"],)).fetchone()
             workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
             self._auto_process(execution_id, workflow, state)
@@ -218,6 +230,112 @@ class ChronicleFlow:
             return state
 
         return self._idempotent(key, f"cancel:{execution_id}", apply)
+
+    def _lease_row(self, execution_id: str) -> Any:
+        return self.store.connection.execute(
+            "SELECT worker_id, lease_seconds, expires_at, heartbeat_at FROM leases WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _lease_payload(worker_id: str, lease_seconds: float, expires_at: float, heartbeat_at: float) -> dict[str, Any]:
+        return {
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+            "expires_at": expires_at,
+            "heartbeat_at": heartbeat_at,
+        }
+
+    def _assert_submission_allowed(self, execution_id: str, worker_id: str | None) -> None:
+        """Once a work item is claimed, only the active lease holder may submit results."""
+        row = self._lease_row(execution_id)
+        if row is None:
+            return
+        if time.time() >= row["expires_at"]:
+            raise ConflictError(f"lease for execution {execution_id} has expired")
+        if worker_id != row["worker_id"]:
+            raise ConflictError(f"work item for execution {execution_id} is held by another worker")
+
+    def claim(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or "worker_id" not in raw or not set(raw) <= {"worker_id", "lease_seconds"}:
+            raise ValidationError("claim body must contain a worker_id and optionally lease_seconds")
+        worker_id = _identifier(raw["worker_id"], "worker id")
+        lease_seconds = raw.get("lease_seconds", DEFAULT_LEASE_SECONDS)
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)):
+            raise ValidationError("lease_seconds must be a positive number of seconds")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValidationError("lease_seconds must be a positive number of seconds")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id)
+            if state["status"] != "running":
+                # A finished execution has no claimable work item; the request
+                # is a definite empty result and absorbs no input.
+                return {"work_item": None, "lease": None}
+            now = time.time()
+            row = self._lease_row(execution_id)
+            if row is not None and now < row["expires_at"]:
+                raise ConflictError(f"work item for execution {execution_id} is already claimed")
+            expires_at = now + lease_seconds
+            self.store.connection.execute(
+                "INSERT INTO leases(execution_id, worker_id, lease_seconds, expires_at, heartbeat_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(execution_id) DO UPDATE SET worker_id = excluded.worker_id, "
+                "lease_seconds = excluded.lease_seconds, expires_at = excluded.expires_at, heartbeat_at = excluded.heartbeat_at",
+                (execution_id, worker_id, lease_seconds, expires_at, now),
+            )
+            return {
+                "work_item": {"execution_id": execution_id, "workflow_id": state["workflow_id"]},
+                "lease": self._lease_payload(worker_id, lease_seconds, expires_at, now),
+            }
+
+        return self._idempotent(key, f"claim:{execution_id}", apply)
+
+    def heartbeat(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
+            raise ValidationError("heartbeat body must contain exactly a worker_id")
+        worker_id = _identifier(raw["worker_id"], "worker id")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id)
+            row = self._lease_row(execution_id)
+            if row is None:
+                raise NotFoundError(f"execution {execution_id} has no claimed work item")
+            now = time.time()
+            if state["status"] != "running":
+                raise ConflictError(f"execution {execution_id} is not running")
+            if now >= row["expires_at"]:
+                raise ConflictError(f"lease for execution {execution_id} has expired")
+            if row["worker_id"] != worker_id:
+                raise ConflictError(f"work item for execution {execution_id} is held by another worker")
+            # A heartbeat only extends the lease and refreshes the active time;
+            # it never advances nodes, writes outputs, or appends node events.
+            expires_at = now + row["lease_seconds"]
+            self.store.connection.execute(
+                "UPDATE leases SET expires_at = ?, heartbeat_at = ? WHERE execution_id = ?",
+                (expires_at, now, execution_id),
+            )
+            return {"lease": self._lease_payload(worker_id, row["lease_seconds"], expires_at, now)}
+
+        return self._idempotent(key, f"heartbeat:{execution_id}", apply)
+
+    def release(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
+            raise ValidationError("release body must contain exactly a worker_id")
+        worker_id = _identifier(raw["worker_id"], "worker id")
+
+        def apply() -> dict[str, Any]:
+            self.get_execution(execution_id)
+            row = self._lease_row(execution_id)
+            if row is None:
+                raise NotFoundError(f"execution {execution_id} has no claimed work item")
+            if time.time() >= row["expires_at"]:
+                raise ConflictError(f"lease for execution {execution_id} has expired")
+            if row["worker_id"] != worker_id:
+                raise ConflictError(f"work item for execution {execution_id} is held by another worker")
+            self.store.connection.execute("DELETE FROM leases WHERE execution_id = ?", (execution_id,))
+            return {"released": True}
+
+        return self._idempotent(key, f"release:{execution_id}", apply)
 
     def checkpoints(self, execution_id: str) -> dict[str, Any]:
         self.get_execution(execution_id)

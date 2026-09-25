@@ -287,5 +287,132 @@ class CheckpointHttpTransportTests(unittest.TestCase):
         self.assertTrue(json.loads(data)["consistent"])
 
 
+class WorkerLeaseHttpTests(unittest.TestCase):
+    @staticmethod
+    def _request(port, method, path, body=None, raw=None, key=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        payload = raw if raw is not None else (json.dumps(body) if body is not None else None)
+        headers = {"Content-Type": "application/json"}
+        if key is not None:
+            headers["Idempotency-Key"] = key
+        connection.request(method, path, payload, headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-leases.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls._request(
+            cls.port,
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-lease",
+                "nodes": [
+                    {"id": "a", "kind": "task", "depends_on": []},
+                    {"id": "b", "kind": "task", "depends_on": ["a"]},
+                ],
+            },
+            key="wf-lease",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, raw=None):
+        return self._request(self.port, method, path, body=body, raw=raw, key=key)
+
+    def start(self, execution_id):
+        self.call("POST", "/executions", {"id": execution_id, "workflow_id": "wf-lease", "input": {}}, f"ex-{execution_id}")
+
+    def test_claim_heartbeat_release_round_trip(self):
+        self.start("run-l1")
+        status, data = self.call("POST", "/executions/run-l1/claim", {"worker_id": "w-1", "lease_seconds": 30}, "cl-l1")
+        self.assertEqual(200, status)
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        payload = json.loads(data)
+        self.assertEqual({"execution_id": "run-l1", "workflow_id": "wf-lease"}, payload["work_item"])
+        self.assertEqual("w-1", payload["lease"]["worker_id"])
+        status, data = self.call("POST", "/executions/run-l1/heartbeat", {"worker_id": "w-1"}, "hb-l1")
+        self.assertEqual(200, status)
+        self.assertEqual("w-1", json.loads(data)["lease"]["worker_id"])
+        status, data = self.call("POST", "/executions/run-l1/release", {"worker_id": "w-1"}, "rl-l1")
+        self.assertEqual(200, status)
+        self.assertEqual({"released": True}, json.loads(data))
+        status, data = self.call("POST", "/executions/run-l1/claim", {"worker_id": "w-2"}, "cl-l1b")
+        self.assertEqual(200, status)
+        self.assertEqual("w-2", json.loads(data)["lease"]["worker_id"])
+        # claims, heartbeats, and releases append no events
+        status, data = self.call("GET", "/executions/run-l1/events")
+        self.assertEqual(["execution_started"], [event["type"] for event in json.loads(data)["events"]])
+
+    def test_held_work_item_gates_advance(self):
+        self.start("run-l2")
+        self.call("POST", "/executions/run-l2/claim", {"worker_id": "w-1"}, "cl-l2")
+        status, data = self.call("POST", "/executions/run-l2/advance", {"output": {"v": 1}}, "adv-l2-anon")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "POST", "/executions/run-l2/advance", {"output": {"v": 1}, "worker_id": "w-2"}, "adv-l2-other"
+        )
+        self.assertEqual(409, status)
+        status, data = self.call("POST", "/executions/run-l2/advance", {"output": {"v": 1}, "worker_id": "w-1"}, "adv-l2")
+        self.assertEqual(200, status)
+        self.assertEqual({"a": {"v": 1}}, json.loads(data)["outputs"])
+
+    def test_double_claim_conflicts(self):
+        self.start("run-l3")
+        self.call("POST", "/executions/run-l3/claim", {"worker_id": "w-1"}, "cl-l3")
+        status, data = self.call("POST", "/executions/run-l3/claim", {"worker_id": "w-2"}, "cl-l3b")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_claim_on_finished_execution_is_empty(self):
+        self.start("run-l4")
+        self.call("POST", "/executions/run-l4/advance", {"output": {}}, "adv-l4-1")
+        self.call("POST", "/executions/run-l4/advance", {"output": {}}, "adv-l4-2")
+        status, data = self.call("POST", "/executions/run-l4/claim", {"worker_id": "w-1"}, "cl-l4")
+        self.assertEqual(200, status)
+        self.assertEqual({"work_item": None, "lease": None}, json.loads(data))
+
+    def test_lease_errors(self):
+        self.start("run-l5")
+        status, data = self.call("POST", "/executions/nope/claim", {"worker_id": "w-1"}, "cl-nope")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+        status, data = self.call("POST", "/executions/run-l5/heartbeat", {"worker_id": "w-1"}, "hb-none")
+        self.assertEqual(404, status)
+        status, data = self.call("POST", "/executions/run-l5/release", {"worker_id": "w-1"}, "rl-none")
+        self.assertEqual(404, status)
+        status, data = self.call("POST", "/executions/run-l5/claim", {"lease_seconds": 30}, "cl-bad")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "POST", "/executions/run-l5/claim", raw=b'{"worker_id":"w-1","lease_seconds":1e400}', key="cl-nan"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_lease_idempotency_key_scoping(self):
+        self.start("run-l6")
+        self.call("POST", "/executions/run-l6/claim", {"worker_id": "w-1"}, "shared-lease-key")
+        status, data = self.call("POST", "/executions/run-l6/heartbeat", {"worker_id": "w-1"}, "shared-lease-key")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        status, data = self.call("POST", "/executions/run-l6/advance", {"output": {}, "worker_id": "w-1"}, "shared-lease-key")
+        self.assertEqual(409, status)
+
+
 if __name__ == "__main__":
     unittest.main()

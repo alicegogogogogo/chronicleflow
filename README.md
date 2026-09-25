@@ -22,6 +22,10 @@ The initial release intentionally supports a compact public contract:
 - a checkpoint is written at every node boundary, capturing the state
   summary and event position, so an execution can be recovered from the
   latest checkpoint after a restart;
+- workers may claim a running execution to receive a work item with a
+  time-bounded lease, renew the lease with heartbeats, and release it;
+  while a lease is active only its holder may submit results, and an
+  expired or released lease returns the work item to the claimable set;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -221,7 +225,9 @@ Idempotency-Key: advance-request-2
 ```
 
 The body must contain exactly one of `output` or `failure`, and `failure`
-carries exactly a `reason` string. A failed task appends a `node_failed`
+carries exactly a `reason` string. Either body may additionally carry a
+`worker_id` string identifying the lease holder when the execution's work
+item has been claimed (see "Claim a work item"). A failed task appends a `node_failed`
 event recording the attempt number and reason. While the task has retries
 left it returns to the ready set and a `node_retried` event records the next
 attempt number; otherwise the task is permanently failed and the execution
@@ -252,6 +258,87 @@ execution records exactly one `termination_reason` — `retries_exhausted`,
 event; completed executions keep a `null` termination reason and their own
 `execution_completed` event. Advancing a terminated execution returns its
 state unchanged without consuming the submitted output or failure.
+
+### Claim a work item
+
+```http
+POST /executions/run-1/claim
+Idempotency-Key: claim-request-1
+
+{"worker_id":"worker-7","lease_seconds":30}
+```
+
+Claiming is how an external worker takes ownership of a running execution
+before advancing its ready tasks. `worker_id` is a non-empty string and
+`lease_seconds` is an optional positive number of seconds (default 30). The
+response contains the claimed `work_item` (its `execution_id` and
+`workflow_id`) and a `lease` recording the `worker_id`, the `lease_seconds`
+duration, the `expires_at` deadline, and the `heartbeat_at` active time.
+Each work item is held by at most one worker at a time: claiming a work
+item whose lease is still active — even by the same worker — is a 409
+`conflict`. Claiming a completed or terminated execution returns the
+definite empty result `{"work_item":null,"lease":null}` and absorbs no
+input, and claiming a missing execution returns 404.
+
+While a work item is held, results are submitted through the usual
+`advance` entry by including the holder's identity:
+
+```http
+POST /executions/run-1/advance
+Idempotency-Key: advance-request-3
+
+{"output":{"reservation_id":"r-9"},"worker_id":"worker-7"}
+```
+
+Submitting results for a work item held by another worker, or after the
+lease has expired, is a 409 `conflict` that does not change execution
+state. An execution that never claimed a work item accepts `advance`
+exactly as before, and its state fields and event stream are identical to
+an execution without any claim.
+
+When a lease expires, the work item returns to the claimable set and may be
+claimed again by the same or another worker. The second claim continues
+from the materialized state: node outputs and results recorded by the
+earlier holder are never advanced or recorded twice, and every written
+output belongs to the single advance that submitted it.
+
+### Renew a lease
+
+```http
+POST /executions/run-1/heartbeat
+Idempotency-Key: heartbeat-request-1
+
+{"worker_id":"worker-7"}
+```
+
+Within the lease period the holder may heartbeat to extend `expires_at` by
+the lease duration and refresh the `heartbeat_at` active time; the response
+carries the updated `lease`. A heartbeat never advances nodes, writes
+outputs, or appends node events. A heartbeat from another worker or after
+the lease expired is a 409 `conflict`; a heartbeat for a missing execution
+or an execution with no claimed work item is a 404 `not_found`.
+
+### Release a work item
+
+```http
+POST /executions/run-1/release
+Idempotency-Key: release-request-1
+
+{"worker_id":"worker-7"}
+```
+
+Releasing invalidates the lease immediately and returns the work item to
+the claimable set, so it can be claimed again right away; progress already
+made and the recorded events are unchanged. Releasing with another
+worker's identity or after expiry is a 409 `conflict`; releasing for a
+missing execution or an execution with no claimed work item is a 404
+`not_found`.
+
+Claims, heartbeats, and releases append no events and add no fields to the
+execution state, so replay, checkpoints, and recovery are unaffected.
+Leases live in the same SQLite database as the execution state, so
+unexpired leases and claim ownership remain valid after the service
+restarts.
 
 ### Recover from a checkpoint
 
@@ -310,10 +397,14 @@ Validation errors return 400, missing resources return 404, and conflicts
 return 409. A `retries` value that is negative, non-integer, or greater than
 10, and a non-positive `timeout_seconds`, are validation errors. Reusing a
 workflow or execution identifier, or reusing an idempotency key across
-different operations, is a conflict. Recovering a missing execution is a
-missing resource, while recovering an execution that has no checkpoint or
-whose latest checkpoint is unparseable is a conflict; an invalid recover body
-is a validation error. Request bodies must not contain
+different operations, is a conflict. Claiming a work item whose lease is
+still active, submitting results for a work item held by another worker or
+after the lease expired, and heartbeating or releasing a lease held by
+another worker are conflicts, while heartbeating or releasing an execution
+with no claimed work item is a missing resource. Recovering a missing
+execution is a missing resource, while recovering an execution that has no
+checkpoint or whose latest checkpoint is unparseable is a conflict; an
+invalid recover body is a validation error. Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
 they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.
