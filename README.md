@@ -33,7 +33,12 @@ The initial release intentionally supports a compact public contract:
 - duplicate commands with the same idempotency key return the original result;
 - workflows and executions may declare webhook subscriptions, and matching
   business events are delivered to the declared targets with bounded retries,
-  each delivery recorded in a per-execution history.
+  each delivery recorded in a per-execution history;
+- a workflow may declare a schedule — a fixed interval in seconds or a
+  five-field cron plan — and the service automatically creates one execution
+  per due period with the declared input; schedules can be paused and
+  resumed, and periods missed while paused are either caught up once or
+  skipped, according to the declared missed policy.
 
 ## Requirements
 
@@ -91,6 +96,18 @@ A workflow may also declare webhook `subscriptions` alongside its nodes:
 
 See "Webhook notifications" below for the subscription shape and delivery
 semantics; the subscriptions apply to every execution of the workflow.
+
+A workflow may also declare a `schedule` alongside its nodes:
+
+```json
+{
+  "id": "nightly-orders",
+  "nodes": [{"id": "reserve", "kind": "task", "depends_on": []}],
+  "schedule": {"interval_seconds": 3600, "input": {"mode": "nightly"}, "missed_policy": "catch_up"}
+}
+```
+
+See "Schedules" below for the declaration shape and the trigger semantics.
 
 Besides `task`, a node may have `kind` set to `condition`:
 
@@ -321,6 +338,103 @@ gives its `sequence`, the subscription `url`, the `event_type`, the
 recording each try's `status_code` or `error` (so a retry that eventually
 succeeds is visible attempt by attempt), and `occurred_at`. Querying the
 history of a missing execution returns 404 `not_found` and records nothing.
+
+### Schedules
+
+A workflow may declare a schedule so the service creates executions
+automatically. The declaration happens at workflow creation (a `schedule`
+field next to `id` and `nodes`) or later through the update endpoint, and it
+takes effect from the moment it is stored. A schedule contains exactly:
+
+- `interval_seconds`: a positive integer number of seconds between runs —
+  or, alternatively, `cron`: a five-field cron expression (`minute hour
+  day-of-month month day-of-week`) whose fields support `*`, `*/step`,
+  single values, ranges `a-b`, ranges with steps `a-b/step`, and
+  comma-separated lists, with 0 and 7 both meaning Sunday. Exactly one of
+  `interval_seconds` and `cron` must be present;
+- `input`: the object used as the execution input of every created run;
+- `missed_policy`: either `catch_up` or `skip`.
+
+Whenever a period of the plan comes due, the service creates one execution
+for the workflow with the declared input. The created execution is exactly a
+manually created one: it starts `running` with the same state shape and the
+usual `execution_started` event, and advancing, approvals, leases, retries,
+timeouts, and cancellation all behave identically. The trigger itself writes
+nothing into the created execution's event stream and adds no fields to its
+state; the schedule's own record of when it fired and which execution it
+created is exposed through the status query below.
+
+Creation is idempotent per schedule period: a repeated trigger or a repeated
+request for the same period returns the same execution and never creates a
+second one, under either missed policy. When periods were missed — the
+schedule was paused, or the service was not running — `catch_up` makes up
+exactly the single most recent missed period, while `skip` makes up none;
+neither policy ever creates more than one execution for the same period.
+
+An invalid declaration rejects the whole request with 400
+`validation_error` and writes nothing: a non-positive or non-integer
+`interval_seconds`, a cron expression with other than five fields, out-of
+range values, or unparseable fragments, declaring both `interval_seconds`
+and `cron`, a `missed_policy` other than `catch_up` or `skip`, a missing or
+mistyped `input`, or any unknown field.
+
+### Declare or replace a schedule
+
+```http
+PUT /workflows/nightly-orders/schedule
+Idempotency-Key: schedule-request-1
+
+{"interval_seconds":3600,"input":{"mode":"nightly"},"missed_policy":"catch_up"}
+```
+
+`POST` to the same path is accepted as well. The body is validated exactly
+like a schedule declared at creation time, and the response is the schedule
+status. Updating replaces the plan and re-anchors it at the update time; the
+paused flag is kept. A missing workflow returns 404 `not_found`, an invalid
+plan 400 `validation_error` with no partial write, and reusing an
+idempotency key from another operation is a 409 `conflict`.
+
+### Inspect the schedule status
+
+```http
+GET /workflows/nightly-orders/schedule
+```
+
+Returns the declared plan as given (`interval_seconds` or `cron`, the
+`input`, and the `missed_policy`), whether the schedule is currently
+`paused`, the `last_triggered_at` time, and the `last_execution_id` of the
+most recently created execution (both `null` until the first trigger). A
+workflow that never declared a schedule returns the definite empty result
+`{"schedule":null}`, and a missing workflow returns 404 `not_found`.
+
+### Pause and resume a schedule
+
+```http
+POST /workflows/nightly-orders/schedule/pause
+Idempotency-Key: pause-request-1
+
+{}
+```
+
+```http
+POST /workflows/nightly-orders/schedule/resume
+Idempotency-Key: resume-request-1
+
+{}
+```
+
+Both bodies must be empty objects; a missing or mistyped body, an unknown
+field, or a non-finite number is a 400 `validation_error`. While paused, due
+periods create no executions. Resuming settles the periods that came due
+during the pause according to the missed policy: `catch_up` immediately
+creates the single most recent missed run, `skip` creates none. Pausing or
+resuming a workflow that has no schedule, or any schedule operation on a
+missing workflow, returns 404 `not_found`; reusing an idempotency key across
+operations returns 409 `conflict`. Both responses carry the schedule status.
+
+Workflows that declare no schedule are unaffected: their creation,
+advancement, approvals, deliveries, checkpoints, recovery, and replay behave
+exactly as before, with no additional fields or events.
 
 ### Checkpoints
 
@@ -560,7 +674,14 @@ another worker are conflicts, while heartbeating or releasing an execution
 with no claimed work item is a missing resource. Recovering a missing
 execution is a missing resource, while recovering an execution that has no
 checkpoint or whose latest checkpoint is unparseable is a conflict; an
-invalid recover body is a validation error. Request bodies must not contain
+invalid recover body is a validation error. An invalid schedule declaration —
+a non-positive or non-integer interval, a malformed or out-of-range cron
+expression, declaring both an interval and a cron plan, an unknown missed
+policy, or an unknown field — is a validation error that rejects the whole
+request without partial writes; pausing, resuming, or updating the schedule
+of a missing workflow, or pausing and resuming a workflow that has no
+schedule, is a missing resource, and a malformed pause or resume body is a
+validation error. Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
 they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.

@@ -61,6 +61,14 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"status": "ok"}
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
+            return 200, self.service.schedule_status(parts[1])
+        if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command in ("POST", "PUT"):
+            return 200, self.service.update_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "pause" and self.command == "POST":
+            return 200, self.service.pause_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+        if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "resume" and self.command == "POST":
+            return 200, self.service.resume_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if self.command == "POST" and parts == ["executions"]:
             return 201, self.service.create_execution(self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 2 and parts[0] == "executions" and self.command == "GET":
@@ -100,6 +108,7 @@ class Handler(BaseHTTPRequestHandler):
 
     do_GET = _handle
     do_POST = _handle
+    do_PUT = _handle
 
 
 def main() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,8 @@ class Store:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # Serializes transactions across request threads and the scheduler thread.
+        self._lock = threading.RLock()
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -67,19 +70,36 @@ class Store:
               document TEXT NOT NULL,
               PRIMARY KEY (execution_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS schedules (
+              workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
+              document TEXT NOT NULL,
+              paused INTEGER NOT NULL DEFAULT 0,
+              anchor_at REAL NOT NULL,
+              cursor TEXT NOT NULL DEFAULT '',
+              last_triggered_at TEXT,
+              last_execution_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS schedule_triggers (
+              workflow_id TEXT NOT NULL REFERENCES workflows(id),
+              period_key TEXT NOT NULL,
+              execution_id TEXT NOT NULL,
+              triggered_at TEXT NOT NULL,
+              PRIMARY KEY (workflow_id, period_key)
+            );
             """
         )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.connection
-        except Exception:
-            self.connection.execute("ROLLBACK")
-            raise
-        else:
-            self.connection.execute("COMMIT")
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
 
     @staticmethod
     def encode(value: Any) -> str:

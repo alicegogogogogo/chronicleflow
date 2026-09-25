@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator
 from .errors import ConflictError, NotFoundError, ValidationError
 from .model import Node, Workflow, _finite_json, _identifier
 from .notify import NOTIFY_EVENT_TYPES, parse_subscriptions
+from .schedule import Cron, parse_schedule
 from .store import Store
 
 
@@ -46,6 +47,9 @@ def _new_loop_state() -> dict[str, Any]:
 
 DEFAULT_LEASE_SECONDS = 30.0
 
+# How often the background scheduler looks for due schedules.
+SCHEDULER_TICK_SECONDS = 0.05
+
 
 class ChronicleFlow:
     def __init__(self, database: str):
@@ -53,6 +57,19 @@ class ChronicleFlow:
         # Per-thread notification state: events appended inside an operation
         # are buffered and delivered only after the operation commits.
         self._local = threading.local()
+        self._scheduler = threading.Thread(target=self._scheduler_loop, daemon=True, name="chronicleflow-scheduler")
+        self._scheduler.start()
+
+    def _scheduler_loop(self) -> None:
+        """Fire due schedules in the background; a failing pass never stops the loop."""
+        while True:
+            try:
+                with self._operation():
+                    with self.store.transaction():
+                        self._process_schedules()
+            except Exception:
+                pass
+            time.sleep(SCHEDULER_TICK_SECONDS)
 
     def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if not key:
@@ -172,11 +189,17 @@ class ChronicleFlow:
 
     def create_workflow(self, raw: Any, key: str | None) -> dict[str, Any]:
         subscriptions = None
-        if isinstance(raw, dict) and "subscriptions" in raw:
-            # Subscriptions are validated up front so an invalid declaration
-            # rejects the whole request before anything is written.
-            subscriptions = parse_subscriptions(raw["subscriptions"])
-            raw = {field: value for field, value in raw.items() if field != "subscriptions"}
+        schedule = None
+        if isinstance(raw, dict):
+            # Subscriptions and the schedule are validated up front so an
+            # invalid declaration rejects the whole request before anything
+            # is written.
+            if "subscriptions" in raw:
+                subscriptions = parse_subscriptions(raw["subscriptions"])
+                raw = {field: value for field, value in raw.items() if field != "subscriptions"}
+            if "schedule" in raw:
+                schedule = parse_schedule(raw["schedule"])
+                raw = {field: value for field, value in raw.items() if field != "schedule"}
         workflow = Workflow.parse(raw)
 
         def create() -> dict[str, Any]:
@@ -194,9 +217,23 @@ class ChronicleFlow:
                     "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
                     ("workflow", workflow.id, position, self.store.encode(subscription)),
                 )
+            if schedule is not None:
+                self._insert_schedule(workflow.id, schedule)
             return workflow.as_dict()
 
         return self._idempotent(key, f"create-workflow:{workflow.id}", create)
+
+    def _insert_schedule(self, workflow_id: str, schedule: dict[str, Any]) -> None:
+        """Attach a fresh schedule declaration to a workflow; it is due from now on."""
+        self.store.connection.execute(
+            "INSERT INTO schedules(workflow_id, document, paused, anchor_at, cursor) VALUES (?, ?, 0, ?, '') "
+            "ON CONFLICT(workflow_id) DO UPDATE SET document = excluded.document, "
+            "anchor_at = excluded.anchor_at, cursor = '', last_triggered_at = NULL, last_execution_id = NULL",
+            (workflow_id, self.store.encode(schedule), time.time()),
+        )
+        # A new declaration starts a fresh period lineage, so trigger records
+        # of a previous plan never make a new period look already fired.
+        self.store.connection.execute("DELETE FROM schedule_triggers WHERE workflow_id = ?", (workflow_id,))
 
     def create_execution(self, raw: Any, key: str | None) -> dict[str, Any]:
         if not isinstance(raw, dict) or not {"id", "workflow_id", "input"} <= set(raw) <= {
@@ -223,66 +260,77 @@ class ChronicleFlow:
                 raise ValidationError("timeout_seconds must be a positive number of seconds")
 
         def create() -> dict[str, Any]:
-            workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
-            if not workflow_row:
-                raise NotFoundError(f"workflow {workflow_id} was not found")
-            workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
-            loops = {node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"}
-            has_approvals = any(node.approval is not None for node in workflow.nodes)
-            deadline = time.time() + timeout if timeout is not None else None
-            state = {
-                "id": execution_id,
-                "workflow_id": workflow_id,
-                "status": "running",
-                "termination_reason": None,
-                "timeout_seconds": timeout,
-                "deadline_at": deadline,
-                "input": raw["input"],
-                "completed_nodes": [],
-                "skipped_nodes": [],
-                "failed_nodes": [],
-                "condition_results": {},
-                "outputs": {},
-                "attempts": {},
-                "loops": loops,
-            }
-            # Approval state exists only for workflows that declare approval
-            # points, so every other execution keeps its baseline state shape.
-            if has_approvals:
-                state["waiting_approval"] = None
-                state["approvals"] = []
-            try:
-                self.store.connection.execute(
-                    "INSERT INTO executions(id, workflow_id, state) VALUES (?, ?, ?)",
-                    (execution_id, workflow_id, self.store.encode(state)),
-                )
-            except Exception as error:
-                if "UNIQUE constraint" in str(error):
-                    raise ConflictError(f"execution {execution_id} already exists") from error
-                raise
-            for position, subscription in enumerate(subscriptions or []):
-                self.store.connection.execute(
-                    "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
-                    ("execution", execution_id, position, self.store.encode(subscription)),
-                )
-            started_payload: dict[str, Any] = {
-                "workflow_id": workflow_id,
-                "input": raw["input"],
-                "loops": loops,
-                "timeout_seconds": timeout,
-                "deadline_at": deadline,
-            }
-            if has_approvals:
-                started_payload["waiting_approval"] = None
-                started_payload["approvals"] = []
-            self._append(
-                execution_id,
-                "execution_started",
-                started_payload,
-            )
-            return state
+            return self._insert_execution(execution_id, workflow_id, raw["input"], timeout, subscriptions)
 
         return self._idempotent(key, f"create-execution:{execution_id}", create)
+
+    def _insert_execution(
+        self,
+        execution_id: str,
+        workflow_id: str,
+        input_data: dict[str, Any],
+        timeout: float | None,
+        subscriptions: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Insert a running execution and its start event; caller holds a transaction."""
+        workflow_row = self.store.connection.execute("SELECT document FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+        if not workflow_row:
+            raise NotFoundError(f"workflow {workflow_id} was not found")
+        workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+        loops = {node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"}
+        has_approvals = any(node.approval is not None for node in workflow.nodes)
+        deadline = time.time() + timeout if timeout is not None else None
+        state = {
+            "id": execution_id,
+            "workflow_id": workflow_id,
+            "status": "running",
+            "termination_reason": None,
+            "timeout_seconds": timeout,
+            "deadline_at": deadline,
+            "input": input_data,
+            "completed_nodes": [],
+            "skipped_nodes": [],
+            "failed_nodes": [],
+            "condition_results": {},
+            "outputs": {},
+            "attempts": {},
+            "loops": loops,
+        }
+        # Approval state exists only for workflows that declare approval
+        # points, so every other execution keeps its baseline state shape.
+        if has_approvals:
+            state["waiting_approval"] = None
+            state["approvals"] = []
+        try:
+            self.store.connection.execute(
+                "INSERT INTO executions(id, workflow_id, state) VALUES (?, ?, ?)",
+                (execution_id, workflow_id, self.store.encode(state)),
+            )
+        except Exception as error:
+            if "UNIQUE constraint" in str(error):
+                raise ConflictError(f"execution {execution_id} already exists") from error
+            raise
+        for position, subscription in enumerate(subscriptions or []):
+            self.store.connection.execute(
+                "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
+                ("execution", execution_id, position, self.store.encode(subscription)),
+            )
+        started_payload: dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "input": input_data,
+            "loops": loops,
+            "timeout_seconds": timeout,
+            "deadline_at": deadline,
+        }
+        if has_approvals:
+            started_payload["waiting_approval"] = None
+            started_payload["approvals"] = []
+        self._append(
+            execution_id,
+            "execution_started",
+            started_payload,
+        )
+        return state
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
         with self._operation():
@@ -652,6 +700,186 @@ class ChronicleFlow:
             return snapshot
 
         return self._idempotent(key, f"recover:{execution_id}", apply)
+
+    # --- schedules ------------------------------------------------------
+
+    def _schedule_row(self, workflow_id: str) -> Any:
+        return self.store.connection.execute(
+            "SELECT workflow_id, document, paused, anchor_at, cursor, last_triggered_at, last_execution_id "
+            "FROM schedules WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+
+    def _assert_workflow_exists(self, workflow_id: str) -> None:
+        row = self.store.connection.execute("SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+        if not row:
+            raise NotFoundError(f"workflow {workflow_id} was not found")
+
+    def _schedule_status(self, row: Any) -> dict[str, Any]:
+        if row is None:
+            # A workflow without a declared schedule has a definite empty result.
+            return {"schedule": None}
+        return {
+            "schedule": self.store.decode(row["document"]),
+            "paused": bool(row["paused"]),
+            "last_triggered_at": row["last_triggered_at"],
+            "last_execution_id": row["last_execution_id"],
+        }
+
+    def schedule_status(self, workflow_id: str) -> dict[str, Any]:
+        with self._operation():
+            with self.store.transaction():
+                self._assert_workflow_exists(workflow_id)
+                # Settle any due periods first so the answer reflects the
+                # schedule as of now, not as of the last background tick.
+                self._process_schedules(workflow_id)
+                return self._schedule_status(self._schedule_row(workflow_id))
+
+    @staticmethod
+    def _empty_body(raw: Any, operation: str) -> None:
+        if not isinstance(raw, dict) or raw:
+            raise ValidationError(f"{operation} body must be an empty object")
+
+    def pause_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        self._empty_body(raw, "pause schedule")
+
+        def apply() -> dict[str, Any]:
+            self._assert_workflow_exists(workflow_id)
+            if self._schedule_row(workflow_id) is None:
+                raise NotFoundError(f"workflow {workflow_id} has no schedule")
+            self.store.connection.execute("UPDATE schedules SET paused = 1 WHERE workflow_id = ?", (workflow_id,))
+            return self._schedule_status(self._schedule_row(workflow_id))
+
+        with self._operation():
+            return self._idempotent(key, f"pause-schedule:{workflow_id}", apply)
+
+    def resume_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        self._empty_body(raw, "resume schedule")
+
+        def apply() -> dict[str, Any]:
+            self._assert_workflow_exists(workflow_id)
+            if self._schedule_row(workflow_id) is None:
+                raise NotFoundError(f"workflow {workflow_id} has no schedule")
+            self.store.connection.execute("UPDATE schedules SET paused = 0 WHERE workflow_id = ?", (workflow_id,))
+            # Periods that came due while paused are settled immediately
+            # according to the missed policy.
+            self._process_schedules(workflow_id)
+            return self._schedule_status(self._schedule_row(workflow_id))
+
+        with self._operation():
+            return self._idempotent(key, f"resume-schedule:{workflow_id}", apply)
+
+    def update_schedule(self, workflow_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        # The whole plan is validated before anything is written, so an
+        # invalid declaration never partially replaces the stored one.
+        schedule = parse_schedule(raw)
+
+        def apply() -> dict[str, Any]:
+            self._assert_workflow_exists(workflow_id)
+            self._insert_schedule(workflow_id, schedule)
+            return self._schedule_status(self._schedule_row(workflow_id))
+
+        with self._operation():
+            return self._idempotent(key, f"update-schedule:{workflow_id}", apply)
+
+    def _set_schedule_cursor(self, workflow_id: str, cursor: str) -> None:
+        self.store.connection.execute("UPDATE schedules SET cursor = ? WHERE workflow_id = ?", (cursor, workflow_id))
+
+    def _process_schedules(self, workflow_id: str | None = None) -> None:
+        """Settle every due schedule period once; caller holds a transaction."""
+        now = time.time()
+        if workflow_id is None:
+            rows = self.store.connection.execute(
+                "SELECT workflow_id, document, paused, anchor_at, cursor FROM schedules"
+            ).fetchall()
+        else:
+            rows = self.store.connection.execute(
+                "SELECT workflow_id, document, paused, anchor_at, cursor FROM schedules WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchall()
+        for row in rows:
+            self._process_schedule(row, now)
+
+    def _process_schedule(self, row: Any, now: float) -> None:
+        """Advance one schedule to the current time.
+
+        Exactly one execution may exist per schedule period: the trigger row
+        and the cursor together make a repeated pass for the same period a
+        no-op. While paused nothing fires; a "skip" schedule consumes the
+        periods it sleeps through, a "catch_up" schedule keeps them pending
+        and fires only the most recent one when it is resumed.
+        """
+        workflow_id = row["workflow_id"]
+        document = self.store.decode(row["document"])
+        paused = bool(row["paused"])
+        cursor = row["cursor"]
+        if "interval_seconds" in document:
+            interval = document["interval_seconds"]
+            anchor = row["anchor_at"]
+            index = int((now - anchor) // interval)
+            if index < 1:
+                return
+            consumed = int(cursor) if cursor else 0
+            if index <= consumed:
+                return
+            period_key = f"i:{index}"
+            fire_at = anchor + index * interval
+            granularity = float(interval)
+            new_cursor = str(index)
+        else:
+            cron = Cron.parse(document["cron"])
+            candidate = int(cursor) if cursor else cron.next_after(row["anchor_at"])
+            horizon = int(now // 60) * 60
+            latest = None
+            following = candidate
+            while following is not None and following <= horizon:
+                latest = following
+                following = cron.next_after(following)
+            if latest is None:
+                if candidate is not None and str(candidate) != cursor:
+                    self._set_schedule_cursor(workflow_id, str(candidate))
+                return
+            period_key = f"c:{latest}"
+            fire_at = float(latest)
+            granularity = 60.0
+            # When no further match exists (an unreachable expression), keep
+            # scanning from just past the current horizon on later passes.
+            new_cursor = str(following) if following is not None else str(horizon + 60)
+        if paused:
+            if document["missed_policy"] == "skip":
+                self._set_schedule_cursor(workflow_id, new_cursor)
+            return
+        if document["missed_policy"] == "catch_up" or now - fire_at < granularity:
+            self._fire_schedule(workflow_id, document, period_key)
+        self._set_schedule_cursor(workflow_id, new_cursor)
+
+    def _fire_schedule(self, workflow_id: str, document: dict[str, Any], period_key: str) -> str:
+        """Create the execution for one schedule period, or return the existing one."""
+        existing = self.store.connection.execute(
+            "SELECT execution_id, triggered_at FROM schedule_triggers WHERE workflow_id = ? AND period_key = ?",
+            (workflow_id, period_key),
+        ).fetchone()
+        if existing:
+            execution_id = existing["execution_id"]
+            triggered_at = existing["triggered_at"]
+        else:
+            execution_id = f"{workflow_id}-scheduled-{period_key}"
+            claimed = self.store.connection.execute("SELECT 1 FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            if not claimed:
+                # The created execution is exactly a manually created one:
+                # same state shape and the usual execution_started event,
+                # with nothing schedule-specific added to its stream.
+                self._insert_execution(execution_id, workflow_id, document["input"], None, None)
+            triggered_at = self.store.now()
+            self.store.connection.execute(
+                "INSERT INTO schedule_triggers(workflow_id, period_key, execution_id, triggered_at) VALUES (?, ?, ?, ?)",
+                (workflow_id, period_key, execution_id, triggered_at),
+            )
+        self.store.connection.execute(
+            "UPDATE schedules SET last_triggered_at = ?, last_execution_id = ? WHERE workflow_id = ?",
+            (triggered_at, execution_id, workflow_id),
+        )
+        return execution_id
 
     def _node_container(self, workflow: Workflow, state: dict[str, Any], node_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return the state fragment holding the node's progress and its event context."""
