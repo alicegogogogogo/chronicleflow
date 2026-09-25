@@ -47,6 +47,13 @@ class Store:
               created_at TEXT NOT NULL,
               PRIMARY KEY (execution_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS leases (
+              execution_id TEXT PRIMARY KEY REFERENCES executions(id),
+              worker_id TEXT NOT NULL,
+              lease_seconds REAL NOT NULL,
+              expires_at REAL NOT NULL,
+              heartbeat_at REAL NOT NULL
+            );
             """
         )
 
