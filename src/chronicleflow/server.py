@@ -69,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"events": self.service.events(parts[1])}
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "checkpoints" and self.command == "GET":
             return 200, self.service.checkpoints(parts[1])
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "deliveries" and self.command == "GET":
+            return 200, self.service.deliveries(parts[1])
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":
