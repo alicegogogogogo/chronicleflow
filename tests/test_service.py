@@ -261,10 +261,12 @@ class LoopWorkflowTests(unittest.TestCase):
             self.assertEqual({"attempt": expected}, iteration["outputs"])
         # body outputs belong to their iterations, not the execution outputs
         self.assertEqual({"prepare": {"prepared": 1}}, third["outputs"])
-        self.assertEqual(["prepare", "retry_loop"], third["completed_nodes"])
+        # The finished loop also surfaces each body node completed across its
+        # rounds in the execution-level list, once each, before the loop node.
+        self.assertEqual(["prepare", "check", "attempt", "retry_loop"], third["completed_nodes"])
         final = self.service.advance("run-1", {"output": {"done": True}}, "a4")
         self.assertEqual("completed", final["status"])
-        self.assertEqual(["prepare", "retry_loop", "finalize"], final["completed_nodes"])
+        self.assertEqual(["prepare", "check", "attempt", "retry_loop", "finalize"], final["completed_nodes"])
         event_types = [event["type"] for event in self.service.events("run-1")]
         self.assertEqual(
             [

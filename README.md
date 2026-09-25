@@ -92,7 +92,7 @@ version is the usual `404 not_found`.
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, and all history and status
-queries. An empty
+queries, as well as the usage and bill queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -147,6 +147,66 @@ schedule is left unchanged — its cursor, `last_triggered_at`, and
 `last_execution_id` stay as they were — so the period is settled on a later
 pass once capacity exists, under the usual per-period idempotence. Delivery
 history follows the tenant of the execution it belongs to.
+
+### Usage metering and billing
+
+Requests that carry a tenant identifier leave a usage record for each billable
+action they perform. Only tenant-scoped requests are metered: a request that
+omits the `X-Tenant-Id` header keeps the legacy namespace and writes no usage
+record at all, with its state shapes and event content unchanged. The four
+metered action types are:
+
+- `workflow_created` — a workflow definition is stored. Adding a new version
+  to an existing workflow is one workflow creation, the same as the first
+  definition;
+- `execution_started` — an execution is created and starts `running`;
+- `schedule_triggered` — a due schedule period creates its execution. The
+  scheduled execution is metered both as `execution_started` and as
+  `schedule_triggered`;
+- `delivery_attempted` — one outbound webhook HTTP attempt is made. A
+  subscription that retries is metered once per attempt, so a delivery that
+  fails and then succeeds on its second attempt records two attempts; the
+  action is metered whether it ultimately succeeds or fails.
+
+Metering is atomic with the action it describes: a write rejected by
+validation or by a quota produces no record and performs no partial write.
+Repeating an idempotent command returns its first result and writes no second
+record, and settling the same schedule period more than once (a repeated
+trigger or a later pass) meters that period only once. Replay, recovery, and
+queries never meter and never alter recorded usage or billing conclusions.
+
+```http
+GET /usage
+X-Tenant-Id: acme
+```
+
+Returns `{"usage":[{"type":"execution_started","count":1}, ...]}`: the
+cumulative count of recorded actions per type, sorted by ascending type
+identifier. Types with no records are omitted, so a tenant with no usage gets
+the definite empty result `{"usage":[]}`.
+
+```http
+GET /bill
+X-Tenant-Id: acme
+```
+
+Returns the per-type bill:
+
+```json
+{"bill":{"items":[
+  {"type":"execution_started","count":1,"unit_price":100,"subtotal":100},
+  {"type":"workflow_created","count":2,"unit_price":1000,"subtotal":2000}
+],"total":2100}}
+```
+
+Each item gives the metered `count`, a positive-integer `unit_price` in cents
+that is also returned in the response, and a `subtotal` equal to
+`count * unit_price`; `total` is the integer-cent sum of every subtotal. With
+no records, `items` is empty and `total` is `0`.
+
+Both endpoints are tenant-scoped `GET` requests: a missing or empty
+`X-Tenant-Id` is a `400 validation_error`. Usage and bill data follow the
+usual tenant isolation, so one tenant can never see another's records.
 
 ### Health
 
@@ -331,7 +391,13 @@ iteration. Once every body node is completed or skipped, the condition is
 evaluated again: `true` starts the next iteration, `false` ends the loop with
 `condition_false`, and reaching `max_iterations` ends it with
 `iteration_limit` after that iteration finishes. Ending the loop completes
-the loop node and releases the dependencies of its successors.
+the loop node and releases the dependencies of its successors. Once the loop
+has finished, the execution-level `completed_nodes` list also includes every
+body node that completed in any iteration, each listed only once and in the
+order of its first completion, followed by the loop node itself; body nodes
+skipped by a `run_if` guard remain out of the execution-level completed list
+and are visible only in their iteration record. Body task outputs still
+belong only to their iterations.
 
 Execution state exposes each loop under `loops`: `status`, the
 `current_iteration`, one entry per iteration with its own `completed_nodes`,
@@ -472,9 +538,11 @@ The response is the updated execution state. Migrating a `completed` or
 execution or a target version that does not exist for the workflow returns
 `404 not_found`; a cross-tenant reference is the same missing resource. A
 missing or mistyped `version`, an unknown field, or a non-finite number is a
-`400 validation_error`. Migrating to the version the execution is already
-bound to returns the current state as-is, appending no event and writing no
-checkpoint; reusing an idempotency key for another operation is a `409
+`400 validation_error`. Migrating a running execution to the version it is
+already bound to returns the current state as-is, appending no event and
+writing no checkpoint; a `completed` or `terminated` execution instead
+returns `409 conflict` even when the target version is exactly the one it is
+bound to. Reusing an idempotency key for another operation is a `409
 conflict`. The migration event is listed directly by the per-execution
 events query, and node outputs produced after the migration belong to the
 target version's definition. Approver-list validation, lease renewal, and
@@ -922,7 +990,8 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations require a tenant and positive integer limits, validated by the
+declarations and the usage and bill queries require a tenant, and quota
+limits are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
 Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across

@@ -129,6 +129,22 @@ class MigrationServiceTests(unittest.TestCase):
         self.assertNotIn("version_migrated",
                          [event["type"] for event in self.service.events("run-term")])
 
+    def test_finished_execution_conflicts_even_for_the_version_it_is_bound_to(self):
+        self.versions()
+        self.start("run-done2", "orders", version="v2")
+        self.service.advance("run-done2", {"output": {}}, "e1")
+        self.service.advance("run-done2", {"output": {}}, "e2")
+        self.service.advance("run-done2", {"output": {}}, "e3")
+        self.assertEqual("completed", self.service.get_execution("run-done2")["status"])
+        # Target equals the currently bound version, but a finished execution
+        # conflicts rather than getting the running-execution no-op.
+        with self.assertRaises(ConflictError):
+            self.service.migrate("run-done2", {"version": "v2"}, "mig-done2-same")
+        self.start("run-term2", "orders", version="v2", key="ex-run-term2")
+        self.service.cancel("run-term2", "cancel-run-term2")
+        with self.assertRaises(ConflictError):
+            self.service.migrate("run-term2", {"version": "v2"}, "mig-term2-same")
+
     def test_missing_execution_or_version_is_not_found(self):
         self.versions()
         with self.assertRaises(NotFoundError):

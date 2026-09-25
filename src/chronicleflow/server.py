@@ -74,6 +74,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
+        if self.command == "GET" and parts == ["usage"]:
+            return 200, self.service.usage(self._tenant())
+        if self.command == "GET" and parts == ["bill"]:
+            return 200, self.service.bill(self._tenant())
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 2 and parts[0] == "workflows" and self.command == "GET":

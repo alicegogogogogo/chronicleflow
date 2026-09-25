@@ -57,6 +57,28 @@ DEFAULT_LEASE_SECONDS = 30.0
 # How often the background scheduler looks for due schedules.
 SCHEDULER_TICK_SECONDS = 0.05
 
+# Metered action types, in ascending identifier order. Only requests that
+# carry a tenant identifier are metered; the legacy namespace stays unmetered.
+USAGE_TYPE_WORKFLOW_CREATED = "workflow_created"
+USAGE_TYPE_EXECUTION_STARTED = "execution_started"
+USAGE_TYPE_SCHEDULE_TRIGGERED = "schedule_triggered"
+USAGE_TYPE_DELIVERY_ATTEMPTED = "delivery_attempted"
+USAGE_TYPES = (
+    USAGE_TYPE_DELIVERY_ATTEMPTED,
+    USAGE_TYPE_EXECUTION_STARTED,
+    USAGE_TYPE_SCHEDULE_TRIGGERED,
+    USAGE_TYPE_WORKFLOW_CREATED,
+)
+
+# Unit price per metered action, in integer cents. Positive by contract and
+# reported verbatim on every bill line.
+USAGE_UNIT_PRICES = {
+    USAGE_TYPE_WORKFLOW_CREATED: 1000,
+    USAGE_TYPE_EXECUTION_STARTED: 100,
+    USAGE_TYPE_SCHEDULE_TRIGGERED: 50,
+    USAGE_TYPE_DELIVERY_ATTEMPTED: 10,
+}
+
 
 class ChronicleFlow:
     def __init__(self, database: str):
@@ -184,6 +206,38 @@ class ChronicleFlow:
                 (tenant, execution_id, sequence_row["sequence"], self.store.encode(record)),
             )
 
+    def _record_usage(self, tenant: str, usage_type: str) -> None:
+        """Append one metered usage record for a tenant on the open transaction.
+
+        Only tenant-scoped requests are metered: the legacy namespace (empty
+        tenant) keeps no records at all. Callers run inside a store
+        transaction so the record commits atomically with the action it meters
+        and rolls back when that action is rejected.
+        """
+        if not tenant:
+            return
+        sequence_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM usage_records WHERE tenant = ?",
+            (tenant,),
+        ).fetchone()
+        self.store.connection.execute(
+            "INSERT INTO usage_records(tenant, sequence, type, created_at) VALUES (?, ?, ?, ?)",
+            (tenant, sequence_row["sequence"], usage_type, self.store.now()),
+        )
+
+    def _record_delivery_attempt_usage(self, tenant: str) -> None:
+        """Meter a delivery attempt in its own transaction.
+
+        Deliveries run after the triggering operation commits, so they hold no
+        open transaction; every HTTP attempt is metered once regardless of its
+        final result, including when the delivery history write fails.
+        """
+        if not tenant:
+            return
+        with self.store.transaction():
+            self._record_usage(tenant, USAGE_TYPE_DELIVERY_ATTEMPTED)
+
+
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
         message = {"event_type": notice["type"], "execution_id": notice["execution_id"], **notice["payload"]}
         body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
@@ -193,6 +247,10 @@ class ChronicleFlow:
             if attempt > 1:
                 # Increasing backoff between attempts of the same delivery.
                 time.sleep(min(0.1 * (2 ** (attempt - 2)), 1.0))
+            # Every HTTP attempt is metered once, whether it eventually
+            # succeeds or fails; it runs after the triggering operation
+            # committed, in its own transaction.
+            self._record_delivery_attempt_usage(notice["tenant"])
             request = urllib.request.Request(
                 subscription["url"],
                 data=body,
@@ -269,6 +327,50 @@ class ChronicleFlow:
                     return {"quota": None}
                 return {"quota": {"workflows": row["workflows"], "executions": row["executions"]}}
 
+    def _usage_counts(self, tenant: str) -> dict[str, int]:
+        rows = self.store.connection.execute(
+            "SELECT type, COUNT(*) AS count FROM usage_records WHERE tenant = ? GROUP BY type",
+            (tenant,),
+        ).fetchall()
+        counts = {row["type"]: row["count"] for row in rows}
+        return {usage_type: counts[usage_type] for usage_type in USAGE_TYPES if counts.get(usage_type)}
+
+    def usage(self, tenant: str) -> dict[str, Any]:
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        with self._operation():
+            with self.store.transaction():
+                # Types are reported in ascending identifier order; a type
+                # with no records is omitted, so a tenant with no usage gets a
+                # definite empty list.
+                entries = [
+                    {"type": usage_type, "count": count}
+                    for usage_type, count in sorted(self._usage_counts(tenant).items())
+                ]
+                return {"usage": entries}
+
+    def bill(self, tenant: str) -> dict[str, Any]:
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        with self._operation():
+            with self.store.transaction():
+                items = []
+                total = 0
+                for usage_type, count in sorted(self._usage_counts(tenant).items()):
+                    unit_price = USAGE_UNIT_PRICES[usage_type]
+                    subtotal = count * unit_price
+                    total += subtotal
+                    items.append(
+                        {
+                            "type": usage_type,
+                            "count": count,
+                            "unit_price": unit_price,
+                            "subtotal": subtotal,
+                        }
+                    )
+                return {"bill": {"items": items, "total": total}}
+
+
     def _quota_limits(self, tenant: str) -> Any:
         return self.store.connection.execute(
             "SELECT workflows, executions FROM quotas WHERE tenant = ?",
@@ -338,6 +440,9 @@ class ChronicleFlow:
                 self._replace_workflow_subscriptions(workflow.id, version, subscriptions, tenant)
                 if schedule is not None:
                     self._insert_schedule(workflow.id, schedule, tenant)
+                # An added version is itself one workflow creation, so it is
+                # metered exactly like the first definition.
+                self._record_usage(tenant, USAGE_TYPE_WORKFLOW_CREATED)
                 result = workflow.as_dict()
                 result["version"] = version
                 return result
@@ -360,6 +465,7 @@ class ChronicleFlow:
             self._replace_workflow_subscriptions(workflow.id, version or "", subscriptions, tenant)
             if schedule is not None:
                 self._insert_schedule(workflow.id, schedule, tenant)
+            self._record_usage(tenant, USAGE_TYPE_WORKFLOW_CREATED)
             result = workflow.as_dict()
             if version is not None:
                 result["version"] = version
@@ -607,6 +713,9 @@ class ChronicleFlow:
             started_payload,
             tenant,
         )
+        # An execution is metered once at creation; the same insert path backs
+        # scheduled runs, which additionally record a schedule_triggered usage.
+        self._record_usage(tenant, USAGE_TYPE_EXECUTION_STARTED)
         return state
 
     def get_execution(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
@@ -1316,6 +1425,11 @@ class ChronicleFlow:
                 # same state shape and the usual execution_started event,
                 # with nothing schedule-specific added to its stream.
                 self._insert_execution(execution_id, workflow_id, document["input"], None, None, tenant)
+                # A scheduled run counts both as an execution start (recorded
+                # by _insert_execution) and as one schedule trigger. A
+                # repeated pass for the same period takes the existing-row or
+                # already-claimed path and is not metered again.
+                self._record_usage(tenant, USAGE_TYPE_SCHEDULE_TRIGGERED)
             triggered_at = self.store.now()
             self.store.connection.execute(
                 "INSERT INTO schedule_triggers(tenant, workflow_id, period_key, execution_id, triggered_at) "
@@ -1526,6 +1640,17 @@ class ChronicleFlow:
         reason: str,
         tenant: str = DEFAULT_TENANT,
     ) -> None:
+        # Once the loop is finished, its body conclusions are also visible in
+        # the execution-level completed list. Include every body node completed
+        # in any iteration, preserving first completion order and listing a
+        # node only once, followed by the loop node itself. Skipped body nodes
+        # remain per-iteration skips rather than completions.
+        listed = set(state["completed_nodes"])
+        for iteration in loop_state["iterations"]:
+            for node_id in iteration["completed_nodes"]:
+                if node_id not in listed:
+                    state["completed_nodes"].append(node_id)
+                    listed.add(node_id)
         loop_state["status"] = "completed"
         loop_state["end_reason"] = reason
         state["completed_nodes"].append(loop_id)
@@ -1613,6 +1738,15 @@ class ChronicleFlow:
                 loop_state["iterations"].append(_new_iteration())
             elif event_type == "loop_completed" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
+                # Mirror the materialized roll-up: body nodes completed in any
+                # iteration enter the execution-level completed list once, in
+                # first completion order, followed by the loop node.
+                listed = set(rebuilt["completed_nodes"])
+                for iteration in loop_state["iterations"]:
+                    for node_id in iteration["completed_nodes"]:
+                        if node_id not in listed:
+                            rebuilt["completed_nodes"].append(node_id)
+                            listed.add(node_id)
                 loop_state["status"] = "completed"
                 loop_state["end_reason"] = payload["reason"]
                 rebuilt["completed_nodes"].append(payload["loop_id"])
