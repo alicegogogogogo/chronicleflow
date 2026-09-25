@@ -54,6 +54,19 @@ class Store:
               expires_at REAL NOT NULL,
               heartbeat_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS subscriptions (
+              owner_type TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              position INTEGER NOT NULL,
+              document TEXT NOT NULL,
+              PRIMARY KEY (owner_type, owner_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS deliveries (
+              execution_id TEXT NOT NULL REFERENCES executions(id),
+              sequence INTEGER NOT NULL,
+              document TEXT NOT NULL,
+              PRIMARY KEY (execution_id, sequence)
+            );
             """
         )
 

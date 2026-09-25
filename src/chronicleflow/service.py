@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
+import threading
 import time
-from typing import Any, Callable
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .model import Node, Workflow, _finite_json, _identifier
+from .notify import NOTIFY_EVENT_TYPES, parse_subscriptions
 from .store import Store
 
 
@@ -44,6 +50,9 @@ DEFAULT_LEASE_SECONDS = 30.0
 class ChronicleFlow:
     def __init__(self, database: str):
         self.store = Store(database)
+        # Per-thread notification state: events appended inside an operation
+        # are buffered and delivered only after the operation commits.
+        self._local = threading.local()
 
     def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if not key:
@@ -61,7 +70,113 @@ class ChronicleFlow:
             )
             return response
 
+    @contextmanager
+    def _operation(self) -> Iterator[None]:
+        """Scope a public operation so buffered notifications drain once, after commit."""
+        depth = getattr(self._local, "depth", 0)
+        self._local.depth = depth + 1
+        failed = True
+        try:
+            yield
+            failed = False
+        finally:
+            self._local.depth = depth
+            if depth == 0:
+                pending = getattr(self._local, "pending", [])
+                self._local.pending = []
+                # A failed operation rolls its events back, so nothing is
+                # delivered for it; a delivery problem never reaches the caller.
+                if not failed:
+                    for notice in pending:
+                        try:
+                            self._deliver_notice(notice)
+                        except Exception:
+                            pass
+
+    def _subscriptions_for(self, execution_id: str) -> list[tuple[str, dict[str, Any]]]:
+        """Return (label, subscription) pairs for an execution, workflow first."""
+        row = self.store.connection.execute("SELECT workflow_id FROM executions WHERE id = ?", (execution_id,)).fetchone()
+        if not row:
+            return []
+        pairs: list[tuple[str, dict[str, Any]]] = []
+        for owner_type, owner_id in (("workflow", row["workflow_id"]), ("execution", execution_id)):
+            rows = self.store.connection.execute(
+                "SELECT position, document FROM subscriptions WHERE owner_type = ? AND owner_id = ? ORDER BY position",
+                (owner_type, owner_id),
+            ).fetchall()
+            for sub_row in rows:
+                pairs.append((f"{owner_type}:{sub_row['position']}", self.store.decode(sub_row["document"])))
+        return pairs
+
+    def _deliver_notice(self, notice: dict[str, Any]) -> None:
+        for label, subscription in self._subscriptions_for(notice["execution_id"]):
+            if notice["type"] not in subscription["events"]:
+                continue
+            # The idempotency key is deterministic per event and subscription:
+            # retries of this delivery reuse it, other events never share it.
+            key = f"{notice['execution_id']}:{notice['sequence']}:{label}"
+            record = self._attempt_delivery(subscription, notice, key)
+            with self.store.transaction() as connection:
+                sequence_row = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM deliveries WHERE execution_id = ?",
+                    (notice["execution_id"],),
+                ).fetchone()
+                connection.execute(
+                    "INSERT INTO deliveries(execution_id, sequence, document) VALUES (?, ?, ?)",
+                    (notice["execution_id"], sequence_row["sequence"], self.store.encode(record)),
+                )
+
+    def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
+        message = {"event_type": notice["type"], "execution_id": notice["execution_id"], **notice["payload"]}
+        body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
+        tries: list[dict[str, Any]] = []
+        status = "failed"
+        for attempt in range(1, subscription["max_attempts"] + 1):
+            if attempt > 1:
+                # Increasing backoff between attempts of the same delivery.
+                time.sleep(min(0.1 * (2 ** (attempt - 2)), 1.0))
+            request = urllib.request.Request(
+                subscription["url"],
+                data=body,
+                headers={"Content-Type": "application/json", "Idempotency-Key": key},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=subscription["timeout_seconds"]) as response:
+                    tries.append({"attempt": attempt, "status_code": response.status})
+                status = "delivered"
+                break
+            except urllib.error.HTTPError as error:
+                tries.append({"attempt": attempt, "status_code": error.code})
+            except Exception as error:
+                reason = getattr(error, "reason", error)
+                tries.append({"attempt": attempt, "error": str(reason)})
+        return {
+            "url": subscription["url"],
+            "event_type": notice["type"],
+            "event_sequence": notice["sequence"],
+            "idempotency_key": key,
+            "attempts": tries,
+            "attempt_count": len(tries),
+            "status": status,
+            "occurred_at": self.store.now(),
+        }
+
+    def deliveries(self, execution_id: str) -> dict[str, Any]:
+        self.get_execution(execution_id)
+        rows = self.store.connection.execute(
+            "SELECT sequence, document FROM deliveries WHERE execution_id = ? ORDER BY sequence",
+            (execution_id,),
+        ).fetchall()
+        return {"deliveries": [{"sequence": row["sequence"], **self.store.decode(row["document"])} for row in rows]}
+
     def create_workflow(self, raw: Any, key: str | None) -> dict[str, Any]:
+        subscriptions = None
+        if isinstance(raw, dict) and "subscriptions" in raw:
+            # Subscriptions are validated up front so an invalid declaration
+            # rejects the whole request before anything is written.
+            subscriptions = parse_subscriptions(raw["subscriptions"])
+            raw = {field: value for field, value in raw.items() if field != "subscriptions"}
         workflow = Workflow.parse(raw)
 
         def create() -> dict[str, Any]:
@@ -74,18 +189,32 @@ class ChronicleFlow:
                 if "UNIQUE constraint" in str(error):
                     raise ConflictError(f"workflow {workflow.id} already exists") from error
                 raise
+            for position, subscription in enumerate(subscriptions or []):
+                self.store.connection.execute(
+                    "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
+                    ("workflow", workflow.id, position, self.store.encode(subscription)),
+                )
             return workflow.as_dict()
 
         return self._idempotent(key, f"create-workflow:{workflow.id}", create)
 
     def create_execution(self, raw: Any, key: str | None) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) not in ({"id", "workflow_id", "input"}, {"id", "workflow_id", "input", "timeout_seconds"}):
-            raise ValidationError("execution must contain exactly id, workflow_id, input, and optionally timeout_seconds")
+        if not isinstance(raw, dict) or not {"id", "workflow_id", "input"} <= set(raw) <= {
+            "id",
+            "workflow_id",
+            "input",
+            "timeout_seconds",
+            "subscriptions",
+        }:
+            raise ValidationError(
+                "execution must contain exactly id, workflow_id, input, and optionally timeout_seconds and subscriptions"
+            )
         execution_id = _identifier(raw["id"], "execution id")
         workflow_id = _identifier(raw["workflow_id"], "workflow id")
         if not isinstance(raw["input"], dict):
             raise ValidationError("input must be an object")
         _finite_json(raw["input"], "input")
+        subscriptions = parse_subscriptions(raw["subscriptions"]) if "subscriptions" in raw else None
         timeout = raw.get("timeout_seconds")
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
@@ -131,6 +260,11 @@ class ChronicleFlow:
                 if "UNIQUE constraint" in str(error):
                     raise ConflictError(f"execution {execution_id} already exists") from error
                 raise
+            for position, subscription in enumerate(subscriptions or []):
+                self.store.connection.execute(
+                    "INSERT INTO subscriptions(owner_type, owner_id, position, document) VALUES (?, ?, ?, ?)",
+                    ("execution", execution_id, position, self.store.encode(subscription)),
+                )
             started_payload: dict[str, Any] = {
                 "workflow_id": workflow_id,
                 "input": raw["input"],
@@ -151,12 +285,13 @@ class ChronicleFlow:
         return self._idempotent(key, f"create-execution:{execution_id}", create)
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
-        row = self.store.connection.execute("SELECT state FROM executions WHERE id = ?", (execution_id,)).fetchone()
-        if not row:
-            raise NotFoundError(f"execution {execution_id} was not found")
-        state = self.store.decode(row["state"])
-        self._maybe_timeout(execution_id, state)
-        return state
+        with self._operation():
+            row = self.store.connection.execute("SELECT state FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            if not row:
+                raise NotFoundError(f"execution {execution_id} was not found")
+            state = self.store.decode(row["state"])
+            self._maybe_timeout(execution_id, state)
+            return state
 
     def _maybe_timeout(self, execution_id: str, state: dict[str, Any]) -> None:
         deadline = state.get("deadline_at")
@@ -243,7 +378,8 @@ class ChronicleFlow:
             self._write_checkpoint(execution_id, state)
             return state
 
-        return self._idempotent(key, f"advance:{execution_id}", apply)
+        with self._operation():
+            return self._idempotent(key, f"advance:{execution_id}", apply)
 
     def decision(self, execution_id: str, raw: Any, key: str | None) -> dict[str, Any]:
         if not isinstance(raw, dict) or not {"approver", "decision"} <= set(raw) <= {"approver", "decision", "output", "reason"}:
@@ -308,7 +444,8 @@ class ChronicleFlow:
             self._write_checkpoint(execution_id, state)
             return state
 
-        return self._idempotent(key, f"decision:{execution_id}", apply)
+        with self._operation():
+            return self._idempotent(key, f"decision:{execution_id}", apply)
 
     @staticmethod
     def _is_repeated_decision(
@@ -357,7 +494,8 @@ class ChronicleFlow:
             self.store.connection.execute("UPDATE executions SET state = ? WHERE id = ?", (self.store.encode(state), execution_id))
             return state
 
-        return self._idempotent(key, f"cancel:{execution_id}", apply)
+        with self._operation():
+            return self._idempotent(key, f"cancel:{execution_id}", apply)
 
     def _lease_row(self, execution_id: str) -> Any:
         return self.store.connection.execute(
@@ -810,6 +948,12 @@ class ChronicleFlow:
             "INSERT INTO events(execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
             (execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
         )
+        if event_type in NOTIFY_EVENT_TYPES:
+            # Buffered, not delivered: the surrounding operation may still roll
+            # back. The outermost _operation scope delivers after the commit.
+            self._local.pending = getattr(self._local, "pending", []) + [
+                {"execution_id": execution_id, "sequence": row["sequence"], "type": event_type, "payload": payload}
+            ]
 
     def _write_checkpoint(self, execution_id: str, state: dict[str, Any]) -> None:
         """Persist the state summary and event position at a node boundary."""

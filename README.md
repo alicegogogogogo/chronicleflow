@@ -30,7 +30,10 @@ The initial release intentionally supports a compact public contract:
   time-bounded lease, renew the lease with heartbeats, and release it;
   while a lease is active only its holder may submit results, and an
   expired or released lease returns the work item to the claimable set;
-- duplicate commands with the same idempotency key return the original result.
+- duplicate commands with the same idempotency key return the original result;
+- workflows and executions may declare webhook subscriptions, and matching
+  business events are delivered to the declared targets with bounded retries,
+  each delivery recorded in a per-execution history.
 
 ## Requirements
 
@@ -75,6 +78,19 @@ Idempotency-Key: workflow-request-1
 
 Returns HTTP 201 with the stored workflow. Node identifiers must be unique,
 dependencies must exist, and cycles are rejected.
+
+A workflow may also declare webhook `subscriptions` alongside its nodes:
+
+```json
+{
+  "id": "order-flow",
+  "nodes": [{"id": "reserve", "kind": "task", "depends_on": []}],
+  "subscriptions": [{"url": "https://hooks.example.com/orders", "events": ["execution_completed"]}]
+}
+```
+
+See "Webhook notifications" below for the subscription shape and delivery
+semantics; the subscriptions apply to every execution of the workflow.
 
 Besides `task`, a node may have `kind` set to `condition`:
 
@@ -230,6 +246,18 @@ execution starts. Once the deadline passes, the execution terminates with
 termination reason `timeout` and no longer accepts output. Executions without
 a timeout never expire.
 
+An execution may also declare its own webhook `subscriptions`, which apply in
+addition to the ones its workflow declares:
+
+```json
+{
+  "id": "run-3",
+  "workflow_id": "order-flow",
+  "input": {},
+  "subscriptions": [{"url": "https://hooks.example.com/ops", "events": ["node_completed"], "max_attempts": 3}]
+}
+```
+
 ### Inspect an execution
 
 ```http
@@ -242,6 +270,57 @@ The first endpoint returns the materialized state. The second returns the
 ordered event stream. The third returns the ordered checkpoints; each entry
 gives its `sequence`, the `event_sequence` position it was taken at, the full
 `state` summary, and `created_at`.
+
+### Webhook notifications
+
+Subscriptions declared on a workflow or an execution deliver outbound webhook
+messages when business events occur. Each subscription contains exactly:
+
+- `url`: a non-empty `http` or `https` address to POST to;
+- `events`: a non-empty array of event types without duplicates, drawn from
+  `node_completed`, `execution_completed`, `execution_terminated`, and
+  `approval_decided` (a termination is the same event type whatever its
+  reason);
+- `timeout_seconds` (optional): a positive number of seconds to wait for each
+  delivery attempt, defaulting to 5;
+- `max_attempts` (optional): an integer between 1 and 10, defaulting to 1.
+
+Any other field, a missing `url` or `events`, a mistyped value, an empty or
+duplicated event list, an unknown event type, an empty or non-http(s) `url`,
+a non-finite number, a non-positive timeout or attempt count, or more than
+ten attempts is a 400 `validation_error` and rejects the whole request — no
+workflow, execution, or subscription is partially written.
+
+When a subscribed event occurs, a JSON message is POSTed to each matching
+target immediately: the body carries `event_type`, `execution_id`, and the
+event's details (such as `node_id` for a completed node or `approver` for an
+approval decision). Each delivery request carries an `Idempotency-Key`
+header; retries of the same event reuse the same key, and different events
+never share a key. A delivery is attempted at most the subscription's
+`max_attempts` times, with an increasing backoff between attempts. An
+unreachable target, a timeout, or a non-2xx response marks the attempt as
+failed, but a failed delivery never changes the outcome of the call that
+triggered it.
+
+Deliveries do not append execution events, do not add fields to the execution
+state, and are never triggered by replay, recovery, or queries, so
+checkpoints and replay conclusions are unaffected. An execution that declares
+no subscriptions keeps exactly the same state, event stream, and advancement
+results as before.
+
+### Inspect the delivery history
+
+```http
+GET /executions/run-1/deliveries
+```
+
+Returns `{"deliveries": [...]}` in the order the events occurred. Each record
+gives its `sequence`, the subscription `url`, the `event_type`, the
+`event_sequence` that triggered it, the delivery `idempotency_key`, the final
+`status` (`delivered` or `failed`), the `attempt_count`, an `attempts` list
+recording each try's `status_code` or `error` (so a retry that eventually
+succeeds is visible attempt by attempt), and `occurred_at`. Querying the
+history of a missing execution returns 404 `not_found` and records nothing.
 
 ### Checkpoints
 
@@ -461,7 +540,12 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. A `retries` value that is negative, non-integer, or greater than
-10, and a non-positive `timeout_seconds`, are validation errors. An approval
+10, and a non-positive `timeout_seconds`, are validation errors. A malformed
+subscription — a missing or mistyped field, an unknown field, an empty or
+duplicated event list, an unknown event type, an empty or non-http(s) `url`,
+a non-positive timeout or attempt count, or more than ten attempts — is a
+validation error that rejects the whole request without partial writes, and
+querying the delivery history of a missing execution is a missing resource. An approval
 point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.
