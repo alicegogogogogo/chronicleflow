@@ -31,6 +31,9 @@ The initial release intentionally supports a compact public contract:
   while a lease is active only its holder may submit results, and an
   expired or released lease returns the work item to the claimable set;
 - duplicate commands with the same idempotency key return the original result;
+- a workflow may declare a schedule (a fixed interval or a five-field cron
+  rule) with its own input and a missed-period policy, and the service creates
+  an execution automatically whenever a period comes due;
 - workflows and executions may declare webhook subscriptions, and matching
   business events are delivered to the declared targets with bounded retries,
   each delivery recorded in a per-execution history.
@@ -91,6 +94,10 @@ A workflow may also declare webhook `subscriptions` alongside its nodes:
 
 See "Webhook notifications" below for the subscription shape and delivery
 semantics; the subscriptions apply to every execution of the workflow.
+
+A workflow may also declare a `schedule` here; see "Scheduled executions"
+below. A stored workflow echoes its declared schedule, and only workflows with
+a schedule carry that field.
 
 Besides `task`, a node may have `kind` set to `condition`:
 
@@ -223,6 +230,75 @@ Execution state exposes each loop under `loops`: `status`, the
 records `iteration_started`, `loop_condition_evaluated`, and `loop_completed`
 events alongside the usual per-node ones, so replay rebuilds loop state
 exactly.
+
+### Scheduled executions
+
+A workflow may declare a schedule when it is created, or later through a
+dedicated operation. The declaration carries the plan, the input every
+scheduled execution starts with, and the policy for periods the service was
+not awake to handle:
+
+```json
+"schedule": {
+  "interval_seconds": 300,
+  "input": {"source": "timer"},
+  "misfire_policy": "catch_up"
+}
+```
+
+Exactly one of `interval_seconds` (a positive integer number of seconds) or
+`cron` (a five-field cron expression) is allowed; declaring both or neither is
+a validation error. `misfire_policy` is exactly `catch_up` or `skip`. A cron
+expression has five whitespace-separated fields — minute (0-59), hour (0-23),
+day of month (1-31), month (1-12), day of week (0-6, Sunday through Saturday)
+— and supports `*`, comma lists, numeric ranges (`9-17`), and steps (`*/15`,
+`10-20/2`); a wrong field count, an out-of-range value, or an unparseable
+fragment rejects the request. When both day fields are restricted a day
+matches on either rule; when one is `*` the other decides alone.
+
+The schedule takes effect as soon as the workflow exists. When a period comes
+due the service creates exactly one execution for the workflow with the
+declared input; that execution advances, awaits approval, holds leases,
+retries, times out, and cancels exactly like a manually created one — its
+state shape and event stream are identical (the trigger writes nothing into
+them). Period creation is idempotent within a period: repeated triggers and
+repeated requests for the same period return the same execution and never
+create a second one. If periods were missed (for example while the service
+was down), `catch_up` runs only the single most recently missed period and
+`skip` runs none of them; under either policy one period never produces more
+than one execution.
+
+A schedule may be paused and resumed. While paused, due periods create no
+executions; on resume the elapsed periods are settled under the declared
+misfire policy. Declaring a schedule again replaces the plan (which restarts
+from the current moment), validates the new plan before any write, and keeps
+the paused/active state.
+
+```http
+POST /workflows/order-flow/schedule
+Idempotency-Key: schedule-request-1
+
+{"cron":"0 9 * * 1-5","input":{},"misfire_policy":"skip"}
+
+POST /workflows/order-flow/schedule/pause
+Idempotency-Key: schedule-pause-1
+
+POST /workflows/order-flow/schedule/resume
+Idempotency-Key: schedule-resume-1
+
+GET /workflows/order-flow/schedule
+GET /workflows/order-flow/schedule/events
+```
+
+Pause and resume carry an empty body. The status query returns the plan as
+declared, the `misfire_policy`, whether the schedule is currently `paused`,
+the `last_fired_at` time, and the `last_execution_id`; a workflow without a
+schedule returns the definite empty result `{"schedule":null}`, while a
+missing workflow returns 404. The events endpoint lists, in order, when the
+schedule triggered which execution (with the period start), recording only
+the schedule's own firings. Pausing or resuming a workflow without a
+schedule, or operating on a missing workflow, returns 404 `not_found`;
+reusing an idempotency key across different operations returns 409.
 
 ### Start an execution
 
@@ -548,7 +624,12 @@ validation error that rejects the whole request without partial writes, and
 querying the delivery history of a missing execution is a missing resource. An approval
 point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
-a decision other than `approved` or `rejected` are validation errors.
+a decision other than `approved` or `rejected` are validation errors. An
+invalid schedule — a non-positive or non-integer `interval_seconds`, a cron
+expression with the wrong field count, out-of-range values or unparseable
+fragments, both a plan and a cron, an unknown `misfire_policy`, or an unknown
+field — rejects the whole request (workflow creation or schedule declaration)
+without partial writes, as does a pause or resume body that carries fields.
 Reusing a workflow or execution identifier, or reusing an idempotency key
 across different operations, is a conflict. A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
