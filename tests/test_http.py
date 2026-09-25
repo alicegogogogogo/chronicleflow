@@ -414,5 +414,173 @@ class WorkerLeaseHttpTests(unittest.TestCase):
         self.assertEqual(409, status)
 
 
+class ApprovalHttpTests(unittest.TestCase):
+    @staticmethod
+    def _request(port, method, path, body=None, raw=None, key=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        payload = raw if raw is not None else (json.dumps(body) if body is not None else None)
+        headers = {"Content-Type": "application/json"}
+        if key is not None:
+            headers["Idempotency-Key"] = key
+        connection.request(method, path, payload, headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-approvals.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls._request(
+            cls.port,
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-approval",
+                "nodes": [
+                    {"id": "a", "kind": "task", "depends_on": []},
+                    {"id": "signoff", "kind": "task", "depends_on": ["a"], "approval": {"approvers": ["alice", "bob"]}},
+                ],
+            },
+            key="wf-approval",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, raw=None):
+        return self._request(self.port, method, path, body=body, raw=raw, key=key)
+
+    def park(self, execution_id):
+        self.call("POST", "/executions", {"id": execution_id, "workflow_id": "wf-approval", "input": {}}, f"ex-{execution_id}")
+        self.call("POST", f"/executions/{execution_id}/advance", {"output": {"v": 1}}, f"adv-{execution_id}-1")
+        status, data = self.call("POST", f"/executions/{execution_id}/advance", {"output": {"v": 2}}, f"adv-{execution_id}-2")
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual("signoff", state["pending_approval"])
+        return state
+
+    def test_approval_round_trip_over_http(self):
+        self.park("run-ap1")
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap1/decide",
+            {"approver": "alice", "decision": "approved", "output": {"receipt": "r-9"}},
+            "dec-ap1",
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        state = json.loads(data)
+        self.assertIsNone(state["pending_approval"])
+        self.assertEqual({"receipt": "r-9"}, state["outputs"]["signoff"])
+        self.assertEqual(
+            [{"node_id": "signoff", "approver": "alice", "decision": "approved", "reason": None}],
+            state["approvals"],
+        )
+        status, data = self.call("POST", "/executions/run-ap1/advance", {"output": {"done": True}}, "adv-ap1-3")
+        self.assertEqual(200, status)
+        self.assertEqual("completed", json.loads(data)["status"])
+        status, data = self.call("POST", "/executions/run-ap1/replay")
+        self.assertEqual(200, status)
+        self.assertTrue(json.loads(data)["consistent"])
+
+    def test_rejection_terminates_over_http(self):
+        self.park("run-ap2")
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap2/decide",
+            {"approver": "bob", "decision": "rejected", "reason": "no budget"},
+            "dec-ap2",
+        )
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual("terminated", state["status"])
+        self.assertEqual("rejected", state["termination_reason"])
+        self.assertEqual(["signoff"], state["failed_nodes"])
+        status, data = self.call("GET", "/executions/run-ap2/events")
+        types = [event["type"] for event in json.loads(data)["events"]]
+        self.assertEqual(
+            ["execution_started", "node_completed", "approval_requested", "approval_decided", "execution_terminated"],
+            types,
+        )
+
+    def test_decide_errors_over_http(self):
+        self.park("run-ap3")
+        # unknown approver
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap3/decide",
+            {"approver": "carol", "decision": "approved", "output": {}},
+            "dec-ap3-bad",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        # invalid decision value
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap3/decide",
+            {"approver": "alice", "decision": "maybe", "output": {}},
+            "dec-ap3-maybe",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        # missing fields
+        status, data = self.call("POST", "/executions/run-ap3/decide", {"approver": "alice"}, "dec-ap3-missing")
+        self.assertEqual(400, status)
+        # non-finite number in the body
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap3/decide",
+            raw=b'{"approver":"alice","decision":"approved","output":{"v":NaN}}',
+            key="dec-ap3-nan",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        # missing execution
+        status, data = self.call(
+            "POST",
+            "/executions/nope/decide",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "dec-nope",
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+        # the failed attempts changed nothing
+        status, data = self.call("GET", "/executions/run-ap3")
+        self.assertEqual("signoff", json.loads(data)["pending_approval"])
+
+    def test_decide_without_pending_approval_conflicts_over_http(self):
+        self.call("POST", "/executions", {"id": "run-ap4", "workflow_id": "wf-approval", "input": {}}, "ex-run-ap4")
+        status, data = self.call(
+            "POST",
+            "/executions/run-ap4/decide",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "dec-ap4",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_decide_idempotency_key_scoping_over_http(self):
+        self.park("run-ap5")
+        self.call(
+            "POST",
+            "/executions/run-ap5/decide",
+            {"approver": "alice", "decision": "approved", "output": {}},
+            "shared-ap5",
+        )
+        status, data = self.call("POST", "/executions/run-ap5/advance", {"output": {}}, "shared-ap5")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+
 if __name__ == "__main__":
     unittest.main()

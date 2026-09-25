@@ -79,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.release(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
             return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"))
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decide" and self.command == "POST":
+            return 200, self.service.decide(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "recover" and self.command == "POST":
             return 200, self.service.recover(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "replay" and self.command == "POST":
