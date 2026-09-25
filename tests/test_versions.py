@@ -302,7 +302,7 @@ class VersionServiceTests(unittest.TestCase):
         deadline = time.time() + 5
         execution_id = None
         while time.time() < deadline:
-            status = self.service.schedule_status("scheduled")
+            status = self.service.schedule_status("scheduled")["schedule"]
             execution_id = status["last_execution_id"]
             if execution_id:
                 break

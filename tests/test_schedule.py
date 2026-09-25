@@ -57,19 +57,23 @@ class ScheduleHttpTests(unittest.TestCase):
         self.assertFalse(data.endswith(b"\n\n"))
         payload = json.loads(data)
         self.assertEqual(
-            {"interval_seconds": 1, "input": {"n": 1}, "missed_policy": "catch_up"},
+            {
+                "interval_seconds": 1,
+                "input": {"n": 1},
+                "missed_policy": "catch_up",
+                "paused": False,
+                "last_triggered_at": None,
+                "last_execution_id": None,
+            },
             payload["schedule"],
         )
-        self.assertFalse(payload["paused"])
-        self.assertIsNone(payload["last_triggered_at"])
-        self.assertIsNone(payload["last_execution_id"])
 
         time.sleep(1.3)
         status, data = self.call("GET", "/workflows/wf-s1/schedule")
         self.assertEqual(200, status)
-        payload = json.loads(data)
-        self.assertEqual("wf-s1-scheduled-i:1", payload["last_execution_id"])
-        self.assertIsNotNone(payload["last_triggered_at"])
+        plan = json.loads(data)["schedule"]
+        self.assertEqual("wf-s1-scheduled-i:1", plan["last_execution_id"])
+        self.assertIsNotNone(plan["last_triggered_at"])
 
         # The created execution looks exactly like a manually created one.
         status, data = self.call("GET", "/executions/wf-s1-scheduled-i:1")
@@ -100,7 +104,7 @@ class ScheduleHttpTests(unittest.TestCase):
         manual_keys = set(json.loads(data))
         time.sleep(1.3)
         status, data = self.call("GET", "/workflows/wf-shape/schedule")
-        scheduled_id = json.loads(data)["last_execution_id"]
+        scheduled_id = json.loads(data)["schedule"]["last_execution_id"]
         self.assertIsNotNone(scheduled_id)
         status, data = self.call("GET", f"/executions/{scheduled_id}")
         self.assertEqual(200, status)
@@ -187,22 +191,22 @@ class ScheduleHttpTests(unittest.TestCase):
         payload = json.loads(data)
         self.assertEqual("*/5 9-17 1,15 * 1-5", payload["schedule"]["cron"])
         self.assertEqual("catch_up", payload["schedule"]["missed_policy"])
-        self.assertIsNone(payload["last_execution_id"])
+        self.assertIsNone(payload["schedule"]["last_execution_id"])
 
     def test_pause_halts_and_catch_up_fires_only_latest_missed(self):
         self.create_workflow("wf-s2", {"interval_seconds": 1, "input": {}, "missed_policy": "catch_up"})
         status, data = self.call("POST", "/workflows/wf-s2/schedule/pause", {}, key="pause-s2")
         self.assertEqual(200, status)
-        self.assertTrue(json.loads(data)["paused"])
+        self.assertTrue(json.loads(data)["schedule"]["paused"])
         time.sleep(2.4)
         status, data = self.call("GET", "/workflows/wf-s2/schedule")
-        self.assertIsNone(json.loads(data)["last_execution_id"])
+        self.assertIsNone(json.loads(data)["schedule"]["last_execution_id"])
         status, data = self.call("POST", "/workflows/wf-s2/schedule/resume", {}, key="resume-s2")
         self.assertEqual(200, status)
-        payload = json.loads(data)
-        self.assertFalse(payload["paused"])
+        plan = json.loads(data)["schedule"]
+        self.assertFalse(plan["paused"])
         # Only the most recent missed period is made up, exactly once.
-        self.assertEqual("wf-s2-scheduled-i:2", payload["last_execution_id"])
+        self.assertEqual("wf-s2-scheduled-i:2", plan["last_execution_id"])
         status, _ = self.call("GET", "/executions/wf-s2-scheduled-i:1")
         self.assertEqual(404, status)
         status, _ = self.call("GET", "/executions/wf-s2-scheduled-i:2")
@@ -215,14 +219,14 @@ class ScheduleHttpTests(unittest.TestCase):
         time.sleep(2.4)
         status, data = self.call("POST", "/workflows/wf-s3/schedule/resume", {}, key="resume-s3")
         self.assertEqual(200, status)
-        payload = json.loads(data)
-        self.assertIsNone(payload["last_execution_id"])
-        self.assertIsNone(payload["last_triggered_at"])
+        plan = json.loads(data)["schedule"]
+        self.assertIsNone(plan["last_execution_id"])
+        self.assertIsNone(plan["last_triggered_at"])
         # New periods still fire after the resume.
         time.sleep(1.3)
         status, data = self.call("GET", "/workflows/wf-s3/schedule")
-        payload = json.loads(data)
-        self.assertTrue(payload["last_execution_id"].startswith("wf-s3-scheduled-i:"))
+        plan = json.loads(data)["schedule"]
+        self.assertTrue(plan["last_execution_id"].startswith("wf-s3-scheduled-i:"))
 
     def test_update_schedule_on_existing_workflow(self):
         self.create_workflow("wf-s4")
@@ -233,11 +237,18 @@ class ScheduleHttpTests(unittest.TestCase):
             key="upd-s4",
         )
         self.assertEqual(200, status)
-        payload = json.loads(data)
+        plan = json.loads(data)["schedule"]
         self.assertEqual(
-            {"interval_seconds": 5, "input": {"x": 1}, "missed_policy": "skip"}, payload["schedule"]
+            {
+                "interval_seconds": 5,
+                "input": {"x": 1},
+                "missed_policy": "skip",
+                "paused": False,
+                "last_triggered_at": None,
+                "last_execution_id": None,
+            },
+            plan,
         )
-        self.assertFalse(payload["paused"])
         # Replacing the plan works the same way.
         status, data = self.call(
             "PUT",
@@ -278,7 +289,7 @@ class ScheduleHttpTests(unittest.TestCase):
         # Repeating the same operation with the same key replays the result.
         status, data = self.call("POST", "/workflows/wf-s6/schedule/pause", {}, key="sched-shared")
         self.assertEqual(200, status)
-        self.assertTrue(json.loads(data)["paused"])
+        self.assertTrue(json.loads(data)["schedule"]["paused"])
         status, data = self.call("POST", "/workflows/wf-s6/schedule/resume", {}, key="sched-shared")
         self.assertEqual(409, status)
         self.assertEqual("conflict", json.loads(data)["error"]["code"])

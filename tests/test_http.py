@@ -88,6 +88,34 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(0.30000000000000004, state["outputs"]["a"]["precise"])
         self.assertIn(b"-0.0", data)
 
+    def test_submitted_float_lexeme_is_echoed_unchanged(self):
+        self.request(
+            "POST",
+            "/workflows",
+            {"id": "wf-lex", "nodes": [{"id": "a", "kind": "task", "depends_on": []}]},
+            headers={"Idempotency-Key": "wf-lex"},
+        )
+        self.request(
+            "POST",
+            "/executions",
+            raw=b'{"id":"run-lex","workflow_id":"wf-lex","input":{}}',
+            headers={"Idempotency-Key": "ex-lex"},
+        )
+        # The token 0.12345678901234567 parses to the same double as the
+        # shorter ...566; the submitted spelling must nevertheless survive.
+        status, data = self.request(
+            "POST",
+            "/executions/run-lex/advance",
+            raw=b'{"output":{"p":0.12345678901234567,"z":-0.0}}',
+            headers={"Idempotency-Key": "adv-lex"},
+        )
+        self.assertEqual(200, status)
+        self.assertIn(b"0.12345678901234567", data)
+        self.assertIn(b"-0.0", data)
+        status, data = self.request("GET", "/executions/run-lex")
+        self.assertIn(b"0.12345678901234567", data)
+        self.assertIn(b"-0.0", data)
+
     def test_non_finite_constants_are_rejected(self):
         for constant in (b"NaN", b"Infinity", b"-Infinity"):
             with self.subTest(constant=constant):

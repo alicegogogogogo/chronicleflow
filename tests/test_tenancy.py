@@ -259,7 +259,7 @@ class QuotaServiceTests(unittest.TestCase):
         )
         self.service.create_execution({"id": "run-full", "workflow_id": "wf-sched", "input": {}}, "run-full", "alpha")
         time.sleep(1.3)
-        status = self.service.schedule_status("wf-sched", "alpha")
+        status = self.service.schedule_status("wf-sched", "alpha")["schedule"]
         # Quota full: no execution was created and the schedule status is unchanged.
         self.assertIsNone(status["last_execution_id"])
         self.assertIsNone(status["last_triggered_at"])
@@ -267,7 +267,7 @@ class QuotaServiceTests(unittest.TestCase):
         self.service.declare_quota({"workflows": 10, "executions": 10}, "q2", "alpha")
         deadline = time.time() + 3
         while time.time() < deadline:
-            status = self.service.schedule_status("wf-sched", "alpha")
+            status = self.service.schedule_status("wf-sched", "alpha")["schedule"]
             if status["last_execution_id"]:
                 break
             time.sleep(0.05)

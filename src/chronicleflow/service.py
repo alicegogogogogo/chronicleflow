@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import threading
@@ -10,6 +9,7 @@ import urllib.request
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
+from . import codec
 from .errors import ConflictError, NotFoundError, ValidationError
 from .model import Node, Workflow, _finite_json, _identifier
 from .notify import NOTIFY_EVENT_TYPES, parse_subscriptions
@@ -186,7 +186,7 @@ class ChronicleFlow:
 
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
         message = {"event_type": notice["type"], "execution_id": notice["execution_id"], **notice["payload"]}
-        body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
+        body = codec.dumps(message).encode()
         tries: list[dict[str, Any]] = []
         status = "failed"
         for attempt in range(1, subscription["max_attempts"] + 1):
@@ -476,6 +476,25 @@ class ChronicleFlow:
         if row is None:
             raise NotFoundError(f"execution {execution_id} was not found")
         return Workflow.parse(self.store.decode(row["document"]))
+
+    @staticmethod
+    def _reconcile_state_for_workflow(state: dict[str, Any], workflow: Workflow) -> dict[str, Any]:
+        """Align state containers with a newly bound workflow definition.
+
+        After a migration the recorded history (completed nodes, outputs,
+        conclusions) is left untouched, but progress must continue under the
+        target definition: every loop introduced by the target that the state
+        does not yet know starts pending, and a target declaring approval
+        points gains the waiting/approval containers. Loops and approval
+        records that existed before are preserved.
+        """
+        for node in workflow.nodes:
+            if node.kind == "loop" and node.id not in state["loops"]:
+                state["loops"][node.id] = _new_loop_state()
+        if any(node.approval is not None for node in workflow.nodes):
+            state.setdefault("waiting_approval", None)
+            state.setdefault("approvals", [])
+        return state
 
     def _insert_schedule(self, workflow_id: str, schedule: dict[str, Any], tenant: str) -> None:
         """Attach a fresh schedule declaration to a workflow; it is due from now on."""
@@ -835,6 +854,59 @@ class ChronicleFlow:
             tenant,
         )
 
+    def migrate(
+        self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"version"}:
+            raise ValidationError("migrate body must contain exactly a version string")
+        target = _identifier(raw["version"], "version")
+
+        def apply() -> dict[str, Any]:
+            row = self.store.connection.execute(
+                "SELECT workflow_id, workflow_version FROM executions WHERE tenant = ? AND id = ?",
+                (tenant, execution_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"execution {execution_id} was not found")
+            # The target must be a stored version of the same workflow.
+            target_row = self.store.connection.execute(
+                "SELECT 1 FROM workflow_versions WHERE tenant = ? AND workflow_id = ? AND version = ?",
+                (tenant, row["workflow_id"], target),
+            ).fetchone()
+            if target_row is None:
+                raise NotFoundError(f"workflow {row['workflow_id']} version {target} was not found")
+            target_document, _ = self._load_workflow(row["workflow_id"], tenant, target)
+            target_workflow = Workflow.parse(target_document)
+            state = self.get_execution(execution_id, tenant)
+            current = state.get("version")
+            # Moving to the version already bound is a pure no-op: the current
+            # state is returned with no event appended and no checkpoint.
+            if current == target:
+                return state
+            if state["status"] != "running":
+                raise ConflictError("only a running execution can be migrated")
+            # Record the move in the event stream before changing the binding,
+            # so replay reconstructs the migration point and the version.
+            self._append(
+                execution_id,
+                "version_migrated",
+                {"from_version": current, "to_version": target},
+                tenant,
+            )
+            state["version"] = target
+            self._reconcile_state_for_workflow(state, target_workflow)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ?, workflow_version = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), target, tenant, execution_id),
+            )
+            # The migration settles a node boundary; checkpoint the state at
+            # the migration event in the same transaction.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(key, f"migrate:{execution_id}", apply, tenant)
+
     def cancel(self, execution_id: str, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id, tenant)
@@ -1043,10 +1115,12 @@ class ChronicleFlow:
             # A workflow without a declared schedule has a definite empty result.
             return {"schedule": None}
         return {
-            "schedule": self.store.decode(row["document"]),
-            "paused": bool(row["paused"]),
-            "last_triggered_at": row["last_triggered_at"],
-            "last_execution_id": row["last_execution_id"],
+            "schedule": {
+                **self.store.decode(row["document"]),
+                "paused": bool(row["paused"]),
+                "last_triggered_at": row["last_triggered_at"],
+                "last_execution_id": row["last_execution_id"],
+            }
         }
 
     def schedule_status(self, workflow_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
@@ -1485,6 +1559,14 @@ class ChronicleFlow:
                 if "approvals" in payload:
                     rebuilt["waiting_approval"] = payload.get("waiting_approval")
                     rebuilt["approvals"] = []
+            elif event_type == "version_migrated" and rebuilt is not None:
+                # Replay reconstructs the new binding solely from the event
+                # stream; the target definition contributes any loops and
+                # approval containers it declares that the state lacks.
+                target = payload["to_version"]
+                rebuilt["version"] = target
+                document, _ = self._load_workflow(rebuilt["workflow_id"], tenant, target)
+                self._reconcile_state_for_workflow(rebuilt, Workflow.parse(document))
             elif event_type == "condition_evaluated" and rebuilt is not None:
                 node_id = payload["node_id"]
                 if "loop_id" in payload:

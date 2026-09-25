@@ -208,18 +208,27 @@ class Workflow:
         return {"id": self.id, "nodes": [node.as_dict() for node in self.nodes]}
 
     def loop_bodies(self) -> dict[str, frozenset[str]]:
-        """Map each loop node id to the set of node ids forming its body."""
+        """Map each loop node id to the set of node ids forming its body.
+
+        The body is the entry task's dependency closure together with the
+        boundary condition's closure: the condition may sit upstream of the
+        entry (it gates the entry) or downstream of it (the entry feeds the
+        condition), as long as the two are connected through dependencies.
+        """
         by_id = {node.id: node for node in self.nodes}
         bodies: dict[str, frozenset[str]] = {}
         for node in self.nodes:
             if node.kind == "loop":
-                bodies[node.id] = frozenset(_collect_loop_body(by_id, node.entry))
+                bodies[node.id] = frozenset(
+                    _ancestors(by_id, node.entry) | _ancestors(by_id, node.condition)
+                )
         return bodies
 
 
-def _collect_loop_body(by_id: dict[str, Node], entry: str) -> set[str]:
+def _ancestors(by_id: dict[str, Node], start: str) -> set[str]:
+    """Collect a node and every node reachable from it through depends_on."""
     body: set[str] = set()
-    stack = [entry]
+    stack = [start]
     while stack:
         node_id = stack.pop()
         if node_id in body:
@@ -227,6 +236,10 @@ def _collect_loop_body(by_id: dict[str, Node], entry: str) -> set[str]:
         body.add(node_id)
         stack.extend(by_id[node_id].depends_on)
     return body
+
+
+# Backwards-compatible alias for the dependency-closure helper.
+_collect_loop_body = _ancestors
 
 
 def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None:
@@ -239,18 +252,29 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
             raise ValidationError(f"loop {node.id} entry references an unknown node")
         if entry.kind != "task":
             raise ValidationError(f"loop {node.id} entry must reference a task node")
-        body = _collect_loop_body(by_id, entry.id)
-        if node.id in body:
+        entry_ancestors = _ancestors(by_id, entry.id)
+        if node.id in entry_ancestors:
             raise ValidationError(f"loop {node.id} entry must not depend on the loop itself")
-        if any(by_id[member].kind == "loop" for member in body):
+        if any(by_id[member].kind == "loop" for member in entry_ancestors):
             raise ValidationError(f"loop {node.id} body must not contain another loop")
         judge = by_id.get(node.condition)
         if judge is None:
             raise ValidationError(f"loop {node.id} condition references an unknown node")
         if judge.kind != "condition":
             raise ValidationError(f"loop {node.id} condition must reference a condition node")
-        if judge.id not in body:
+        judge_ancestors = _ancestors(by_id, judge.id)
+        # The boundary condition belongs to the body when it is connected to
+        # the entry: either it gates the entry from upstream (it is one of the
+        # entry's dependencies) or the entry feeds it downstream (the entry is
+        # one of the condition's dependencies). A condition unrelated to the
+        # entry is rejected as a condition outside the body.
+        if judge.id not in entry_ancestors and entry.id not in judge_ancestors:
             raise ValidationError(f"loop {node.id} condition must belong to the loop body")
+        body = entry_ancestors | judge_ancestors
+        if node.id in body:
+            raise ValidationError(f"loop {node.id} body must not depend on the loop itself")
+        if any(by_id[member].kind == "loop" for member in body):
+            raise ValidationError(f"loop {node.id} body must not contain another loop")
         bodies[node.id] = body
     owner: dict[str, str] = {}
     for loop_id, body in bodies.items():

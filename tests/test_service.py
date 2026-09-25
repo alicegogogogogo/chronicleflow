@@ -383,6 +383,63 @@ class LoopWorkflowTests(unittest.TestCase):
         stored = self.service.create_workflow(document, "w-copy")
         self.assertEqual(document, stored)
 
+    def test_loop_with_downstream_boundary_condition_is_created_and_run(self):
+        # The boundary condition may sit downstream of the entry task: the
+        # entry feeds the condition, which decides whether another round runs.
+        workflow = {
+            "id": "downstream",
+            "nodes": [
+                {"id": "attempt", "kind": "task", "depends_on": []},
+                {"id": "keep_trying", "kind": "condition", "depends_on": ["attempt"], "path": "go", "equals": True},
+                {
+                    "id": "rounds",
+                    "kind": "loop",
+                    "depends_on": [],
+                    "entry": "attempt",
+                    "condition": "keep_trying",
+                    "max_iterations": 2,
+                },
+            ],
+        }
+        stored = self.service.create_workflow(workflow, "w-downstream")
+        self.assertEqual(workflow, stored)
+        self.service.create_execution(
+            {"id": "run-d", "workflow_id": "downstream", "input": {"go": True}}, "e-d"
+        )
+        first = self.service.advance("run-d", {"output": {"n": 1}}, "d-a1")
+        self.service.advance("run-d", {"output": {"n": 2}}, "d-a2")
+        loop = first["loops"]["rounds"]
+        self.assertEqual("running", loop["status"])
+        done = self.service.advance("run-d", {"output": {}}, "d-a3")
+        self.assertEqual("completed", done["status"])
+        self.assertEqual("iteration_limit", done["loops"]["rounds"]["end_reason"])
+        order = [
+            (event["payload"].get("iteration"), event["payload"].get("node_id"))
+            for event in self.service.events("run-d")
+            if event["payload"].get("loop_id") == "rounds"
+            and event["type"] in ("node_completed", "condition_evaluated")
+        ]
+        self.assertEqual([(1, "attempt"), (1, "keep_trying"), (2, "attempt"), (2, "keep_trying")], order)
+        self.assertEqual({"consistent": True, "execution": done}, self.service.replay("run-d"))
+
+    def test_disconnected_condition_is_still_rejected(self):
+        from chronicleflow.errors import ValidationError
+
+        nodes = [
+            {"id": "attempt", "kind": "task", "depends_on": []},
+            {"id": "other", "kind": "condition", "depends_on": [], "path": "a", "equals": True},
+            {
+                "id": "loop",
+                "kind": "loop",
+                "depends_on": [],
+                "entry": "attempt",
+                "condition": "other",
+                "max_iterations": 2,
+            },
+        ]
+        with self.assertRaises(ValidationError):
+            self.service.create_workflow({"id": "disconnected", "nodes": nodes}, "w-disconnected")
+
     def test_invalid_loops_are_rejected(self):
         check = {"id": "check", "kind": "condition", "depends_on": [], "path": "a", "equals": True}
         attempt = {"id": "attempt", "kind": "task", "depends_on": ["check"]}

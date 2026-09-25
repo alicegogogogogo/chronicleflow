@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from . import codec
 
 # Every tenant-scoped table carries a tenant column. The empty string is the
 # legacy namespace used by requests that declare no tenant, so their data and
@@ -172,7 +173,7 @@ class Store:
         rows = self.connection.execute("SELECT rowid, document FROM deliveries").fetchall()
         for row in rows:
             try:
-                document = json.loads(row["document"])
+                document = codec.loads(row["document"])
             except ValueError:
                 continue
             attempts = document.get("attempts")
@@ -185,10 +186,7 @@ class Store:
             if changed:
                 self.connection.execute(
                     "UPDATE deliveries SET document = ? WHERE rowid = ?",
-                    (
-                        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
-                        row["rowid"],
-                    ),
+                    (codec.dumps(document, sort_keys=True), row["rowid"]),
                 )
 
     def _migrate_legacy_schema(self) -> None:
@@ -258,11 +256,11 @@ class Store:
 
     @staticmethod
     def encode(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return codec.dumps(value, sort_keys=True)
 
     @staticmethod
     def decode(value: str) -> Any:
-        return json.loads(value)
+        return codec.loads(value)
 
     @staticmethod
     def now() -> str:

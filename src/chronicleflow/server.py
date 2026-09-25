@@ -1,31 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import json
-import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import codec
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
 from .service import ChronicleFlow
 
 TENANT_HEADER = "X-Tenant-Id"
-
-
-def _reject_non_finite(constant: str) -> Any:
-    raise ValidationError(f"request body must not contain {constant}")
-
-
-def _assert_finite(value: Any) -> None:
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValidationError("request body must not contain non-finite numbers")
-    if isinstance(value, dict):
-        for item in value.values():
-            _assert_finite(item)
-    elif isinstance(value, list):
-        for item in value:
-            _assert_finite(item)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -35,7 +19,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _json(self, status: int, value: Any) -> None:
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        body = codec.dumps(value).encode() + b"\n"
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -50,10 +34,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 1_000_000:
                 raise ValueError
-            parsed = json.loads(self.rfile.read(length), parse_constant=_reject_non_finite)
-            _assert_finite(parsed)
+            parsed = codec.loads(self.rfile.read(length).decode())
             return parsed
-        except (ValueError, json.JSONDecodeError) as error:
+        except (ValueError, UnicodeDecodeError) as error:
             raise ValidationError("request body must be valid JSON") from error
 
     def _tenant(self) -> str:
@@ -100,6 +83,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":
             return 200, self.service.decision(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "migrate" and self.command == "POST":
+            return 200, self.service.migrate(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "claim" and self.command == "POST":
             return 200, self.service.claim(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "heartbeat" and self.command == "POST":
