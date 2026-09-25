@@ -213,20 +213,34 @@ class Workflow:
         bodies: dict[str, frozenset[str]] = {}
         for node in self.nodes:
             if node.kind == "loop":
-                bodies[node.id] = frozenset(_collect_loop_body(by_id, node.entry))
+                bodies[node.id] = frozenset(_collect_loop_body(by_id, node.entry, node.condition))
         return bodies
 
 
-def _collect_loop_body(by_id: dict[str, Node], entry: str) -> set[str]:
-    body: set[str] = set()
-    stack = [entry]
+def _ancestors(by_id: dict[str, Node], node_id: str) -> set[str]:
+    """Every node reachable from node_id by following depends_on edges."""
+    found: set[str] = set()
+    stack = [node_id]
     while stack:
-        node_id = stack.pop()
-        if node_id in body:
+        current = stack.pop()
+        if current in found:
             continue
-        body.add(node_id)
-        stack.extend(by_id[node_id].depends_on)
-    return body
+        found.add(current)
+        stack.extend(by_id[current].depends_on)
+    return found
+
+
+def _collect_loop_body(by_id: dict[str, Node], entry: str, condition: str) -> set[str]:
+    """The loop body region anchored by its named entry and condition.
+
+    The two anchors name the ends of the repeated segment: the entry task may
+    run first with the condition evaluated after it (the condition depends on
+    the entry), or the condition may gate the entry task (the entry depends on
+    it). Either way the body is the union of what the anchors depend on; the
+    anchors are additionally required to be connected (see
+    ``_assert_valid_loops``).
+    """
+    return _ancestors(by_id, entry) | _ancestors(by_id, condition)
 
 
 def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None:
@@ -239,16 +253,23 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
             raise ValidationError(f"loop {node.id} entry references an unknown node")
         if entry.kind != "task":
             raise ValidationError(f"loop {node.id} entry must reference a task node")
-        body = _collect_loop_body(by_id, entry.id)
-        if node.id in body:
-            raise ValidationError(f"loop {node.id} entry must not depend on the loop itself")
-        if any(by_id[member].kind == "loop" for member in body):
-            raise ValidationError(f"loop {node.id} body must not contain another loop")
         judge = by_id.get(node.condition)
         if judge is None:
             raise ValidationError(f"loop {node.id} condition references an unknown node")
         if judge.kind != "condition":
             raise ValidationError(f"loop {node.id} condition must reference a condition node")
+        # The condition is inside the repeated segment only when it is connected
+        # to the entry: it gates the entry (entry depends on it) or it is
+        # evaluated after the entry (it depends on the entry).
+        entry_ancestors = _ancestors(by_id, node.entry)
+        condition_ancestors = _ancestors(by_id, node.condition)
+        if node.condition not in entry_ancestors and node.entry not in condition_ancestors:
+            raise ValidationError(f"loop {node.id} condition must belong to the loop body")
+        body = _collect_loop_body(by_id, node.entry, node.condition)
+        if node.id in body:
+            raise ValidationError(f"loop {node.id} entry must not depend on the loop itself")
+        if any(by_id[member].kind == "loop" for member in body):
+            raise ValidationError(f"loop {node.id} body must not contain another loop")
         if judge.id not in body:
             raise ValidationError(f"loop {node.id} condition must belong to the loop body")
         bodies[node.id] = body

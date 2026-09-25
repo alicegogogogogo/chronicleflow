@@ -383,6 +383,64 @@ class LoopWorkflowTests(unittest.TestCase):
         stored = self.service.create_workflow(document, "w-copy")
         self.assertEqual(document, stored)
 
+    def test_loop_whose_condition_follows_the_entry_task_is_accepted(self):
+        # The documented shape: the condition is evaluated after the entry
+        # task each round, so it depends on the entry rather than the other
+        # way around. The body is anchored by both ends and must be accepted.
+        workflow = {
+            "id": "postcheck",
+            "nodes": [
+                {"id": "reserve", "kind": "task", "depends_on": []},
+                {"id": "attempt", "kind": "task", "depends_on": []},
+                {"id": "keep_trying", "kind": "condition", "depends_on": ["attempt"], "path": "again", "equals": True},
+                {
+                    "id": "retry",
+                    "kind": "loop",
+                    "depends_on": ["reserve"],
+                    "entry": "attempt",
+                    "condition": "keep_trying",
+                    "max_iterations": 2,
+                },
+                {"id": "finalize", "kind": "task", "depends_on": ["retry"]},
+            ],
+        }
+        stored = self.service.create_workflow(workflow, "w-postcheck")
+        self.assertEqual(workflow, stored)
+        self.service.create_execution({"id": "run-p", "workflow_id": "postcheck", "input": {"again": True}}, "e-p")
+        self.service.advance("run-p", {"output": {"reserved": True}}, "ap1")
+        first = self.service.advance("run-p", {"output": {"try": 1}}, "ap2")
+        # Submitting the first attempt completes the body (task then condition)
+        # and rolls into the second iteration.
+        self.assertEqual(2, first["loops"]["retry"]["current_iteration"])
+        finished_iteration = first["loops"]["retry"]["iterations"][0]
+        self.assertEqual(["attempt", "keep_trying"], finished_iteration["completed_nodes"])
+        self.assertEqual({"keep_trying": True}, finished_iteration["condition_results"])
+        # The second attempt reaches the limit and completes the loop; one more
+        # advance settles the successor task.
+        after_loop = self.service.advance("run-p", {"output": {"try": 2}}, "ap3")
+        self.assertEqual("iteration_limit", after_loop["loops"]["retry"]["end_reason"])
+        done = self.service.advance("run-p", {"output": {"done": True}}, "ap4")
+        self.assertEqual("completed", done["status"])
+        self.assertEqual({"consistent": True, "execution": done}, self.service.replay("run-p"))
+
+    def test_loop_condition_unrelated_to_entry_is_rejected(self):
+        # Two anchors that never connect leave the condition outside the
+        # repeated segment and must remain a validation error.
+        nodes = [
+            {"id": "attempt", "kind": "task", "depends_on": []},
+            {"id": "check", "kind": "condition", "depends_on": [], "path": "a", "equals": True},
+            {
+                "id": "loop",
+                "kind": "loop",
+                "depends_on": [],
+                "entry": "attempt",
+                "condition": "check",
+                "max_iterations": 2,
+            },
+        ]
+        with self.assertRaises(ValidationError):
+            self.service.create_workflow({"id": "disconnected", "nodes": nodes}, "w-disconnected")
+
     def test_invalid_loops_are_rejected(self):
         check = {"id": "check", "kind": "condition", "depends_on": [], "path": "a", "equals": True}
         attempt = {"id": "attempt", "kind": "task", "depends_on": ["check"]}

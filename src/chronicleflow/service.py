@@ -850,6 +850,86 @@ class ChronicleFlow:
         with self._operation():
             return self._idempotent(key, f"cancel:{execution_id}", apply, tenant)
 
+    @staticmethod
+    def _reconcile_state_for_definition(state: dict[str, Any], workflow: Workflow) -> None:
+        """Align the materialized summary with a newly bound revision.
+
+        Loops introduced by the new definition start in their initial pending
+        state; loops only the previous definition knew keep their recorded
+        history untouched, so pre-migration conclusions never change. The
+        approval fields exist as soon as the bound definition declares an
+        approval point; a parked waiting point is left exactly as recorded.
+        """
+        for node in workflow.nodes:
+            if node.kind == "loop" and node.id not in state["loops"]:
+                state["loops"][node.id] = _new_loop_state()
+        if any(node.approval is not None for node in workflow.nodes) and "approvals" not in state:
+            state["waiting_approval"] = None
+            state["approvals"] = []
+
+    def migrate(
+        self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"version"}:
+            raise ValidationError("migrate body must contain exactly a version string")
+        target = _identifier(raw["version"], "version")
+
+        def apply() -> dict[str, Any]:
+            row = self.store.connection.execute(
+                "SELECT workflow_id, workflow_version FROM executions WHERE tenant = ? AND id = ?",
+                (tenant, execution_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"execution {execution_id} was not found")
+            workflow_id = row["workflow_id"]
+            target_row = self.store.connection.execute(
+                "SELECT 1 FROM workflow_versions WHERE tenant = ? AND workflow_id = ? AND version = ?",
+                (tenant, workflow_id, target),
+            ).fetchone()
+            if target_row is None:
+                raise NotFoundError(f"workflow {workflow_id} version {target} was not found")
+            # get_execution settles a due timeout first, so a deadline that has
+            # elapsed takes precedence over the migration, as it does for every
+            # other operation.
+            state = self.get_execution(execution_id, tenant)
+            if state["status"] != "running":
+                raise ConflictError(f"execution {execution_id} is not running")
+            current = row["workflow_version"]
+            if target == current:
+                # Already bound to the target: report the current state without
+                # appending an event or writing a checkpoint.
+                return state
+            document, _ = self._load_workflow(workflow_id, tenant, target)
+            workflow = Workflow.parse(document)
+            self._reconcile_state_for_definition(state, workflow)
+            # The payload carries the target revision's structural skeleton so
+            # replay can rebuild the migration point from the event stream
+            # alone, exactly as it does from the execution_started record.
+            payload: dict[str, Any] = {"from_version": current, "to_version": target}
+            payload["loops"] = {
+                node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"
+            }
+            if any(node.approval is not None for node in workflow.nodes):
+                payload["waiting_approval"] = None
+                payload["approvals"] = []
+            self._append(execution_id, "version_migrated", payload, tenant)
+            state["version"] = target
+            self.store.connection.execute(
+                "UPDATE executions SET state = ?, workflow_version = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), target, tenant, execution_id),
+            )
+            # The migration is recorded at the same node boundary: checkpoint
+            # the rebound summary at the migration event's position so recovery
+            # resumes on the new version without replaying it.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            # Scope the operation to the target tag so two migrations of the
+            # same execution to different versions sharing one key conflict,
+            # exactly like two version declarations do.
+            return self._idempotent(key, f"migrate:{execution_id}:{target}", apply, tenant)
+
     def _lease_row(self, execution_id: str, tenant: str) -> Any:
         return self.store.connection.execute(
             "SELECT worker_id, lease_seconds, expires_at, heartbeat_at FROM leases "
@@ -1542,6 +1622,18 @@ class ChronicleFlow:
                     "approvers": list(payload["approvers"]),
                     **({"loop_id": payload["loop_id"], "iteration": payload["iteration"]} if "loop_id" in payload else {}),
                 }
+            elif event_type == "version_migrated" and rebuilt is not None:
+                # Rebuild the migration point from the record alone: add the
+                # structure the target revision introduces and rebind, while
+                # keeping every pre-migration conclusion (and a parked approval
+                # point) exactly as the earlier events rebuilt it.
+                for loop_id in payload.get("loops", {}):
+                    if loop_id not in rebuilt["loops"]:
+                        rebuilt["loops"][loop_id] = _new_loop_state()
+                if "approvals" in payload and "approvals" not in rebuilt:
+                    rebuilt["waiting_approval"] = None
+                    rebuilt["approvals"] = []
+                rebuilt["version"] = payload["to_version"]
             elif event_type == "approval_decided" and rebuilt is not None:
                 verdict = payload["decision"]
                 record = {

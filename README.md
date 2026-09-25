@@ -11,7 +11,8 @@ The initial release intentionally supports a compact public contract:
 - a workflow may declare named versions: every declared version is kept and
   each execution is bound to the version that was current (or explicitly
   named) when it started, so upgrading a workflow never changes a running
-  execution;
+  execution, and a running execution can be explicitly migrated to another
+  version of the same workflow, after which it advances under that version;
 - executions advance one ready task at a time, evaluating conditions and
   skipping unmatched branches automatically;
 - task nodes may declare a bounded number of retries: a submitted failure
@@ -62,6 +63,15 @@ has bound the port.
 
 All request and response bodies are JSON. Unknown fields are rejected.
 
+Responses are compact JSON with no insignificant whitespace, and every
+response body ends with exactly one trailing newline (`\n`). Numbers
+round-trip with their full precision: finite floats keep their original
+IEEE-754 value through the shortest textual representation that decodes to
+it (so `0.30000000000000004` stays `0.30000000000000004`), negative zero is
+preserved as `-0.0`, and integers stay integers. Non-finite numbers may
+never appear in a request and are never produced in a response; timestamps
+are ISO-8601 UTC strings ending in `Z`.
+
 ### Tenants and quotas
 
 A request may declare a tenant by sending the `X-Tenant-Id` header with a
@@ -70,17 +80,19 @@ and delivery history record is scoped to the tenant of the request that
 created it: queries and operations only ever see data belonging to that
 tenant, and different tenants may use the same workflow or execution
 identifiers without colliding. Referencing another tenant's resource — for
-example advancing, deciding, claiming, cancelling, recovering, replaying, or
+example advancing, migrating, deciding, claiming, cancelling, recovering, replaying, or
 reading the events, checkpoints, deliveries, or schedule of an execution or
 workflow owned by another tenant — is answered exactly like a reference to a
 missing resource: `404 not_found`, with no indication that the resource
 exists elsewhere. An execution created in one tenant can only reference a
-workflow of the same tenant; referencing an unseen workflow identifier is the
-usual `404 not_found`.
+workflow of the same tenant, and a migration can only name a version of that
+workflow in the same tenant; referencing an unseen workflow identifier or
+version is the usual `404 not_found`.
 
 The header applies to every workflow, execution, and schedule entry point,
-including creation, advancement, approval decisions, lease operations,
-cancellation, recovery, replay, and all history and status queries. An empty
+including creation, advancement, migration, approval decisions, lease
+operations, cancellation, recovery, replay, and all history and status
+queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -296,9 +308,13 @@ segment:
 A loop node contains exactly `id`, `kind`, `depends_on`, `entry`, `condition`,
 and `max_iterations`; any other field is rejected as unknown. `entry` names a
 `task` node, `condition` names a `condition` node, and `max_iterations` is an
-integer between 1 and 100. The loop body is the entry task plus every node
-reachable from it through `depends_on`; the body keeps the usual DAG rules and
-must contain the referenced condition. The loop's own dependencies must be
+integer between 1 and 100. The loop body is the repeated segment anchored by
+the entry task and the condition: it is the entry task, the condition, and
+every node either anchor reaches through `depends_on`. The two anchors must
+be connected — the condition gates the entry task (the entry depends on it)
+or the condition is evaluated after the entry task (it depends on the entry),
+as in the example above. The body keeps the usual DAG rules and always
+contains the referenced condition. The loop's own dependencies must be
 completed or skipped before the first iteration may start, they must not
 overlap the body, bodies of different loops must not overlap or nest, and
 nodes outside a body must not depend on nodes inside it (they depend on the
@@ -409,6 +425,60 @@ definition with its `version` tag. A workflow that never declared a version
 returns a single untagged entry and `current_version: null`. A missing
 workflow returns 404 `not_found`. Cross-tenant references are missing
 resources as usual.
+
+### Migrate a running execution to another version
+
+```http
+POST /executions/run-v1/migrate
+Idempotency-Key: migrate-request-1
+
+{"version":"2026-09-25"}
+```
+
+A running execution can be explicitly moved to another declared version of
+the same workflow; after the call it keeps advancing under the new version.
+The body must contain exactly `version`, a non-empty version identifier that
+names a stored version of the execution's workflow. On success a
+`version_migrated` event is appended to the event stream — it records the
+`from_version`, the `to_version`, and the structural skeleton of the target
+revision (its `loops`, and, when it declares approval points, its
+`waiting_approval` and `approvals` fields) — and a checkpoint of the rebound
+state is written at that same node boundary. The execution's state then
+carries the target version.
+
+Everything that follows uses the target version's definition: ready-node
+selection, condition evaluation, loop rounds, approval points, retries, and
+the workflow subscriptions that fire for later events. Everything recorded
+before the migration is kept exactly as-is: prior events, node outputs,
+condition conclusions, and per-iteration history are never rewritten. Loops
+introduced by the target definition begin in their initial pending state; a
+loop the old definition knew keeps its recorded iterations and conclusion.
+Replay rebuilds the migration point and version binding solely from the
+event stream, and after a restart recovery continues on the migrated version
+from the migration checkpoint, so checkpoints and materialized state agree.
+
+An execution parked at an approval point may also be migrated: the waiting
+point keeps its recorded node and approver list unchanged (only a recorded
+approver may still decide it), and once the decision lands the subsequent
+advancement follows the target version. Executions that are never migrated
+keep advancing on the version they started with to completion or
+termination; adding versions never moves them. An execution of a workflow
+that never declared a version cannot name a target, and such workflows and
+their executions keep exactly the previous behavior, state shape, and event
+content.
+
+The response is the updated execution state. Migrating a `completed` or
+`terminated` execution returns `409 conflict` and changes nothing. A missing
+execution or a target version that does not exist for the workflow returns
+`404 not_found`; a cross-tenant reference is the same missing resource. A
+missing or mistyped `version`, an unknown field, or a non-finite number is a
+`400 validation_error`. Migrating to the version the execution is already
+bound to returns the current state as-is, appending no event and writing no
+checkpoint; reusing an idempotency key for another operation is a `409
+conflict`. The migration event is listed directly by the per-execution
+events query, and node outputs produced after the migration belong to the
+target version's definition. Approver-list validation, lease renewal, and
+delivery history keep their existing semantics before and after a migration.
 
 ### Start an execution
 
@@ -577,12 +647,33 @@ idempotency key from another operation is a 409 `conflict`.
 GET /workflows/nightly-orders/schedule
 ```
 
-Returns the declared plan as given (`interval_seconds` or `cron`, the
-`input`, and the `missed_policy`), whether the schedule is currently
-`paused`, the `last_triggered_at` time, and the `last_execution_id` of the
-most recently created execution (both `null` until the first trigger). A
-workflow that never declared a schedule returns the definite empty result
-`{"schedule":null}`, and a missing workflow returns 404 `not_found`.
+Returns a single `schedule` object with the status fields, or the definite
+empty result `{"schedule":null}` for a workflow that never declared a
+schedule. When a schedule exists the object is:
+
+```json
+{
+  "schedule": {"interval_seconds": 3600, "input": {"mode": "nightly"}, "missed_policy": "catch_up"},
+  "paused": false,
+  "last_triggered_at": "2026-09-26T08:00:00.000Z",
+  "last_execution_id": "nightly-orders-scheduled-i:42"
+}
+```
+
+The fields are:
+
+- `schedule`: the declared plan exactly as stored — either
+  `{"interval_seconds": <positive integer>, "input": <object>, "missed_policy": "catch_up"|"skip"}`
+  or `{"cron": "<five-field expression>", "input": <object>, "missed_policy": ...}`;
+  the input is the declared object verbatim;
+- `paused`: a JSON boolean;
+- `last_triggered_at`: an ISO-8601 UTC timestamp string ending in `Z`, or
+  `null` until the first period fires;
+- `last_execution_id`: the execution id string of the most recently created
+  run, or `null` until the first trigger.
+
+`last_triggered_at` and `last_execution_id` are `null` (not omitted) until
+the first trigger. A missing workflow returns 404 `not_found`.
 
 ### Pause and resume a schedule
 
@@ -837,7 +928,11 @@ Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across
 different operations (within the same tenant), is a conflict. Starting an
 execution against a missing workflow or a missing workflow version is a
-missing resource (`404 not_found`).
+missing resource (`404 not_found`). Migrating an execution to a missing
+version is likewise a missing resource, while migrating a completed or
+terminated execution is a conflict; a malformed migration body is a
+validation error, and a migration to the version already bound is a
+state-returning no-op rather than an error.
 Exceeding a tenant's declared workflow or execution quota is also a `409
 conflict`, with the word "quota" in the message so it can be distinguished
 from an identifier conflict; the rejected request writes nothing. Referencing
