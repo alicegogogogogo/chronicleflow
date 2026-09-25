@@ -121,22 +121,33 @@ class ChronicleFlow:
                             logger.exception("notification delivery failed")
 
     def _subscriptions_for(self, execution_id: str, tenant: str) -> list[tuple[str, dict[str, Any]]]:
-        """Return (label, subscription) pairs for an execution, workflow first."""
+        """Return (label, subscription) pairs for an execution.
+
+        Workflow subscriptions are those declared on the exact workflow
+        version the execution is bound to (and, for an unversioned workflow,
+        the legacy unscoped set); execution subscriptions apply on top.
+        """
         row = self.store.connection.execute(
-            "SELECT workflow_id FROM executions WHERE tenant = ? AND id = ?",
+            "SELECT workflow_id, workflow_version FROM executions WHERE tenant = ? AND id = ?",
             (tenant, execution_id),
         ).fetchone()
         if not row:
             return []
+        bound_version = row["workflow_version"] or ""
         pairs: list[tuple[str, dict[str, Any]]] = []
-        for owner_type, owner_id in (("workflow", row["workflow_id"]), ("execution", execution_id)):
+        owners = [("workflow", row["workflow_id"], bound_version), ("execution", execution_id, "")]
+        for owner_type, owner_id, version in owners:
             rows = self.store.connection.execute(
                 "SELECT position, document FROM subscriptions "
-                "WHERE tenant = ? AND owner_type = ? AND owner_id = ? ORDER BY position",
-                (tenant, owner_type, owner_id),
+                "WHERE tenant = ? AND owner_type = ? AND owner_id = ? AND version = ? ORDER BY position",
+                (tenant, owner_type, owner_id, version),
             ).fetchall()
             for sub_row in rows:
-                pairs.append((f"{owner_type}:{sub_row['position']}", self.store.decode(sub_row["document"])))
+                if version:
+                    label = f"{owner_type}:{version}:{sub_row['position']}"
+                else:
+                    label = f"{owner_type}:{sub_row['position']}"
+                pairs.append((label, self.store.decode(sub_row["document"])))
         return pairs
 
     def _deliver_notice(self, notice: dict[str, Any]) -> None:
@@ -194,14 +205,14 @@ class ChronicleFlow:
             )
             try:
                 with urllib.request.urlopen(request, timeout=subscription["timeout_seconds"]) as response:
-                    tries.append({"attempt": attempt, "status_code": response.status})
+                    tries.append({"status_code": response.status})
                 status = "delivered"
                 break
             except urllib.error.HTTPError as error:
-                tries.append({"attempt": attempt, "status_code": error.code})
+                tries.append({"status_code": error.code})
             except Exception as error:
                 reason = getattr(error, "reason", error)
-                tries.append({"attempt": attempt, "error": str(reason)})
+                tries.append({"error": str(reason)})
         return {
             "url": subscription["url"],
             "event_type": notice["type"],
@@ -282,12 +293,16 @@ class ChronicleFlow:
             raise ConflictError(f"quota exceeded: tenant already holds {used} {kind} (quota limit is {ceiling})")
 
     def create_workflow(self, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        version = None
         subscriptions = None
         schedule = None
         if isinstance(raw, dict):
-            # Subscriptions and the schedule are validated up front so an
-            # invalid declaration rejects the whole request before anything
-            # is written.
+            # The version tag, subscriptions, and the schedule are validated up
+            # front so an invalid declaration rejects the whole request before
+            # anything is written.
+            if "version" in raw:
+                version = _identifier(raw["version"], "version")
+                raw = {field: value for field, value in raw.items() if field != "version"}
             if "subscriptions" in raw:
                 subscriptions = parse_subscriptions(raw["subscriptions"])
                 raw = {field: value for field, value in raw.items() if field != "subscriptions"}
@@ -297,34 +312,98 @@ class ChronicleFlow:
         workflow = Workflow.parse(raw)
 
         def create() -> dict[str, Any]:
-            # A duplicate identifier does not grow the holding, so it keeps the
-            # ordinary identifier conflict even when the tenant is at quota.
             existing = self.store.connection.execute(
-                "SELECT 1 FROM workflows WHERE tenant = ? AND id = ?",
+                "SELECT current_version FROM workflows WHERE tenant = ? AND id = ?",
                 (tenant, workflow.id),
             ).fetchone()
             if existing:
-                raise ConflictError(f"workflow {workflow.id} already exists")
-            self._assert_within_quota(tenant, "workflows")
-            try:
+                if version is None:
+                    raise ConflictError(f"workflow {workflow.id} already exists")
+                duplicate = self.store.connection.execute(
+                    "SELECT 1 FROM workflow_versions WHERE tenant = ? AND workflow_id = ? AND version = ?",
+                    (tenant, workflow.id, version),
+                ).fetchone()
+                if duplicate:
+                    raise ConflictError(f"workflow {workflow.id} version {version} already exists")
+                position_row = self.store.connection.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 AS position FROM workflow_versions "
+                    "WHERE tenant = ? AND workflow_id = ?",
+                    (tenant, workflow.id),
+                ).fetchone()
                 self.store.connection.execute(
-                    "INSERT INTO workflows(tenant, id, document) VALUES (?, ?, ?)",
-                    (tenant, workflow.id, self.store.encode(workflow.as_dict())),
+                    "INSERT INTO workflow_versions(tenant, workflow_id, version, position, document, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (tenant, workflow.id, version, position_row["position"], self.store.encode(workflow.as_dict()), self.store.now()),
                 )
-            except Exception as error:
-                if "UNIQUE constraint" in str(error):
-                    raise ConflictError(f"workflow {workflow.id} already exists") from error
-                raise
-            for position, subscription in enumerate(subscriptions or []):
+                # The newest declared version becomes the current one; the
+                # single-document row stays as the current snapshot for foreign
+                # keys and legacy readers.
                 self.store.connection.execute(
-                    "INSERT INTO subscriptions(tenant, owner_type, owner_id, position, document) VALUES (?, ?, ?, ?, ?)",
-                    (tenant, "workflow", workflow.id, position, self.store.encode(subscription)),
+                    "UPDATE workflows SET document = ?, current_version = ? WHERE tenant = ? AND id = ?",
+                    (self.store.encode(workflow.as_dict()), version, tenant, workflow.id),
                 )
-            if schedule is not None:
-                self._insert_schedule(workflow.id, schedule, tenant)
-            return workflow.as_dict()
+                for position, subscription in enumerate(subscriptions or []):
+                    self.store.connection.execute(
+                        "INSERT INTO subscriptions(tenant, owner_type, owner_id, version, position, document) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (tenant, "workflow", workflow.id, version, position, self.store.encode(subscription)),
+                    )
+                if schedule is not None:
+                    self._insert_schedule(workflow.id, schedule, tenant)
+            else:
+                # A duplicate identifier does not grow the holding, so it keeps
+                # the ordinary identifier conflict even when the tenant is at quota.
+                self._assert_within_quota(tenant, "workflows")
+                bound_version = version or ""
+                self.store.connection.execute(
+                    "INSERT INTO workflows(tenant, id, document, current_version) VALUES (?, ?, ?, ?)",
+                    (tenant, workflow.id, self.store.encode(workflow.as_dict()), version),
+                )
+                self.store.connection.execute(
+                    "INSERT INTO workflow_versions(tenant, workflow_id, version, position, document, created_at) "
+                    "VALUES (?, ?, ?, 0, ?, ?)",
+                    (tenant, workflow.id, bound_version, self.store.encode(workflow.as_dict()), self.store.now()),
+                )
+                for position, subscription in enumerate(subscriptions or []):
+                    self.store.connection.execute(
+                        "INSERT INTO subscriptions(tenant, owner_type, owner_id, version, position, document) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (tenant, "workflow", workflow.id, bound_version, position, self.store.encode(subscription)),
+                    )
+                if schedule is not None:
+                    self._insert_schedule(workflow.id, schedule, tenant)
+            result = workflow.as_dict()
+            if version is not None:
+                result["version"] = version
+            return result
 
-        return self._idempotent(key, f"create-workflow:{workflow.id}", create, tenant)
+        operation = f"create-workflow:{workflow.id}"
+        if version is not None:
+            operation = f"{operation}:{version}"
+        with self._operation():
+            return self._idempotent(key, operation, create, tenant)
+
+    def get_workflow(self, workflow_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        with self._operation():
+            with self.store.transaction():
+                row = self.store.connection.execute(
+                    "SELECT current_version FROM workflows WHERE tenant = ? AND id = ?",
+                    (tenant, workflow_id),
+                ).fetchone()
+                if not row:
+                    raise NotFoundError(f"workflow {workflow_id} was not found")
+                version_rows = self.store.connection.execute(
+                    "SELECT version, document FROM workflow_versions "
+                    "WHERE tenant = ? AND workflow_id = ? ORDER BY position",
+                    (tenant, workflow_id),
+                ).fetchall()
+                versions = []
+                for version_row in version_rows:
+                    document = self.store.decode(version_row["document"])
+                    if version_row["version"]:
+                        document["version"] = version_row["version"]
+                    versions.append(document)
+                return {"current_version": row["current_version"], "id": workflow_id, "versions": versions}
 
     def _insert_schedule(self, workflow_id: str, schedule: dict[str, Any], tenant: str) -> None:
         """Attach a fresh schedule declaration to a workflow; it is due from now on."""
@@ -347,14 +426,16 @@ class ChronicleFlow:
             "id",
             "workflow_id",
             "input",
+            "version",
             "timeout_seconds",
             "subscriptions",
         }:
             raise ValidationError(
-                "execution must contain exactly id, workflow_id, input, and optionally timeout_seconds and subscriptions"
+                "execution must contain exactly id, workflow_id, input, and optionally version, timeout_seconds and subscriptions"
             )
         execution_id = _identifier(raw["id"], "execution id")
         workflow_id = _identifier(raw["workflow_id"], "workflow id")
+        version = _identifier(raw["version"], "version") if "version" in raw else None
         if not isinstance(raw["input"], dict):
             raise ValidationError("input must be an object")
         _finite_json(raw["input"], "input")
@@ -367,9 +448,48 @@ class ChronicleFlow:
                 raise ValidationError("timeout_seconds must be a positive number of seconds")
 
         def create() -> dict[str, Any]:
-            return self._insert_execution(execution_id, workflow_id, raw["input"], timeout, subscriptions, tenant)
+            return self._insert_execution(execution_id, workflow_id, raw["input"], timeout, subscriptions, tenant, version)
 
         return self._idempotent(key, f"create-execution:{execution_id}", create, tenant)
+
+    def _load_workflow(
+        self, workflow_id: str, tenant: str, version: str | None = None
+    ) -> tuple[dict[str, Any], str | None]:
+        """Return (workflow document, stored version tag) for the current or a named version."""
+        workflow_row = self.store.connection.execute(
+            "SELECT document, current_version FROM workflows WHERE tenant = ? AND id = ?",
+            (tenant, workflow_id),
+        ).fetchone()
+        if not workflow_row:
+            raise NotFoundError(f"workflow {workflow_id} was not found")
+        if version is None:
+            return self.store.decode(workflow_row["document"]), workflow_row["current_version"]
+        version_row = self.store.connection.execute(
+            "SELECT document FROM workflow_versions WHERE tenant = ? AND workflow_id = ? AND version = ?",
+            (tenant, workflow_id, version),
+        ).fetchone()
+        if not version_row:
+            raise NotFoundError(f"workflow {workflow_id} version {version} was not found")
+        return self.store.decode(version_row["document"]), version
+
+    def _bound_workflow(self, execution_id: str, tenant: str) -> Workflow:
+        """Load the exact workflow version an execution is bound to.
+
+        Executions started before any version was declared bind to the
+        unversioned revision, which stays available after the workflow is
+        upgraded, so an upgrade never changes their definition.
+        """
+        row = self.store.connection.execute(
+            "SELECT v.document FROM executions e "
+            "JOIN workflow_versions v "
+            "ON v.tenant = e.tenant AND v.workflow_id = e.workflow_id "
+            "AND v.version = COALESCE(e.workflow_version, '') "
+            "WHERE e.tenant = ? AND e.id = ?",
+            (tenant, execution_id),
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"execution {execution_id} was not found")
+        return Workflow.parse(self.store.decode(row["document"]))
 
     def _insert_execution(
         self,
@@ -379,15 +499,11 @@ class ChronicleFlow:
         timeout: float | None,
         subscriptions: list[dict[str, Any]] | None,
         tenant: str = DEFAULT_TENANT,
+        version: str | None = None,
     ) -> dict[str, Any]:
         """Insert a running execution and its start event; caller holds a transaction."""
-        workflow_row = self.store.connection.execute(
-            "SELECT document FROM workflows WHERE tenant = ? AND id = ?",
-            (tenant, workflow_id),
-        ).fetchone()
-        if not workflow_row:
-            raise NotFoundError(f"workflow {workflow_id} was not found")
-        workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+        document, bound_version = self._load_workflow(workflow_id, tenant, version)
+        workflow = Workflow.parse(document)
         # A duplicate identifier does not grow the holding, so it keeps the
         # ordinary identifier conflict even when the tenant is at quota.
         existing = self.store.connection.execute(
@@ -416,6 +532,10 @@ class ChronicleFlow:
             "attempts": {},
             "loops": loops,
         }
+        # The bound version tag is part of the state only for executions of a
+        # versioned workflow; an unversioned workflow gains no new field.
+        if bound_version:
+            state["version"] = bound_version
         # Approval state exists only for workflows that declare approval
         # points, so every other execution keeps its baseline state shape.
         if has_approvals:
@@ -423,8 +543,8 @@ class ChronicleFlow:
             state["approvals"] = []
         try:
             self.store.connection.execute(
-                "INSERT INTO executions(tenant, id, workflow_id, state) VALUES (?, ?, ?, ?)",
-                (tenant, execution_id, workflow_id, self.store.encode(state)),
+                "INSERT INTO executions(tenant, id, workflow_id, state, workflow_version) VALUES (?, ?, ?, ?, ?)",
+                (tenant, execution_id, workflow_id, self.store.encode(state), bound_version),
             )
         except Exception as error:
             if "UNIQUE constraint" in str(error):
@@ -432,7 +552,8 @@ class ChronicleFlow:
             raise
         for position, subscription in enumerate(subscriptions or []):
             self.store.connection.execute(
-                "INSERT INTO subscriptions(tenant, owner_type, owner_id, position, document) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO subscriptions(tenant, owner_type, owner_id, version, position, document) "
+                "VALUES (?, ?, ?, '', ?, ?)",
                 (tenant, "execution", execution_id, position, self.store.encode(subscription)),
             )
         started_payload: dict[str, Any] = {
@@ -442,6 +563,8 @@ class ChronicleFlow:
             "timeout_seconds": timeout,
             "deadline_at": deadline,
         }
+        if bound_version:
+            started_payload["version"] = bound_version
         if has_approvals:
             started_payload["waiting_approval"] = None
             started_payload["approvals"] = []
@@ -539,11 +662,9 @@ class ChronicleFlow:
             # enforced, exactly as for any other running-execution submission.
             if state.get("waiting_approval") is not None:
                 return state
-            workflow_row = self.store.connection.execute(
-                "SELECT document FROM workflows WHERE tenant = ? AND id = ?",
-                (tenant, state["workflow_id"]),
-            ).fetchone()
-            workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+            # Condition evaluation, loop rounds, retries, and approval points
+            # all follow the workflow version this execution is bound to.
+            workflow = self._bound_workflow(execution_id, tenant)
             self._auto_process(execution_id, workflow, state, tenant)
             if state["status"] == "running":
                 ready = self._ready_tasks(workflow, state)
@@ -602,11 +723,7 @@ class ChronicleFlow:
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id, tenant)
             waiting = state.get("waiting_approval")
-            workflow_row = self.store.connection.execute(
-                "SELECT document FROM workflows WHERE tenant = ? AND id = ?",
-                (tenant, state["workflow_id"]),
-            ).fetchone()
-            workflow = Workflow.parse(self.store.decode(workflow_row["document"]))
+            workflow = self._bound_workflow(execution_id, tenant)
             if waiting is None:
                 # A duplicate of the decision that already resolved the most
                 # recent approval point returns that first result; it neither
@@ -1328,6 +1445,10 @@ class ChronicleFlow:
                     "attempts": {},
                     "loops": {loop_id: _new_loop_state() for loop_id in payload.get("loops", {})},
                 }
+                # The version binding is part of the start record, so replay
+                # rebuilds it even if the current definition has since changed.
+                if payload.get("version"):
+                    rebuilt["version"] = payload["version"]
                 if "approvals" in payload:
                     rebuilt["waiting_approval"] = payload.get("waiting_approval")
                     rebuilt["approvals"] = []

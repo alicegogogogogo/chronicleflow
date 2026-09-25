@@ -109,7 +109,7 @@ class WebhookHttpTests(unittest.TestCase):
         self.assertEqual("node_completed", record["event_type"])
         self.assertEqual(1, record["attempt_count"])
         self.assertEqual("delivered", record["status"])
-        self.assertEqual([{"attempt": 1, "status_code": 200}], record["attempts"])
+        self.assertEqual([{"status_code": 200}], record["attempts"])
         self.assertEqual(Receiver.requests[0]["idempotency_key"], record["idempotency_key"])
         # new fields are emitted in a stable key order
         self.assertEqual(["sequence"] + sorted(k for k in record if k != "sequence"), list(record))
@@ -200,7 +200,7 @@ class WebhookHttpTests(unittest.TestCase):
         self.assertEqual("delivered", record["status"])
         self.assertEqual(2, record["attempt_count"])
         self.assertEqual(
-            [{"attempt": 1, "status_code": 500}, {"attempt": 2, "status_code": 200}],
+            [{"status_code": 500}, {"status_code": 200}],
             record["attempts"],
         )
 

@@ -76,6 +76,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_quota(self._tenant())
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 2 and parts[0] == "workflows" and self.command == "GET":
+            return 200, self.service.get_workflow(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
             return 200, self.service.schedule_status(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command in ("POST", "PUT"):
