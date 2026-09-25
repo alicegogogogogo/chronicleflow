@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
 from .service import ChronicleFlow
 
+TENANT_HEADER = "X-Tenant-Id"
+
 
 def _reject_non_finite(constant: str) -> Any:
     raise ValidationError(f"request body must not contain {constant}")
@@ -54,47 +56,60 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as error:
             raise ValidationError("request body must be valid JSON") from error
 
+    def _tenant(self) -> str:
+        """Resolve the tenant identifier; an absent header keeps the legacy namespace."""
+        if TENANT_HEADER not in self.headers:
+            return ""
+        tenant = self.headers.get(TENANT_HEADER)
+        if not isinstance(tenant, str) or not tenant:
+            raise ValidationError(f"{TENANT_HEADER} header must be a non-empty string")
+        return tenant
+
     def _dispatch(self) -> tuple[int, Any]:
         path = urlsplit(self.path).path
         parts = [part for part in path.split("/") if part]
         if self.command == "GET" and parts == ["health"]:
             return 200, {"status": "ok"}
+        if self.command in ("PUT", "POST") and parts == ["quotas"]:
+            return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "GET" and parts == ["quotas"]:
+            return 200, self.service.get_quota(self._tenant())
         if self.command == "POST" and parts == ["workflows"]:
-            return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"))
+            return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
-            return 200, self.service.schedule_status(parts[1])
+            return 200, self.service.schedule_status(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command in ("POST", "PUT"):
-            return 200, self.service.update_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.update_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "pause" and self.command == "POST":
-            return 200, self.service.pause_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.pause_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "resume" and self.command == "POST":
-            return 200, self.service.resume_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.resume_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "POST" and parts == ["executions"]:
-            return 201, self.service.create_execution(self._body(), self.headers.get("Idempotency-Key"))
+            return 201, self.service.create_execution(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 2 and parts[0] == "executions" and self.command == "GET":
-            return 200, self.service.get_execution(parts[1])
+            return 200, self.service.get_execution(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "events" and self.command == "GET":
-            return 200, {"events": self.service.events(parts[1])}
+            return 200, {"events": self.service.events(parts[1], self._tenant())}
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "checkpoints" and self.command == "GET":
-            return 200, self.service.checkpoints(parts[1])
+            return 200, self.service.checkpoints(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "deliveries" and self.command == "GET":
-            return 200, self.service.deliveries(parts[1])
+            return 200, self.service.deliveries(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
-            return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":
-            return 200, self.service.decision(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.decision(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "claim" and self.command == "POST":
-            return 200, self.service.claim(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.claim(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "heartbeat" and self.command == "POST":
-            return 200, self.service.heartbeat(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.heartbeat(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "release" and self.command == "POST":
-            return 200, self.service.release(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.release(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
-            return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"))
+            return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "recover" and self.command == "POST":
-            return 200, self.service.recover(parts[1], self._body(), self.headers.get("Idempotency-Key"))
+            return 200, self.service.recover(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "replay" and self.command == "POST":
-            return 200, self.service.replay(parts[1])
+            return 200, self.service.replay(parts[1], self._tenant())
         raise NotFoundError("route was not found")
 
     def _handle(self) -> None:
@@ -125,4 +140,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

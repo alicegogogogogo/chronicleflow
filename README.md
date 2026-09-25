@@ -58,6 +58,80 @@ has bound the port.
 
 All request and response bodies are JSON. Unknown fields are rejected.
 
+### Tenants and quotas
+
+A request may declare a tenant by sending the `X-Tenant-Id` header with a
+non-empty identifier. Every workflow, execution, schedule, schedule status,
+and delivery history record is scoped to the tenant of the request that
+created it: queries and operations only ever see data belonging to that
+tenant, and different tenants may use the same workflow or execution
+identifiers without colliding. Referencing another tenant's resource — for
+example advancing, deciding, claiming, cancelling, recovering, replaying, or
+reading the events, checkpoints, deliveries, or schedule of an execution or
+workflow owned by another tenant — is answered exactly like a reference to a
+missing resource: `404 not_found`, with no indication that the resource
+exists elsewhere. An execution created in one tenant can only reference a
+workflow of the same tenant; referencing an unseen workflow identifier is the
+usual `404 not_found`.
+
+The header applies to every workflow, execution, and schedule entry point,
+including creation, advancement, approval decisions, lease operations,
+cancellation, recovery, replay, and all history and status queries. An empty
+`X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
+header entirely keep using the single legacy namespace, whose advancement,
+approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
+scheduling, and replay behavior is byte-for-byte unchanged: the tenant is
+stored only as database scope, never added to a state field or event payload,
+and state shapes and event streams gain no new fields. Idempotency keys are
+scoped per tenant as well, so tenants can never see or collide with each
+other's keys; reusing a key for another operation within the same tenant is
+the usual `409 conflict`.
+
+A tenant may declare quotas bounding how many workflows and executions it may
+hold:
+
+```http
+PUT /quotas
+Idempotency-Key: quota-request-1
+X-Tenant-Id: acme
+
+{"workflows": 10, "executions": 100}
+```
+
+`POST` to the same path is accepted as well. The body must contain exactly
+`workflows` and `executions`, each a positive integer; a non-positive,
+non-integer, boolean, or non-finite value, a missing or extra field, or a
+non-object body is a `400 validation_error` that writes nothing. Both quota
+routes require a tenant: calling them without `X-Tenant-Id` (or with an empty
+one) is a `400 validation_error`. The response is
+`{"quota":{"workflows":10,"executions":100}}`; declaring again replaces the
+limits (re-anchoring nothing else). Lowering a limit below the current
+holding deletes no existing data — existing workflows and executions stay
+fully usable — it only rejects later writes that would exceed the new limit.
+
+```http
+GET /quotas
+X-Tenant-Id: acme
+```
+
+Returns the declared quota, or the definite empty result `{"quota":null}`
+when the tenant has declared none.
+
+When a write would take the tenant past either limit, the whole request is
+rejected with `409 conflict` and an error message that names the quota (for
+example `quota exceeded: tenant already holds 10 workflows (quota limit is
+10)`), so callers can tell quota rejection apart from an ordinary identifier
+conflict. The rejection performs no partial write: nothing is inserted and
+previously stored data is unaffected, exactly as for validation failures.
+
+A schedule firing on time creates its execution in the schedule's tenant and
+that execution counts against the tenant's execution quota. When the tenant
+is at its execution limit, the due period creates no execution and the
+schedule is left unchanged — its cursor, `last_triggered_at`, and
+`last_execution_id` stay as they were — so the period is settled on a later
+pass once capacity exists, under the usual per-period idempotence. Delivery
+history follows the tenant of the execution it belongs to.
+
 ### Health
 
 ```http
@@ -338,6 +412,11 @@ gives its `sequence`, the subscription `url`, the `event_type`, the
 recording each try's `status_code` or `error` (so a retry that eventually
 succeeds is visible attempt by attempt), and `occurred_at`. Querying the
 history of a missing execution returns 404 `not_found` and records nothing.
+Every delivery attempt is recorded, including one whose history record itself
+could not be written: such a failure is not swallowed — it is retried once in
+a fresh write carrying `status` `failed` and a `persistence_error` describing
+the write failure, so the attempt remains visible whenever the database can
+accept it (and is logged rather than silently dropped if it cannot).
 
 ### Schedules
 
@@ -653,7 +732,17 @@ Errors use this shape:
 ```
 
 Validation errors return 400, missing resources return 404, and conflicts
-return 409. A `retries` value that is negative, non-integer, or greater than
+return 409. An empty `X-Tenant-Id` header value is a validation error; quota
+declarations require a tenant and positive integer limits, validated by the
+same rules as every other body (no non-finite numbers, no unknown fields).
+Reusing a workflow or execution identifier, or reusing an idempotency key
+across different operations (within the same tenant), is a conflict.
+Exceeding a tenant's declared workflow or execution quota is also a `409
+conflict`, with the word "quota" in the message so it can be distinguished
+from an identifier conflict; the rejected request writes nothing. Referencing
+a resource owned by another tenant is a missing resource (`404
+not_found`), indistinguishable from one that does not exist, so existence is
+never revealed across tenants. A `retries` value that is negative, non-integer, or greater than
 10, and a non-positive `timeout_seconds`, are validation errors. A malformed
 subscription — a missing or mistyped field, an unknown field, an empty or
 duplicated event list, an unknown event type, an empty or non-http(s) `url`,
@@ -663,8 +752,7 @@ querying the delivery history of a missing execution is a missing resource. An a
 point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.
-Reusing a workflow or execution identifier, or reusing an idempotency key
-across different operations, is a conflict. A decision by an approver who is
+A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that
 resolved the latest one), is a conflict. Claiming a work item whose lease is

@@ -8,6 +8,122 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+# Every tenant-scoped table carries a tenant column. The empty string is the
+# legacy namespace used by requests that declare no tenant, so their data and
+# behavior are exactly what they were before multi-tenancy existed.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS workflows (
+  tenant TEXT NOT NULL DEFAULT '',
+  id TEXT NOT NULL,
+  document TEXT NOT NULL,
+  PRIMARY KEY (tenant, id)
+);
+CREATE TABLE IF NOT EXISTS executions (
+  tenant TEXT NOT NULL DEFAULT '',
+  id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  PRIMARY KEY (tenant, id),
+  FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS events (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, sequence),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS idempotency (
+  tenant TEXT NOT NULL DEFAULT '',
+  key TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  response TEXT NOT NULL,
+  PRIMARY KEY (tenant, key)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  event_sequence INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, sequence),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS leases (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  lease_seconds REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  heartbeat_at REAL NOT NULL,
+  PRIMARY KEY (tenant, execution_id),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS subscriptions (
+  tenant TEXT NOT NULL DEFAULT '',
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  PRIMARY KEY (tenant, owner_type, owner_id, position)
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, sequence),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS schedules (
+  tenant TEXT NOT NULL DEFAULT '',
+  workflow_id TEXT NOT NULL,
+  document TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0,
+  anchor_at REAL NOT NULL,
+  cursor TEXT NOT NULL DEFAULT '',
+  last_triggered_at TEXT,
+  last_execution_id TEXT,
+  PRIMARY KEY (tenant, workflow_id),
+  FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS schedule_triggers (
+  tenant TEXT NOT NULL DEFAULT '',
+  workflow_id TEXT NOT NULL,
+  period_key TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  triggered_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, workflow_id, period_key),
+  FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS quotas (
+  tenant TEXT PRIMARY KEY,
+  workflows INTEGER NOT NULL,
+  executions INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"""
+
+# Legacy (pre-tenancy) column layouts, used only when migrating an old file.
+LEGACY_COLUMNS = {
+    "workflows": "id, document",
+    "executions": "id, workflow_id, state",
+    "events": "execution_id, sequence, type, payload, occurred_at",
+    "idempotency": "key, operation, response",
+    "checkpoints": "execution_id, sequence, event_sequence, document, created_at",
+    "leases": "execution_id, worker_id, lease_seconds, expires_at, heartbeat_at",
+    "subscriptions": "owner_type, owner_id, position, document",
+    "deliveries": "execution_id, sequence, document",
+    "schedules": (
+        "workflow_id, document, paused, anchor_at, cursor, last_triggered_at, last_execution_id"
+    ),
+    "schedule_triggers": "workflow_id, period_key, execution_id, triggered_at",
+}
+
 
 class Store:
     def __init__(self, path: str):
@@ -18,76 +134,44 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS workflows (
-              id TEXT PRIMARY KEY,
-              document TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS executions (
-              id TEXT PRIMARY KEY,
-              workflow_id TEXT NOT NULL REFERENCES workflows(id),
-              state TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
-              sequence INTEGER NOT NULL,
-              type TEXT NOT NULL,
-              payload TEXT NOT NULL,
-              occurred_at TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
-            );
-            CREATE TABLE IF NOT EXISTS idempotency (
-              key TEXT PRIMARY KEY,
-              operation TEXT NOT NULL,
-              response TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS checkpoints (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
-              sequence INTEGER NOT NULL,
-              event_sequence INTEGER NOT NULL,
-              document TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
-            );
-            CREATE TABLE IF NOT EXISTS leases (
-              execution_id TEXT PRIMARY KEY REFERENCES executions(id),
-              worker_id TEXT NOT NULL,
-              lease_seconds REAL NOT NULL,
-              expires_at REAL NOT NULL,
-              heartbeat_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS subscriptions (
-              owner_type TEXT NOT NULL,
-              owner_id TEXT NOT NULL,
-              position INTEGER NOT NULL,
-              document TEXT NOT NULL,
-              PRIMARY KEY (owner_type, owner_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS deliveries (
-              execution_id TEXT NOT NULL REFERENCES executions(id),
-              sequence INTEGER NOT NULL,
-              document TEXT NOT NULL,
-              PRIMARY KEY (execution_id, sequence)
-            );
-            CREATE TABLE IF NOT EXISTS schedules (
-              workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
-              document TEXT NOT NULL,
-              paused INTEGER NOT NULL DEFAULT 0,
-              anchor_at REAL NOT NULL,
-              cursor TEXT NOT NULL DEFAULT '',
-              last_triggered_at TEXT,
-              last_execution_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS schedule_triggers (
-              workflow_id TEXT NOT NULL REFERENCES workflows(id),
-              period_key TEXT NOT NULL,
-              execution_id TEXT NOT NULL,
-              triggered_at TEXT NOT NULL,
-              PRIMARY KEY (workflow_id, period_key)
-            );
-            """
-        )
+        self._migrate_legacy_schema()
+        self.connection.executescript(SCHEMA)
+
+    def _migrate_legacy_schema(self) -> None:
+        """Rebuild tables created before tenancy, moving every row to the default namespace."""
+        table_rows = self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        columns = {}
+        for table_row in table_rows:
+            name = table_row["name"]
+            columns[name] = [info["name"] for info in self.connection.execute(f'PRAGMA table_info("{name}")')]
+        legacy = [name for name in LEGACY_COLUMNS if name in columns and "tenant" not in columns[name]]
+        if not legacy:
+            return
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        self.connection.execute("BEGIN IMMEDIATE")
+        table_statements = {}
+        for part in SCHEMA.split(";"):
+            statement = part.strip()
+            if statement:
+                table_statements[statement.split("(", 1)[0].strip().split()[-1]] = statement
+        try:
+            for name in legacy:
+                old_columns = LEGACY_COLUMNS[name]
+                self.connection.execute(f'ALTER TABLE "{name}" RENAME TO "{name}_legacy"')
+                self.connection.execute(table_statements[name])
+                self.connection.execute(
+                    f"INSERT INTO {name} SELECT '', {old_columns} FROM {name}_legacy"
+                )
+                self.connection.execute(f"DROP TABLE {name}_legacy")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        else:
+            self.connection.execute("COMMIT")
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -112,4 +196,3 @@ class Store:
     @staticmethod
     def now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
