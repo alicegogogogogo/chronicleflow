@@ -418,10 +418,13 @@ class MapValidationTests(unittest.TestCase):
             self.base(template={"id": "work", "approval": {"approvers": ["a", "a"]}})
         )
 
-    def test_template_id_must_not_collide_with_a_declared_node(self):
-        self.assert_invalid(self.base(template={"id": "collect"}))
+    def test_template_id_may_collide_with_a_declared_node(self):
+        # The template id only names the expanded instances; it may coincide
+        # with a declared node identifier.
+        stored = self.service.create_workflow(self.base(template={"id": "collect"}), "w1")
+        self.assertEqual({"id": "collect"}, stored["nodes"][1]["template"])
 
-    def test_template_ids_must_be_unique(self):
+    def test_template_ids_need_not_be_unique(self):
         document = {
             "id": "orders",
             "nodes": [
@@ -438,18 +441,44 @@ class MapValidationTests(unittest.TestCase):
                 {
                     "id": "m2",
                     "kind": "map",
-                    "depends_on": ["m1"],
-                    "source": "m1",
+                    "depends_on": ["collect"],
+                    "source": "collect",
                     "path": "b",
                     "max_instances": 5,
                     "template": {"id": "work"},
                 },
             ],
         }
-        self.assert_invalid(document)
+        stored = self.service.create_workflow(document, "w1")
+        self.assertEqual({"id": "work"}, stored["nodes"][1]["template"])
+        self.assertEqual({"id": "work"}, stored["nodes"][2]["template"])
 
-    def test_map_must_not_nest_with_a_loop(self):
-        # A map node inside a loop body.
+    def test_map_may_nest_inside_a_loop_body(self):
+        # A map node reached from the loop's anchors belongs to the body.
+        document = {
+            "id": "orders",
+            "nodes": [
+                {"id": "entry", "kind": "task", "depends_on": []},
+                {
+                    "id": "fanout",
+                    "kind": "map",
+                    "depends_on": ["entry"],
+                    "source": "entry",
+                    "path": "items",
+                    "max_instances": 5,
+                    "template": {"id": "work"},
+                },
+                {"id": "check", "kind": "condition", "depends_on": ["fanout"], "path": "x", "equals": 1},
+                {"id": "loop", "kind": "loop", "depends_on": [], "entry": "entry",
+                 "condition": "check", "max_iterations": 3},
+            ],
+        }
+        stored = self.service.create_workflow(document, "w1")
+        self.assertEqual("map", stored["nodes"][1]["kind"])
+
+    def test_map_outside_a_body_must_not_depend_on_a_body_node(self):
+        # A map the loop's anchors never reach sits outside the body and must
+        # not depend on a node inside it.
         document = {
             "id": "orders",
             "nodes": [

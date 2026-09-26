@@ -26,6 +26,9 @@ The initial release intentionally supports a compact public contract:
   no longer accept output, and they may be cancelled explicitly;
 - loop nodes repeat their body a bounded number of times, re-evaluating a
   continue condition at the loop boundaries;
+- a map node inside a loop body expands independently in every iteration
+  from that iteration's source output, its instances and events belonging
+  to the iteration they expanded in;
 - every state transition is appended to the execution event stream;
 - replay rebuilds execution state from the recorded events;
 - a checkpoint is written at every node boundary, capturing the state
@@ -556,10 +559,10 @@ A map node contains exactly `id`, `kind`, `depends_on`, `source`, `path`,
 - `template` describes the single task each instance runs and contains
   exactly an `id`, and optionally `retries` (an integer between 0 and 10,
   defaulting to 0) and an `approval` point with the same shape a task node
-  uses. The template id must not collide with any declared node id and map
-  template ids must be unique; it only names the dynamically expanded
-  instances. A map node must not sit inside a loop body, and a loop body must
-  not contain a map node.
+  uses. The template id only names the dynamically expanded instances; it
+  may coincide with a declared node id or with another map's template id.
+  A map node may also sit inside a loop body, expanding independently in
+  every iteration (see "Maps inside loop bodies" below).
 
 When the dependencies settle, the value at `path` is read once. When it is an
 array, one instance is created per element; the instances queue in ascending
@@ -589,7 +592,8 @@ giving its `index`, `status` (`ready`, `waiting`, `completed`, or `failed`),
 its `output`, and its `failure_reason` (null except for a permanently failed
 instance), plus the ordered completed `outputs` list and the node's single
 `failure_reason`. The `maps` field is present only when the bound workflow
-declares a map node; every other execution keeps its previous state shape.
+declares a map node outside any loop body; every other execution keeps its
+previous state shape.
 
 The event stream records a `map_expanded` event when expansion happens,
 carrying the map id and the number of created instances (zero for a missing
@@ -605,6 +609,64 @@ instances and never repeats an instance output. Per-instance completions and
 failures count toward the existing node metrics under the template node id,
 and webhook and queue subscriptions receive instance events exactly like any
 other node event.
+
+### Maps inside loop bodies
+
+A map node may belong to a loop body — it is part of the body exactly when
+the loop's entry or condition reaches it through `depends_on`, like any
+other body member:
+
+```json
+{"id": "fanout", "kind": "map", "depends_on": ["attempt"],
+ "source": "attempt", "path": "items", "max_instances": 10,
+ "template": {"id": "work", "retries": 1}}
+```
+
+A nested map expands once per iteration, when every dependency of its node
+is completed or skipped in that iteration, and the element list is read from
+the source task's output of that same iteration. The expansion rules are the
+ones of an execution-level map: a missing path or a non-array value expands
+to zero instances and the map completes for that iteration with an empty
+output list, so the loop boundary is evaluated as usual; an element count
+beyond `max_instances` creates no instance at all — the map fails
+permanently, is listed under `failed_nodes`, and the execution terminates
+with reason `retries_exhausted` under the usual exhaustion semantics.
+
+The expanded instances belong to their iteration only: they queue in
+ascending element index order and are settled one per `advance`, exactly
+like execution-level instances, and one iteration's instances never
+overwrite another iteration's results. An instance is an ordinary task in
+every other respect — a submitted failure consumes the template's retry
+bound and re-queues that instance within its iteration, and a template
+approval point parks the execution until an approver decides it — with no
+influence from the iteration number.
+
+Iteration state exposes each nested map under the iteration record's `maps`
+field, with the same per-map shape as an execution-level map (`status`, one
+record per instance, the ordered completed `outputs`, and `failure_reason`);
+the field is present on every iteration of a loop whose body declares a map
+node. When a nested map completes, its node enters the iteration's
+`completed_nodes` and its output list is recorded in the iteration's
+`outputs`; when the loop finishes, the usual roll-up lists the map node once
+in the execution-level `completed_nodes`, while its outputs stay with their
+iterations. An execution-level `maps` field is not created for nested maps.
+
+Every event a nested expansion records carries the owning `loop_id` and
+`iteration` alongside the map id and, for per-instance events, the element
+`index`: `map_expanded`, `map_completed`, the per-instance `node_completed`,
+`node_failed`, and `node_retried`, and `approval_requested` and
+`approval_decided` for a template approval point. The `iteration_started`
+event of a loop whose body declares map nodes carries the iteration's
+initial `maps` skeleton, so replay rebuilds every iteration's instance list,
+status, and ownership solely from the event stream, consistent with the
+materialized state. Checkpoints are written at each iteration's instance
+boundaries, so recovery continues the current iteration's unfinished
+instances and never repeats an instance output. Cancellation, timeouts,
+leases, retries, and approvals keep their existing semantics, and a nested
+map never changes an execution's termination reason.
+
+Executions whose workflows declare no nested map behave exactly as before:
+state fields, event contents, and advancement results are unchanged.
 
 ### Workflow versions
 
@@ -870,7 +932,7 @@ A subscription may declare a queue target instead of a webhook `url`:
 
 A queue subscription contains exactly:
 
-- `queue`: a non-empty queue name of at most 100 characters;
+- `queue`: a non-empty queue name of any length;
 - `events`: the same non-empty event-type list a webhook subscription takes;
 - `visibility_seconds` (optional): a positive number of seconds a pulled
   message stays invisible while awaiting acknowledgement, defaulting to 30.
@@ -1331,10 +1393,10 @@ point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.
 A map node with an unknown or missing field, a mistyped or non-positive
-`max_instances`, an invalid or colliding template, a `source` that is not a
-task dependency, an invalid `path`, or a map node inside a loop body (or a
-loop body containing a map) is likewise a validation error that rejects the
-whole request.
+`max_instances`, an invalid template, a `source` that is not a
+task dependency, or an invalid `path` is likewise a validation error that
+rejects the whole request, whether the map stands alone or sits inside a
+loop body.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that
