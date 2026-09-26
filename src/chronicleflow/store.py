@@ -119,6 +119,32 @@ CREATE TABLE IF NOT EXISTS quotas (
   executions INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS queue_targets (
+  tenant TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL,
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  PRIMARY KEY (tenant, name)
+);
+CREATE TABLE IF NOT EXISTS queues (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, name),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS queue_messages (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  queue TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, queue, sequence),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
 CREATE TABLE IF NOT EXISTS usage_records (
   tenant TEXT NOT NULL DEFAULT '',
   sequence INTEGER NOT NULL,

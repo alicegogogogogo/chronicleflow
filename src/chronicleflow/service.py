@@ -200,6 +200,10 @@ class ChronicleFlow:
     def _deliver_notice(self, notice: dict[str, Any]) -> None:
         tenant = notice["tenant"]
         for label, subscription in self._subscriptions_for(notice["execution_id"], tenant):
+            if "url" not in subscription:
+                # A queue target is fed synchronously when its event is
+                # appended; there is no outbound HTTP delivery for it.
+                continue
             if notice["type"] not in subscription["events"]:
                 continue
             # The idempotency key is deterministic per event and subscription:
@@ -314,6 +318,251 @@ class ChronicleFlow:
             (tenant, execution_id),
         ).fetchall()
         return {"deliveries": [{"sequence": row["sequence"], **self.store.decode(row["document"])} for row in rows]}
+
+    # --- outbound message queues -------------------------------------------
+
+    def _register_queue_targets(
+        self, owner_type: str, owner_id: str, subscriptions: list[dict[str, Any]] | None, tenant: str
+    ) -> None:
+        """Record the queue names a workflow or execution declares.
+
+        Queue names are unique per tenant across declarations: a name already
+        declared by a different workflow or execution is a conflict, exactly
+        like a reused identifier. The same owner may re-declare its own names,
+        so a workflow adding a version keeps its queue targets.
+        """
+        names = [subscription["queue"] for subscription in subscriptions or [] if "queue" in subscription]
+        if len(set(names)) != len(names):
+            raise ConflictError("queue names declared by one subscription list must be unique")
+        for name in names:
+            row = self.store.connection.execute(
+                "SELECT owner_type, owner_id FROM queue_targets WHERE tenant = ? AND name = ?",
+                (tenant, name),
+            ).fetchone()
+            if row is not None and (row["owner_type"], row["owner_id"]) != (owner_type, owner_id):
+                raise ConflictError(f"queue {name} is already declared in this tenant")
+            self.store.connection.execute(
+                "INSERT OR IGNORE INTO queue_targets(tenant, name, owner_type, owner_id) VALUES (?, ?, ?, ?)",
+                (tenant, name, owner_type, owner_id),
+            )
+
+    def _instantiate_queues(
+        self,
+        execution_id: str,
+        workflow_id: str,
+        bound_version: str | None,
+        subscriptions: list[dict[str, Any]] | None,
+        tenant: str,
+    ) -> None:
+        """Create the execution's queue instances from its effective declarations.
+
+        The bound workflow revision's queue targets apply to every execution
+        of that revision; the execution's own queue targets apply on top.
+        """
+        targets: list[dict[str, Any]] = []
+        rows = self.store.connection.execute(
+            "SELECT document FROM subscriptions WHERE tenant = ? AND owner_type = 'workflow' "
+            "AND owner_id = ? AND version = ? ORDER BY position",
+            (tenant, workflow_id, bound_version or ""),
+        ).fetchall()
+        for row in rows:
+            subscription = self.store.decode(row["document"])
+            if "queue" in subscription:
+                targets.append(subscription)
+        for subscription in subscriptions or []:
+            if "queue" in subscription:
+                targets.append(subscription)
+        for position, subscription in enumerate(targets):
+            self.store.connection.execute(
+                "INSERT INTO queues(tenant, execution_id, name, position, document, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    tenant,
+                    execution_id,
+                    subscription["queue"],
+                    position,
+                    self.store.encode(subscription),
+                    self.store.now(),
+                ),
+            )
+
+    def _enqueue_queue_messages(
+        self, execution_id: str, event_sequence: int, event_type: str, payload: dict[str, Any], tenant: str
+    ) -> None:
+        """Append a message to each of the execution's queues subscribed to the event type."""
+        rows = self.store.connection.execute(
+            "SELECT name, document FROM queues WHERE tenant = ? AND execution_id = ? ORDER BY position",
+            (tenant, execution_id),
+        ).fetchall()
+        for row in rows:
+            subscription = self.store.decode(row["document"])
+            if event_type not in subscription["events"]:
+                continue
+            sequence_row = self.store.connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM queue_messages "
+                "WHERE tenant = ? AND execution_id = ? AND queue = ?",
+                (tenant, execution_id, row["name"]),
+            ).fetchone()
+            # The idempotency key is deterministic per event and queue: every
+            # delivery of this message reuses it, and other events never share it.
+            key = f"{execution_id}:{event_sequence}:queue:{row['name']}"
+            message = {
+                "event_type": event_type,
+                "event_sequence": event_sequence,
+                "idempotency_key": key,
+                "payload": payload,
+                "status": "pending",
+                "delivery_count": 0,
+                "deliveries": [],
+                "invisible_until": None,
+                "enqueued_at": self.store.now(),
+            }
+            self.store.connection.execute(
+                "INSERT INTO queue_messages(tenant, execution_id, queue, sequence, document) VALUES (?, ?, ?, ?, ?)",
+                (tenant, execution_id, row["name"], sequence_row["sequence"], self.store.encode(message)),
+            )
+
+    def _queue_row(self, execution_id: str, name: str, tenant: str) -> Any:
+        return self.store.connection.execute(
+            "SELECT document FROM queues WHERE tenant = ? AND execution_id = ? AND name = ?",
+            (tenant, execution_id, name),
+        ).fetchone()
+
+    def _queue_message_rows(self, execution_id: str, name: str, tenant: str) -> list[Any]:
+        return self.store.connection.execute(
+            "SELECT sequence, document FROM queue_messages "
+            "WHERE tenant = ? AND execution_id = ? AND queue = ? ORDER BY sequence",
+            (tenant, execution_id, name),
+        ).fetchall()
+
+    @staticmethod
+    def _effective_queue_status(message: dict[str, Any], now: float) -> str:
+        """A delivered message whose visibility expired is pending again."""
+        if (
+            message["status"] == "delivered"
+            and message["invisible_until"] is not None
+            and now >= message["invisible_until"]
+        ):
+            return "pending"
+        return message["status"]
+
+    def _render_queue_message(self, sequence: int, message: dict[str, Any], now: float) -> dict[str, Any]:
+        # The sequence leads; every other field follows in stable key order.
+        return {
+            "sequence": sequence,
+            "deliveries": message["deliveries"],
+            "delivery_count": message["delivery_count"],
+            "enqueued_at": message["enqueued_at"],
+            "event_sequence": message["event_sequence"],
+            "event_type": message["event_type"],
+            "idempotency_key": message["idempotency_key"],
+            "payload": message["payload"],
+            "status": self._effective_queue_status(message, now),
+        }
+
+    def queues(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        """Queue state and delivery history for one execution, in declaration order."""
+        with self._operation():
+            with self.store.transaction():
+                self.get_execution(execution_id, tenant)
+                now = time.time()
+                rows = self.store.connection.execute(
+                    "SELECT name, document FROM queues WHERE tenant = ? AND execution_id = ? ORDER BY position",
+                    (tenant, execution_id),
+                ).fetchall()
+                result = []
+                for row in rows:
+                    subscription = self.store.decode(row["document"])
+                    messages = [
+                        self._render_queue_message(
+                            message_row["sequence"], self.store.decode(message_row["document"]), now
+                        )
+                        for message_row in self._queue_message_rows(execution_id, row["name"], tenant)
+                    ]
+                    result.append(
+                        {
+                            "messages": messages,
+                            "queue": row["name"],
+                            "visibility_seconds": subscription["visibility_seconds"],
+                        }
+                    )
+                return {"queues": result}
+
+    def pull_queue(
+        self, execution_id: str, name: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        self._empty_body(raw, "pull")
+
+        def apply() -> dict[str, Any]:
+            self.get_execution(execution_id, tenant)
+            queue_row = self._queue_row(execution_id, name, tenant)
+            if queue_row is None:
+                raise NotFoundError(f"queue {name} was not found for execution {execution_id}")
+            subscription = self.store.decode(queue_row["document"])
+            visibility = subscription["visibility_seconds"]
+            now = time.time()
+            delivered = []
+            for message_row in self._queue_message_rows(execution_id, name, tenant):
+                message = self.store.decode(message_row["document"])
+                if self._effective_queue_status(message, now) != "pending":
+                    continue
+                # The message leaves the pending set until the visibility
+                # deadline; unacknowledged by then, it becomes pending again.
+                message["status"] = "delivered"
+                message["invisible_until"] = now + visibility
+                message["delivery_count"] += 1
+                message["deliveries"].append(
+                    {"delivered_at": self.store.now(), "delivery": message["delivery_count"]}
+                )
+                self.store.connection.execute(
+                    "UPDATE queue_messages SET document = ? "
+                    "WHERE tenant = ? AND execution_id = ? AND queue = ? AND sequence = ?",
+                    (self.store.encode(message), tenant, execution_id, name, message_row["sequence"]),
+                )
+                # Every delivery to the caller is metered as a delivery
+                # attempt, atomically with the pull that made it.
+                self._record_usage(tenant, USAGE_TYPE_DELIVERY_ATTEMPTED)
+                delivered.append(self._render_queue_message(message_row["sequence"], message, now))
+            # An empty queue (or one with nothing currently deliverable) is a
+            # definite empty result, not an error.
+            return {"messages": delivered}
+
+        with self._operation():
+            return self._idempotent(key, f"pull-queue:{execution_id}:{name}", apply, tenant)
+
+    def ack_queue(
+        self, execution_id: str, name: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"idempotency_key"}:
+            raise ValidationError("ack body must contain exactly an idempotency_key string")
+        idempotency_key = raw["idempotency_key"]
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValidationError("ack idempotency_key must be a non-empty string")
+
+        def apply() -> dict[str, Any]:
+            self.get_execution(execution_id, tenant)
+            if self._queue_row(execution_id, name, tenant) is None:
+                raise NotFoundError(f"queue {name} was not found for execution {execution_id}")
+            for message_row in self._queue_message_rows(execution_id, name, tenant):
+                message = self.store.decode(message_row["document"])
+                if message["idempotency_key"] != idempotency_key:
+                    continue
+                if message["status"] == "acknowledged":
+                    # A repeated acknowledgement names a message that already
+                    # left the queue: it is missing, like an unknown key.
+                    raise NotFoundError(f"queue message {idempotency_key} was not found")
+                message["status"] = "acknowledged"
+                message["invisible_until"] = None
+                self.store.connection.execute(
+                    "UPDATE queue_messages SET document = ? "
+                    "WHERE tenant = ? AND execution_id = ? AND queue = ? AND sequence = ?",
+                    (self.store.encode(message), tenant, execution_id, name, message_row["sequence"]),
+                )
+                return {"acknowledged": True}
+            raise NotFoundError(f"queue message {idempotency_key} was not found")
+
+        with self._operation():
+            return self._idempotent(key, f"ack-queue:{execution_id}:{name}", apply, tenant)
 
     # --- quotas ---------------------------------------------------------
 
@@ -681,6 +930,7 @@ class ChronicleFlow:
                     (self.store.encode(workflow.as_dict()), version, tenant, workflow.id),
                 )
                 self._replace_workflow_subscriptions(workflow.id, version, subscriptions, tenant)
+                self._register_queue_targets("workflow", workflow.id, subscriptions, tenant)
                 if schedule is not None:
                     self._insert_schedule(workflow.id, schedule, tenant)
                 # An added version is itself one workflow creation, so it is
@@ -706,6 +956,7 @@ class ChronicleFlow:
             # or tagged with the first declared version.
             self._insert_workflow_version(workflow.id, version or "", 0, workflow, tenant)
             self._replace_workflow_subscriptions(workflow.id, version or "", subscriptions, tenant)
+            self._register_queue_targets("workflow", workflow.id, subscriptions, tenant)
             if schedule is not None:
                 self._insert_schedule(workflow.id, schedule, tenant)
             self._record_usage(tenant, USAGE_TYPE_WORKFLOW_CREATED)
@@ -938,6 +1189,10 @@ class ChronicleFlow:
                 "VALUES (?, 'execution', ?, '', ?, ?)",
                 (tenant, execution_id, position, self.store.encode(subscription)),
             )
+        # Queue targets declared on the bound workflow revision or the
+        # execution itself become the execution's own queue instances.
+        self._register_queue_targets("execution", execution_id, subscriptions, tenant)
+        self._instantiate_queues(execution_id, workflow_id, bound_version, subscriptions, tenant)
         started_payload: dict[str, Any] = {
             "workflow_id": workflow_id,
             "input": input_data,
@@ -2050,6 +2305,9 @@ class ChronicleFlow:
             (tenant, execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
         )
         if event_type in NOTIFY_EVENT_TYPES:
+            # Queue targets are fed in the same transaction as the event, so a
+            # rolled-back operation never leaves a queued message behind.
+            self._enqueue_queue_messages(execution_id, row["sequence"], event_type, payload, tenant)
             # Buffered, not delivered: the surrounding operation may still roll
             # back. The outermost _operation scope delivers after the commit.
             self._local.pending = getattr(self._local, "pending", []) + [

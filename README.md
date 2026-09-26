@@ -39,6 +39,11 @@ The initial release intentionally supports a compact public contract:
 - workflows and executions may declare webhook subscriptions, and matching
   business events are delivered to the declared targets with bounded retries,
   each delivery recorded in a per-execution history;
+- subscriptions may also declare queue targets instead of webhook addresses:
+  matching business events are appended, in occurrence order, to persistent
+  per-execution queues that callers pull from and acknowledge explicitly,
+  with a visibility timeout returning unacknowledged messages to the pending
+  set (delivery is at least once);
 - a workflow may declare a schedule — a fixed interval in seconds or a
   five-field cron plan — and the service automatically creates one execution
   per due period with the declared input; schedules can be paused and
@@ -76,13 +81,14 @@ are ISO-8601 UTC strings ending in `Z`.
 
 A request may declare a tenant by sending the `X-Tenant-Id` header with a
 non-empty identifier. Every workflow, execution, schedule, schedule status,
-and delivery history record is scoped to the tenant of the request that
+delivery history, and queue record is scoped to the tenant of the request that
 created it: queries and operations only ever see data belonging to that
 tenant, and different tenants may use the same workflow or execution
 identifiers without colliding. Referencing another tenant's resource — for
 example advancing, migrating, deciding, claiming, cancelling, recovering, replaying, or
-reading the events, checkpoints, deliveries, or schedule of an execution or
-workflow owned by another tenant — is answered exactly like a reference to a
+reading the events, checkpoints, deliveries, queues, or schedule of an execution or
+workflow owned by another tenant, or pulling from or acknowledging one of its
+queues — is answered exactly like a reference to a
 missing resource: `404 not_found`, with no indication that the resource
 exists elsewhere. An execution created in one tenant can only reference a
 workflow of the same tenant, and a migration can only name a version of that
@@ -91,8 +97,9 @@ version is the usual `404 not_found`.
 
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
-operations, cancellation, recovery, replay, and all history and status
-queries, as well as the usage, bill, and metrics queries. An empty
+operations, cancellation, recovery, replay, queue pulls, acknowledgements,
+and all history and status queries, as well as the usage, bill, and metrics
+queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -163,10 +170,14 @@ metered action types are:
 - `schedule_triggered` — a due schedule period creates its execution. The
   scheduled execution is metered both as `execution_started` and as
   `schedule_triggered`;
-- `delivery_attempted` — one outbound webhook HTTP attempt is made. A
+- `delivery_attempted` — one outbound webhook HTTP attempt is made, or one
+  queue message is delivered to a caller pulling from a queue. A
   subscription that retries is metered once per attempt, so a delivery that
   fails and then succeeds on its second attempt records two attempts; the
-  action is metered whether it ultimately succeeds or fails.
+  action is metered whether it ultimately succeeds or fails. A queue pull
+  meters one attempt per message it delivers, so a redelivery after the
+  visibility timeout is metered again, while a pull that delivers nothing
+  meters nothing.
 
 Metering is atomic with the action it describes: a write rejected by
 validation or by a quota produces no record and performs no partial write.
@@ -715,7 +726,7 @@ gives its `sequence`, the `event_sequence` position it was taken at, the full
 ### Webhook notifications
 
 Subscriptions declared on a workflow or an execution deliver outbound webhook
-messages when business events occur. Each subscription contains exactly:
+messages when business events occur. Each webhook subscription contains exactly:
 
 - `url`: a non-empty `http` or `https` address to POST to;
 - `events`: a non-empty array of event types without duplicates, drawn from
@@ -730,7 +741,9 @@ Any other field, a missing `url` or `events`, a mistyped value, an empty or
 duplicated event list, an unknown event type, an empty or non-http(s) `url`,
 a non-finite number, a non-positive timeout or attempt count, or more than
 ten attempts is a 400 `validation_error` and rejects the whole request — no
-workflow, execution, or subscription is partially written.
+workflow, execution, or subscription is partially written. A subscription
+may instead declare a queue target (`queue` instead of `url`); see "Queue
+subscriptions" below.
 
 When a subscribed event occurs, a JSON message is POSTed to each matching
 target immediately: the body carries `event_type`, `execution_id`, and the
@@ -767,6 +780,110 @@ could not be written: such a failure is not swallowed — it is retried once in
 a fresh write carrying `status` `failed` and a `persistence_error` describing
 the write failure, so the attempt remains visible whenever the database can
 accept it (and is logged rather than silently dropped if it cannot).
+
+### Queue subscriptions
+
+A subscription may declare a queue target instead of a webhook `url`:
+
+```json
+{
+  "id": "run-4",
+  "workflow_id": "order-flow",
+  "input": {},
+  "subscriptions": [{"queue": "order-events", "events": ["node_completed"], "visibility_seconds": 60}]
+}
+```
+
+A queue subscription contains exactly:
+
+- `queue`: a non-empty queue name of at most 100 characters;
+- `events`: the same non-empty event-type list a webhook subscription takes;
+- `visibility_seconds` (optional): a positive number of seconds a pulled
+  message stays invisible while awaiting acknowledgement, defaulting to 30.
+
+Exactly one of `url` and `queue` must be present in a subscription. Any
+other field, a missing or invalid `events` list, an empty queue name, or a
+non-positive or non-finite visibility timeout is a 400 `validation_error`
+that rejects the whole request without partial writes. Queue names are
+unique per tenant across declarations: declaring a name that another
+workflow or execution of the same tenant already declared is a 409
+`conflict`, while different tenants may reuse the same names freely.
+
+A workflow or an execution may declare several queue targets. Every
+execution gets its own queues — those declared on the workflow revision it
+is bound to, plus those it declares itself — and when a subscribed event
+occurs, a message carrying the event type and its details is appended to
+each matching queue of that execution, in occurrence order. The append is
+atomic with the event itself: a rejected operation leaves no queued message
+behind. Each message carries an idempotency key that is deterministic per
+event and queue: every delivery of the same message reuses the same key,
+and different events never share a key. Queues add no fields to the
+execution state and append no events, and replay, recovery, and queries
+never enqueue. Executions that declare no queue targets behave exactly as
+before.
+
+### Inspect the queue state
+
+```http
+GET /executions/run-4/queues
+X-Tenant-Id: acme
+```
+
+Returns `{"queues": [...]}` with one entry per queue of the execution, in
+declaration order; an execution with no queue targets gets the definite
+empty result `{"queues": []}`. Each entry gives its `queue` name, the
+`visibility_seconds` in effect, and the queue's `messages` in entry order —
+an empty list for a queue that never received a message. Each message record
+gives its `sequence` (the entry order), the `event_type` and
+`event_sequence` that produced it, the event `payload`, the message
+`idempotency_key`, the `delivery_count`, a `deliveries` list recording every
+delivery with its `delivery` number and `delivered_at` time, the
+`enqueued_at` time, and the current `status` (`pending`, `delivered`, or
+`acknowledged`). Querying the queues of a missing execution — including one
+owned by another tenant — is the usual 404 `not_found`.
+
+### Pull messages from a queue
+
+```http
+POST /executions/run-4/queues/order-events/pull
+Idempotency-Key: pull-request-1
+X-Tenant-Id: acme
+
+{}
+```
+
+The body must be an empty object. The response is `{"messages": [...]}`: the
+currently pending messages in entry order, each rendered like the message
+records of the queue state query. A pulled message becomes invisible for the
+queue's visibility timeout; if it is not acknowledged by then, it returns to
+the pending set and is delivered again — the queue semantics are at least
+once, and every delivery is recorded in the message's delivery history.
+Pulling an empty queue, or one whose messages are all invisible, is a
+definite empty result `{"messages": []}`, not an error. Every delivery to
+the caller is metered as one `delivery_attempted` usage record, exactly like
+an outbound webhook attempt, and counts toward the tenant's bill.
+
+### Acknowledge a message
+
+```http
+POST /executions/run-4/queues/order-events/ack
+Idempotency-Key: ack-request-1
+X-Tenant-Id: acme
+
+{"idempotency_key": "run-4:2:queue:order-events"}
+```
+
+The body must contain exactly `idempotency_key`, naming a message of the
+queue. Acknowledgement is explicit and final: the message permanently leaves
+the queue and is never delivered again, and the response is
+`{"acknowledged": true}`. Acknowledging a message that was already
+acknowledged, or a key the queue does not know, is a 404 `not_found`.
+Pulling from or acknowledging a queue the execution does not have, or one
+belonging to a missing or cross-tenant execution, is likewise a 404
+`not_found`. Pull and acknowledge are idempotent commands like every other
+operation: repeating one with the same `Idempotency-Key` returns the
+original result, and reusing a key across different operations is a 409
+`conflict`.
 
 ### Schedules
 
@@ -1125,9 +1242,17 @@ never revealed across tenants. A `retries` value that is negative, non-integer, 
 10, and a non-positive `timeout_seconds`, are validation errors. A malformed
 subscription — a missing or mistyped field, an unknown field, an empty or
 duplicated event list, an unknown event type, an empty or non-http(s) `url`,
-a non-positive timeout or attempt count, or more than ten attempts — is a
+a non-positive timeout or attempt count, more than ten attempts, a
+subscription declaring both `url` and `queue` or neither, an empty queue
+name, or a non-positive visibility timeout — is a
 validation error that rejects the whole request without partial writes, and
-querying the delivery history of a missing execution is a missing resource. An approval
+querying the delivery history or the queues of a missing execution is a
+missing resource. Declaring a queue name another workflow or execution of
+the same tenant already declared is a conflict. Pulling from or
+acknowledging a missing queue, and acknowledging an unknown or already
+acknowledged message, are missing resources; a pull body that is not an
+empty object, or an acknowledgement body without exactly an
+`idempotency_key` string, is a validation error. An approval
 point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.

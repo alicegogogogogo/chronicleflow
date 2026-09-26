@@ -147,6 +147,12 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.checkpoints(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "deliveries" and self.command == "GET":
             return 200, self.service.deliveries(parts[1], self._tenant())
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "queues" and self.command == "GET":
+            return 200, self.service.queues(parts[1], self._tenant())
+        if len(parts) == 5 and parts[0] == "executions" and parts[2] == "queues" and parts[4] == "pull" and self.command == "POST":
+            return 200, self.service.pull_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 5 and parts[0] == "executions" and parts[2] == "queues" and parts[4] == "ack" and self.command == "POST":
+            return 200, self.service.ack_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":
