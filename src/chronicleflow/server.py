@@ -147,6 +147,36 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.checkpoints(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "deliveries" and self.command == "GET":
             return 200, self.service.deliveries(parts[1], self._tenant())
+        if len(parts) == 3 and parts[0] == "executions" and parts[2] == "queues" and self.command == "GET":
+            return 200, self.service.queue_status(parts[1], self._tenant())
+        if (
+            len(parts) == 5
+            and parts[0] == "executions"
+            and parts[2] == "queues"
+            and parts[4] == "pull"
+            and self.command == "POST"
+        ):
+            return 200, self.service.pull_queue(
+                parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant(), parts[1]
+            )
+        if (
+            len(parts) == 5
+            and parts[0] == "executions"
+            and parts[2] == "queues"
+            and parts[4] == "acknowledge"
+            and self.command == "POST"
+        ):
+            return 200, self.service.acknowledge_queue(
+                parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant(), parts[1]
+            )
+        if len(parts) == 3 and parts[0] == "queues" and parts[2] == "pull" and self.command == "POST":
+            return 200, self.service.pull_queue(
+                parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant()
+            )
+        if len(parts) == 3 and parts[0] == "queues" and parts[2] == "acknowledge" and self.command == "POST":
+            return 200, self.service.acknowledge_queue(
+                parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant()
+            )
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":
@@ -187,10 +217,17 @@ def main() -> None:
     parser.add_argument("--port", default=8080, type=int)
     parser.add_argument("--database", default="chronicleflow.db")
     arguments = parser.parse_args()
-    Handler.service = ChronicleFlow(arguments.database)
+    service = ChronicleFlow(arguments.database)
+    Handler.service = service
     server = ThreadingHTTPServer((arguments.host, arguments.port), Handler)
     print(f"ChronicleFlow listening on http://{arguments.host}:{arguments.port}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        service.close()
 
 
 if __name__ == "__main__":

@@ -126,6 +126,49 @@ CREATE TABLE IF NOT EXISTS usage_records (
   created_at TEXT NOT NULL,
   PRIMARY KEY (tenant, sequence)
 );
+CREATE TABLE IF NOT EXISTS queue_targets (
+  tenant TEXT NOT NULL DEFAULT '',
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  PRIMARY KEY (tenant, owner_type, owner_id, version, position)
+);
+CREATE TABLE IF NOT EXISTS queue_registry (
+  tenant TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  document TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, name),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS queue_messages (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  queue_name TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  document TEXT NOT NULL,
+  status TEXT NOT NULL,
+  delivery_count INTEGER NOT NULL DEFAULT 0,
+  visible_at REAL,
+  active_receipt TEXT,
+  PRIMARY KEY (tenant, execution_id, queue_name, sequence),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
+CREATE TABLE IF NOT EXISTS queue_deliveries (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  queue_name TEXT NOT NULL,
+  message_sequence INTEGER NOT NULL,
+  attempt INTEGER NOT NULL,
+  receipt TEXT NOT NULL,
+  delivered_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, execution_id, queue_name, message_sequence, attempt),
+  FOREIGN KEY (tenant, execution_id, queue_name, message_sequence)
+    REFERENCES queue_messages(tenant, execution_id, queue_name, sequence)
+);
 """
 
 # Legacy (pre-tenancy) column layouts, used only when migrating an old file.
