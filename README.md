@@ -43,7 +43,10 @@ The initial release intentionally supports a compact public contract:
   five-field cron plan — and the service automatically creates one execution
   per due period with the declared input; schedules can be paused and
   resumed, and periods missed while paused are either caught up once or
-  skipped, according to the declared missed policy.
+  skipped, according to the declared missed policy;
+- a per-tenant metrics query summarizes the persisted business facts:
+  execution status distribution, node completions and failures, retry
+  consumption, delivery attempt outcomes, and schedule triggers.
 
 ## Requirements
 
@@ -92,7 +95,7 @@ version is the usual `404 not_found`.
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, and all history and status
-queries, as well as the usage and bill queries. An empty
+queries, as well as the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -207,6 +210,66 @@ no records, `items` is empty and `total` is `0`.
 Both endpoints are tenant-scoped `GET` requests: a missing or empty
 `X-Tenant-Id` is a `400 validation_error`. Usage and bill data follow the
 usual tenant isolation, so one tenant can never see another's records.
+
+### Operational metrics
+
+```http
+GET /metrics
+X-Tenant-Id: acme
+```
+
+Returns a single compact JSON object summarizing the tenant's persisted
+business facts, with the top-level keys in this order:
+
+```json
+{
+  "status_distribution": {"completed": 1, "running": 2, "terminated": {"cancelled": 0, "rejected": 1, "retries_exhausted": 0, "timeout": 1}},
+  "nodes_completed": {"charge": 3, "reserve": 4},
+  "nodes_failed": {"charge": 1},
+  "retries_consumed": {"charge": 1},
+  "deliveries_succeeded": {"https://hooks.example.com/orders": 2},
+  "deliveries_failed": {"https://hooks.example.com/orders": 1},
+  "schedule_triggered": {"nightly-orders": 4}
+}
+```
+
+The dimensions are:
+
+- `status_distribution` — executions grouped into `running`, `completed`,
+  and `terminated`, with `terminated` subdivided by its termination reason
+  (`cancelled`, `rejected`, `retries_exhausted`, `timeout`). Only persisted
+  facts count: a running execution whose deadline has passed still counts as
+  `running` until the timeout is actually settled by an operation.
+- `nodes_completed` — one count per recorded `node_completed` fact, grouped
+  by node identifier. Condition evaluations and `run_if` skips are not
+  completions and are never counted.
+- `nodes_failed` — one count per submitted failure, grouped by node
+  identifier.
+- `retries_consumed` — one count per failure that re-queued the node,
+  grouped by node identifier. A loop body node accumulates every iteration's
+  completions, failures, and retries round by round.
+- `deliveries_succeeded` / `deliveries_failed` — one count per outbound
+  delivery attempt, grouped by target URL; a 2xx response is a success and
+  any other outcome (a non-2xx status or a transport error) is a failure, so
+  a delivery that retries counts every try.
+- `schedule_triggered` — one count per schedule period that created its
+  execution, grouped by workflow identifier; settling the same period more
+  than once counts it only once.
+
+A version migration does not change attribution: facts recorded before and
+after a migration accumulate under the same execution's node names. Every
+count is a non-negative integer; a dimension with no facts reports its zero
+form (zero for every status bucket and termination reason, an empty group
+for the other dimensions) rather than omitting keys, and groups within a
+dimension are ordered by ascending business identifier. A tenant that has
+never recorded a business fact gets the definite all-zero result, not an
+error.
+
+The query is strictly read-only: it appends no events, writes no usage
+records, and changes no stored data, so advancement, approvals, recovery,
+and replay never alter its conclusions. It requires a tenant: a missing or
+empty `X-Tenant-Id` is a `400 validation_error`, and one tenant's facts are
+never visible to — nor counted by — another.
 
 ### Health
 
@@ -990,8 +1053,8 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations and the usage and bill queries require a tenant, and quota
-limits are positive integers validated by the
+declarations and the usage, bill, and metrics queries require a tenant, and
+quota limits are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
 Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across

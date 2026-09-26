@@ -70,6 +70,10 @@ USAGE_TYPES = (
     USAGE_TYPE_WORKFLOW_CREATED,
 )
 
+# Termination reasons, in ascending identifier order. The metrics status
+# distribution always reports every reason, with zero when none occurred.
+TERMINATION_REASONS = ("cancelled", "rejected", "retries_exhausted", "timeout")
+
 # Unit price per metered action, in integer cents. Positive by contract and
 # reported verbatim on every bill line.
 USAGE_UNIT_PRICES = {
@@ -369,6 +373,105 @@ class ChronicleFlow:
                         }
                     )
                 return {"bill": {"items": items, "total": total}}
+
+    def metrics(self, tenant: str) -> dict[str, Any]:
+        """Summarize the tenant's persisted business facts; strictly read-only.
+
+        Every count is derived from facts already stored — execution states,
+        the event streams, the delivery history, and the schedule trigger
+        records — so advancing, approving, recovering, or replaying never
+        changes the conclusions, and the query itself writes nothing.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        with self._operation():
+            with self.store.transaction():
+                # Executions fall into running, completed, or terminated; the
+                # terminated bucket is subdivided by its termination reason.
+                # A running execution past its deadline still counts as
+                # running until the timeout fact is actually persisted.
+                distribution: dict[str, Any] = {
+                    "completed": 0,
+                    "running": 0,
+                    "terminated": {reason: 0 for reason in TERMINATION_REASONS},
+                }
+                execution_rows = self.store.connection.execute(
+                    "SELECT state FROM executions WHERE tenant = ?",
+                    (tenant,),
+                ).fetchall()
+                for execution_row in execution_rows:
+                    state = self.store.decode(execution_row["state"])
+                    status = state["status"]
+                    if status == "terminated":
+                        reason = state.get("termination_reason")
+                        if reason in distribution["terminated"]:
+                            distribution["terminated"][reason] += 1
+                    elif status in ("completed", "running"):
+                        distribution[status] += 1
+                # Node facts come from the recorded events: one completion per
+                # node_completed record (condition evaluations and skips are
+                # not completions), one failure per submitted node_failed
+                # record, and one consumed retry per node_retried re-queue.
+                # Loop body nodes record one event per iteration, so repeated
+                # rounds accumulate naturally; a version migration appends to
+                # the same stream, so facts keep their execution's node names.
+                completed_counts: dict[str, int] = {}
+                failed_counts: dict[str, int] = {}
+                retried_counts: dict[str, int] = {}
+                event_rows = self.store.connection.execute(
+                    "SELECT type, payload FROM events "
+                    "WHERE tenant = ? AND type IN ('node_completed', 'node_failed', 'node_retried')",
+                    (tenant,),
+                ).fetchall()
+                targets = {
+                    "node_completed": completed_counts,
+                    "node_failed": failed_counts,
+                    "node_retried": retried_counts,
+                }
+                for event_row in event_rows:
+                    payload = self.store.decode(event_row["payload"])
+                    counts = targets[event_row["type"]]
+                    node_id = payload["node_id"]
+                    counts[node_id] = counts.get(node_id, 0) + 1
+                # Every outbound delivery try counts once per target: a 2xx
+                # status code is a success, anything else (a non-2xx code or a
+                # transport error) is a failure, and each retry of the same
+                # delivery is its own attempt.
+                delivered_counts: dict[str, int] = {}
+                undelivered_counts: dict[str, int] = {}
+                delivery_rows = self.store.connection.execute(
+                    "SELECT document FROM deliveries WHERE tenant = ?",
+                    (tenant,),
+                ).fetchall()
+                for delivery_row in delivery_rows:
+                    record = self.store.decode(delivery_row["document"])
+                    url = record["url"]
+                    for attempt in record.get("attempts", []):
+                        status_code = attempt.get("status_code")
+                        if isinstance(status_code, int) and 200 <= status_code < 300:
+                            delivered_counts[url] = delivered_counts.get(url, 0) + 1
+                        else:
+                            undelivered_counts[url] = undelivered_counts.get(url, 0) + 1
+                # One trigger record exists per settled schedule period, so
+                # counting rows per workflow counts each fired period once.
+                trigger_rows = self.store.connection.execute(
+                    "SELECT workflow_id, COUNT(*) AS count FROM schedule_triggers "
+                    "WHERE tenant = ? GROUP BY workflow_id ORDER BY workflow_id",
+                    (tenant,),
+                ).fetchall()
+                trigger_counts = {row["workflow_id"]: row["count"] for row in trigger_rows}
+                # Groups within a dimension are ordered by ascending business
+                # identifier; a dimension with no facts reports its zero form
+                # (zeros for the status buckets, an empty group otherwise).
+                return {
+                    "status_distribution": distribution,
+                    "nodes_completed": {node_id: completed_counts[node_id] for node_id in sorted(completed_counts)},
+                    "nodes_failed": {node_id: failed_counts[node_id] for node_id in sorted(failed_counts)},
+                    "retries_consumed": {node_id: retried_counts[node_id] for node_id in sorted(retried_counts)},
+                    "deliveries_succeeded": {url: delivered_counts[url] for url in sorted(delivered_counts)},
+                    "deliveries_failed": {url: undelivered_counts[url] for url in sorted(undelivered_counts)},
+                    "schedule_triggered": trigger_counts,
+                }
 
 
     def _quota_limits(self, tenant: str) -> Any:
