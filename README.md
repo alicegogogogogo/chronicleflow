@@ -225,7 +225,69 @@ recorded. A missing or empty `X-Tenant-Id` is a `400 validation_error`, and
 the metrics follow the usual tenant isolation: another tenant's facts are
 never visible in any dimension and never affect this tenant's counts. A
 tenant with no recorded facts at all gets the definite empty result with
-every dimension at zero — not an error.
+every dimension at zero — not an error. With no query parameters the answer
+is every fact recorded for the tenant, byte for byte.
+
+The query accepts two optional query parameters, each an ISO-8601 UTC
+timestamp ending in `Z`:
+
+```http
+GET /metrics?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
+X-Tenant-Id: acme
+```
+
+- `since` and `until` bound a **closed** interval on the facts' occurrence
+  times: a fact whose time equals `since` or `until` is counted. When either
+  parameter is absent the corresponding bound is open, so omitting both
+  counts every recorded fact;
+- a malformed `since` or `until`, a repeated parameter, or any unknown query
+  parameter is a `400 validation_error`;
+- when `since` is later than `until` the request is not an error: the window
+  simply contains no facts, so every dimension reports its definite zero
+  result.
+
+Each dimension is windowed by the occurrence time of its own fact: node
+completions, failures, and retry consumption use the time of their recorded
+node events; delivery outcomes use the delivery record's `occurred_at`
+(shared by every attempt recorded in it); schedule triggers use the settled
+period's trigger time; and the status distribution counts an execution at
+the time it entered its current status — a still-running execution at its
+start time, and a completed or terminated execution at the time of its
+completion or termination event.
+
+### Export metrics in Prometheus text format
+
+```http
+GET /metrics/export
+X-Tenant-Id: acme
+```
+
+A read-only tenant-scoped entry point that returns the same counts as the
+metrics query — including the same optional `since` and `until` filters, the
+same closed-interval semantics, the same definite zero result for a window
+with `since` later than `until`, and the same `400 validation_error` for a
+missing or empty tenant, a malformed timestamp, or an unknown query
+parameter — rendered in the Prometheus text exposition format
+(`text/plain; version=0.0.4`). It writes no events and no usage records.
+
+Each top-level metrics dimension is one metric family named with the
+dimension's public key prefixed by `chronicleflow_`. The families appear in
+the documented top-level key order, and the samples within a family are
+ordered by ascending label value:
+
+- `chronicleflow_status_distribution` — samples carry a `status` label
+  (`running`, `completed`, `terminated`); only the terminated samples also
+  carry a `reason` label naming one of the four termination reasons;
+- `chronicleflow_node_completions`, `chronicleflow_node_failures`, and
+  `chronicleflow_retry_consumption` — samples carry a `node` label;
+- `chronicleflow_schedule_triggers` — samples carry a `workflow` label;
+- `chronicleflow_delivery_succeeded` and `chronicleflow_delivery_failed` —
+  unlabeled scalar samples.
+
+Every value is a decimal integer. A dimension with no facts in the window
+still exposes a zero-valued sample line (the labeled families expose one
+unlabeled `0` sample). Every line ends with a newline and the whole document
+ends with a single newline.
 
 The top-level keys appear in this order — status distribution, node
 completions, node failures, retry consumption, delivery successes, delivery
@@ -257,8 +319,8 @@ All counts are non-negative integers. A dimension with no facts reports zero
 (or an empty group) rather than being omitted, and the groups within a
 dimension are ordered by ascending identifier. Migrating an execution to
 another version does not change attribution: facts recorded before and after
-the migration accumulate under the same names. Filtering by time range and
-export formats are out of scope.
+the migration accumulate under the same names. The optional `since` and
+`until` filters and the Prometheus text export are described above.
 
 ### Health
 

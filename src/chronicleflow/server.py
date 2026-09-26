@@ -3,14 +3,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
-from .service import ChronicleFlow
+from .service import ChronicleFlow, _parse_timestamp
 
 TENANT_HEADER = "X-Tenant-Id"
+
+# The only query parameters the metrics query and the Prometheus export
+# accept; anything else is a validation error exactly like an unknown field.
+METRICS_QUERY_PARAMETERS = ("since", "until")
+
+# A response rendered as a non-JSON text body (the Prometheus export).
+TextResponse = namedtuple("TextResponse", ("content_type", "body"))
 
 
 def _reject_non_finite(constant: str) -> Any:
@@ -41,6 +49,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write(self, status: int, response: Any) -> None:
+        if isinstance(response, TextResponse):
+            body = response.body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", response.content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._json(status, response)
+
+    def _metrics_window(self) -> tuple[Any, Any]:
+        """Parse the optional since/until query parameters of the metrics routes.
+
+        Both parameters are ISO-8601 UTC timestamps ending in Z, may appear at
+        most once, and are the only accepted parameters. Repeating either or
+        sending any other parameter is a 400 validation_error.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in METRICS_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in METRICS_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        return (
+            _parse_timestamp(query.get("since", [None])[0], "since"),
+            _parse_timestamp(query.get("until", [None])[0], "until"),
+        )
 
     def _body(self) -> Any:
         content_type = self.headers.get("Content-Type", "")
@@ -79,7 +117,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["bill"]:
             return 200, self.service.bill(self._tenant())
         if self.command == "GET" and parts == ["metrics"]:
-            return 200, self.service.metrics(self._tenant())
+            since, until = self._metrics_window()
+            return 200, self.service.metrics(self._tenant(), since, until)
+        if self.command == "GET" and parts == ["metrics", "export"]:
+            since, until = self._metrics_window()
+            return 200, TextResponse(
+                "text/plain; version=0.0.4; charset=utf-8",
+                self.service.metrics_export(self._tenant(), since, until),
+            )
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 2 and parts[0] == "workflows" and self.command == "GET":
@@ -125,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self) -> None:
         try:
             status, response = self._dispatch()
-            self._json(status, response)
+            self._write(status, response)
         except ChronicleFlowError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
         except Exception:

@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -17,6 +18,29 @@ from .schedule import Cron, parse_schedule
 from .store import Store
 
 logger = logging.getLogger("chronicleflow")
+
+
+def _parse_timestamp(value: str | None, field: str) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp ending in Z; absent means no boundary."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValidationError(f"{field} must be an ISO-8601 UTC timestamp ending in Z")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValidationError(f"{field} must be an ISO-8601 UTC timestamp ending in Z") from error
+    return parsed
+
+
+def _parse_stored_time(value: str) -> datetime:
+    """Parse a timestamp the service itself stored (always a UTC value ending in Z)."""
+    return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
+def _prometheus_label(value: str) -> str:
+    """Escape a label value for the Prometheus text exposition format."""
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 def _json_type(value: Any) -> str:
@@ -377,7 +401,12 @@ class ChronicleFlow:
 
     # --- operational metrics ---------------------------------------------
 
-    def metrics(self, tenant: str) -> dict[str, Any]:
+    def metrics(
+        self,
+        tenant: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, Any]:
         """Aggregate the tenant's persisted business facts into run metrics.
 
         The query is read-only: it appends no events, writes no usage records,
@@ -385,90 +414,205 @@ class ChronicleFlow:
         observes it), so the answer reflects exactly what is stored. Every
         dimension is always present — a tenant with no recorded facts gets a
         definite all-zero result rather than an error.
+
+        ``since`` and ``until`` bound a closed interval on the facts'
+        occurrence times: a fact whose time equals either endpoint is counted.
+        A window with ``since`` later than ``until`` simply contains no facts,
+        so every dimension reports zero.
         """
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
         with self._operation():
             with self.store.transaction():
-                distribution: dict[str, Any] = {
-                    "running": 0,
-                    "completed": 0,
-                    "terminated": {reason: 0 for reason in TERMINATION_REASONS},
-                }
-                rows = self.store.connection.execute(
-                    "SELECT state FROM executions WHERE tenant = ?",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    state = self.store.decode(row["state"])
-                    status = state["status"]
-                    if status == "terminated":
-                        reason = state.get("termination_reason")
-                        if reason in distribution["terminated"]:
-                            distribution["terminated"][reason] += 1
-                    elif status in ("running", "completed"):
-                        distribution[status] += 1
-                # Completion, failure, and retry consumption are counted from
-                # the recorded node events: condition evaluations and skips
-                # append their own event types and are never counted here, and
-                # loop body nodes accumulate one event per iteration. A version
-                # migration appends no node events, so facts recorded before
-                # and after it accumulate under the same node identifiers.
-                completions: dict[str, int] = {}
-                failures: dict[str, int] = {}
-                retries: dict[str, int] = {}
-                buckets = {
-                    "node_completed": completions,
-                    "node_failed": failures,
-                    "node_retried": retries,
-                }
-                rows = self.store.connection.execute(
-                    "SELECT type, payload FROM events WHERE tenant = ? "
-                    "AND type IN ('node_completed', 'node_failed', 'node_retried')",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    node_id = self.store.decode(row["payload"])["node_id"]
-                    bucket = buckets[row["type"]]
-                    bucket[node_id] = bucket.get(node_id, 0) + 1
-                # Delivery outcomes are counted per outbound HTTP attempt, so
-                # a delivery that fails and then succeeds on a retry records
-                # one of each; an attempt succeeded exactly when it received a
-                # 2xx status code.
-                succeeded = 0
-                failed = 0
-                rows = self.store.connection.execute(
-                    "SELECT document FROM deliveries WHERE tenant = ?",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    attempts = self.store.decode(row["document"]).get("attempts")
-                    if not isinstance(attempts, list):
-                        continue
-                    for attempt in attempts:
-                        status_code = attempt.get("status_code") if isinstance(attempt, dict) else None
-                        if isinstance(status_code, int) and 200 <= status_code < 300:
-                            succeeded += 1
-                        else:
-                            failed += 1
-                # One trigger row exists per settled schedule period, so a
-                # repeated settlement of the same period counts nothing more.
-                rows = self.store.connection.execute(
-                    "SELECT workflow_id, COUNT(*) AS count FROM schedule_triggers "
-                    "WHERE tenant = ? GROUP BY workflow_id ORDER BY workflow_id",
-                    (tenant,),
-                ).fetchall()
-                triggers = {row["workflow_id"]: row["count"] for row in rows}
-                return {
-                    "status_distribution": distribution,
-                    "node_completions": dict(sorted(completions.items())),
-                    "node_failures": dict(sorted(failures.items())),
-                    "retry_consumption": dict(sorted(retries.items())),
-                    "delivery_succeeded": succeeded,
-                    "delivery_failed": failed,
-                    "schedule_triggers": triggers,
-                }
+                return self._metrics_counts(tenant, since, until)
 
+    def _metrics_counts(
+        self,
+        tenant: str,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> dict[str, Any]:
+        """Compute the metrics document; the caller validates the tenant and holds a transaction."""
+        # A window with since later than until contains no facts at all, so its
+        # result is the same definite zero shape as a tenant with no facts.
+        empty_window = since is not None and until is not None and since > until
+
+        distribution: dict[str, Any] = {
+            "running": 0,
+            "completed": 0,
+            "terminated": {reason: 0 for reason in TERMINATION_REASONS},
+        }
+        # Each execution contributes exactly one status fact: a running
+        # execution's fact is its execution_started event, while a completed or
+        # terminated execution's fact is the event that established that
+        # status. With no window this counts every execution once, exactly as
+        # the unfiltered baseline does. An execution has at most one terminal
+        # event, so the join never multiplies rows.
+        if not empty_window:
+            status_rows = self.store.connection.execute(
+                "SELECT e.state, COALESCE(t.occurred_at, s.occurred_at) AS at "
+                "FROM executions e "
+                "JOIN events s ON s.tenant = e.tenant AND s.execution_id = e.id AND s.type = 'execution_started' "
+                "LEFT JOIN events t ON t.tenant = e.tenant AND t.execution_id = e.id "
+                "AND t.type IN ('execution_completed', 'execution_terminated') "
+                "WHERE e.tenant = ?",
+                (tenant,),
+            ).fetchall()
+            for row in status_rows:
+                if not self._within_window(_parse_stored_time(row["at"]), since, until):
+                    continue
+                state = self.store.decode(row["state"])
+                status = state["status"]
+                if status == "terminated":
+                    reason = state.get("termination_reason")
+                    if reason in distribution["terminated"]:
+                        distribution["terminated"][reason] += 1
+                elif status in ("running", "completed"):
+                    distribution[status] += 1
+
+        # Completion, failure, and retry consumption are counted from
+        # the recorded node events: condition evaluations and skips
+        # append their own event types and are never counted here, and
+        # loop body nodes accumulate one event per iteration. A version
+        # migration appends no node events, so facts recorded before
+        # and after it accumulate under the same node identifiers.
+        completions: dict[str, int] = {}
+        failures: dict[str, int] = {}
+        retries: dict[str, int] = {}
+        buckets = {
+            "node_completed": completions,
+            "node_failed": failures,
+            "node_retried": retries,
+        }
+        if not empty_window:
+            rows = self.store.connection.execute(
+                "SELECT type, payload, occurred_at FROM events WHERE tenant = ? "
+                "AND type IN ('node_completed', 'node_failed', 'node_retried')",
+                (tenant,),
+            ).fetchall()
+            for row in rows:
+                if not self._within_window(_parse_stored_time(row["occurred_at"]), since, until):
+                    continue
+                node_id = self.store.decode(row["payload"])["node_id"]
+                bucket = buckets[row["type"]]
+                bucket[node_id] = bucket.get(node_id, 0) + 1
+
+        # Delivery outcomes are counted per outbound HTTP attempt, so
+        # a delivery that fails and then succeeds on a retry records
+        # one of each; an attempt succeeded exactly when it received a
+        # 2xx status code. A delivery document carries the single
+        # occurred_at of the delivery record, shared by every attempt
+        # recorded in it.
+        succeeded = 0
+        failed = 0
+        if not empty_window:
+            rows = self.store.connection.execute(
+                "SELECT document FROM deliveries WHERE tenant = ?",
+                (tenant,),
+            ).fetchall()
+            for row in rows:
+                document = self.store.decode(row["document"])
+                if since is not None or until is not None:
+                    occurred_at = document.get("occurred_at")
+                    if not isinstance(occurred_at, str) or not self._within_window(
+                        _parse_stored_time(occurred_at), since, until
+                    ):
+                        continue
+                attempts = document.get("attempts")
+                if not isinstance(attempts, list):
+                    continue
+                for attempt in attempts:
+                    status_code = attempt.get("status_code") if isinstance(attempt, dict) else None
+                    if isinstance(status_code, int) and 200 <= status_code < 300:
+                        succeeded += 1
+                    else:
+                        failed += 1
+
+        # One trigger row exists per settled schedule period, so a
+        # repeated settlement of the same period counts nothing more.
+        triggers: dict[str, int] = {}
+        if not empty_window:
+            rows = self.store.connection.execute(
+                "SELECT workflow_id, triggered_at, COUNT(*) AS count FROM schedule_triggers "
+                "WHERE tenant = ? GROUP BY workflow_id, triggered_at ORDER BY workflow_id",
+                (tenant,),
+            ).fetchall()
+            for row in rows:
+                if not self._within_window(_parse_stored_time(row["triggered_at"]), since, until):
+                    continue
+                triggers[row["workflow_id"]] = triggers.get(row["workflow_id"], 0) + row["count"]
+
+        return {
+            "status_distribution": distribution,
+            "node_completions": dict(sorted(completions.items())),
+            "node_failures": dict(sorted(failures.items())),
+            "retry_consumption": dict(sorted(retries.items())),
+            "delivery_succeeded": succeeded,
+            "delivery_failed": failed,
+            "schedule_triggers": dict(sorted(triggers.items())),
+        }
+
+    @staticmethod
+    def _within_window(occurred_at: datetime, since: datetime | None, until: datetime | None) -> bool:
+        """Closed-interval membership: a fact equal to either endpoint counts."""
+        if since is not None and occurred_at < since:
+            return False
+        if until is not None and occurred_at > until:
+            return False
+        return True
+
+    def metrics_export(
+        self,
+        tenant: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> str:
+        """Render the filtered metrics in the Prometheus text exposition format.
+
+        Every top-level dimension is one metric family named with the
+        ``chronicleflow_`` prefix and the dimension's public key. Families
+        appear in the documented top-level key order; samples within a family
+        are ordered by ascending label value. Every family carries at least
+        one zero-valued sample when it has no facts, values are decimal
+        integers, every line ends with a newline, and the whole document ends
+        with a single newline.
+        """
+        counts = self.metrics(tenant, since, until)
+        status = counts["status_distribution"]
+        terminated = status["terminated"]
+        # Samples order by their label values: status first (completed, running,
+        # then the terminated samples by ascending reason), which is the
+        # ascending tuple-of-label-values order.
+        lines: list[str] = [
+            'chronicleflow_status_distribution{status="completed"} ' + str(status["completed"]),
+            'chronicleflow_status_distribution{status="running"} ' + str(status["running"]),
+        ]
+        for reason in TERMINATION_REASONS:
+            lines.append(
+                f'chronicleflow_status_distribution{{status="terminated",reason="{reason}"}} '
+                + str(terminated[reason])
+            )
+        for key in ("node_completions", "node_failures", "retry_consumption"):
+            groups = counts[key]
+            if groups:
+                for label_value, value in groups.items():
+                    lines.append(
+                        f'chronicleflow_{key}{{node="{_prometheus_label(label_value)}"}} {value}'
+                    )
+            else:
+                # A family with no facts still exposes one zero-valued sample.
+                lines.append(f"chronicleflow_{key} 0")
+        lines.append("chronicleflow_delivery_succeeded " + str(counts["delivery_succeeded"]))
+        lines.append("chronicleflow_delivery_failed " + str(counts["delivery_failed"]))
+        triggers = counts["schedule_triggers"]
+        if triggers:
+            for label_value, value in triggers.items():
+                lines.append(
+                    f'chronicleflow_schedule_triggers{{workflow="{_prometheus_label(label_value)}"}} {value}'
+                )
+        else:
+            lines.append("chronicleflow_schedule_triggers 0")
+        return "\n".join(lines) + "\n"
 
     def _quota_limits(self, tenant: str) -> Any:
         return self.store.connection.execute(
