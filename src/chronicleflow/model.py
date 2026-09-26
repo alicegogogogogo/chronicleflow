@@ -82,6 +82,44 @@ class Approval:
 
 
 @dataclass(frozen=True)
+class MapTemplate:
+    """The per-instance task a map node expands into.
+
+    A template carries only a task identifier, a retry bound, and an optional
+    approval point: instances are ready tasks like any other, distinguished
+    only by their map node and element index.
+    """
+
+    task_id: str
+    retries: int | None
+    approval: Approval | None = None
+
+    @classmethod
+    def parse(cls, raw: Any) -> "MapTemplate":
+        if not isinstance(raw, dict) or not set(raw) <= {"id", "retries", "approval"}:
+            raise ValidationError("map template may only contain id, retries, and approval")
+        if "id" not in raw:
+            raise ValidationError("map template must contain an id")
+        task_id = _identifier(raw["id"], "map template id")
+        retries = raw["retries"] if "retries" in raw else None
+        if retries is not None:
+            if isinstance(retries, bool) or not isinstance(retries, int):
+                raise ValidationError("map template retries must be an integer")
+            if not 0 <= retries <= MAX_RETRIES:
+                raise ValidationError(f"map template retries must be between 0 and {MAX_RETRIES}")
+        approval = Approval.parse(raw["approval"]) if "approval" in raw else None
+        return cls(task_id, retries, approval)
+
+    def as_dict(self) -> dict[str, Any]:
+        document: dict[str, Any] = {"id": self.task_id}
+        if self.retries is not None:
+            document["retries"] = self.retries
+        if self.approval is not None:
+            document["approval"] = self.approval.as_dict()
+        return document
+
+
+@dataclass(frozen=True)
 class Node:
     id: str
     kind: str
@@ -94,14 +132,17 @@ class Node:
     entry: str | None = None
     condition: str | None = None
     max_iterations: int | None = None
+    source: str | None = None
+    max_instances: int | None = None
+    template: MapTemplate | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> "Node":
         if not isinstance(raw, dict):
             raise ValidationError("each node must be an object")
         kind = raw.get("kind")
-        if kind not in ("task", "condition", "loop"):
-            raise ValidationError("node kind must be task, condition, or loop")
+        if kind not in ("task", "condition", "loop", "map"):
+            raise ValidationError("node kind must be task, condition, loop, or map")
         base = {"id", "kind", "depends_on"}
         if not base <= set(raw):
             raise ValidationError("each node must contain id, kind, and depends_on")
@@ -140,6 +181,29 @@ class Node:
                 condition=_identifier(raw["condition"], "condition"),
                 max_iterations=max_iterations,
             )
+        if kind == "map":
+            required = {"source", "path", "max_instances", "template"}
+            if set(raw) != base | required:
+                raise ValidationError(
+                    "map nodes must contain exactly id, kind, depends_on, source, path, max_instances, and template"
+                )
+            source = _identifier(raw["source"], "map source")
+            element_path = _input_path(raw["path"])
+            max_instances = raw["max_instances"]
+            if isinstance(max_instances, bool) or not isinstance(max_instances, int):
+                raise ValidationError("max_instances must be an integer")
+            if max_instances < 1:
+                raise ValidationError("max_instances must be a positive integer")
+            template = MapTemplate.parse(raw["template"])
+            return cls(
+                node_id,
+                "map",
+                depends_on,
+                path=element_path,
+                source=source,
+                max_instances=max_instances,
+                template=template,
+            )
         if set(raw) != base | {"path", "equals"}:
             raise ValidationError("condition nodes must contain exactly id, kind, depends_on, path, and equals")
         return cls(
@@ -159,6 +223,11 @@ class Node:
             document["entry"] = self.entry
             document["condition"] = self.condition
             document["max_iterations"] = self.max_iterations
+        elif self.kind == "map":
+            document["source"] = self.source
+            document["path"] = self.path
+            document["max_instances"] = self.max_instances
+            document["template"] = self.template.as_dict()
         else:
             if self.run_if is not None:
                 document["run_if"] = self.run_if.as_dict()
@@ -202,6 +271,7 @@ class Workflow:
                 raise ValidationError(f"node {node.id} must list condition {node.run_if.condition_id} in depends_on")
         _assert_acyclic(nodes)
         _assert_valid_loops(nodes, by_id)
+        _assert_valid_maps(nodes, by_id)
         return cls(workflow_id, nodes)
 
     def as_dict(self) -> dict[str, Any]:
@@ -270,6 +340,8 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
             raise ValidationError(f"loop {node.id} entry must not depend on the loop itself")
         if any(by_id[member].kind == "loop" for member in body):
             raise ValidationError(f"loop {node.id} body must not contain another loop")
+        if any(by_id[member].kind == "map" for member in body):
+            raise ValidationError(f"loop {node.id} body must not contain a map node")
         if judge.id not in body:
             raise ValidationError(f"loop {node.id} condition must belong to the loop body")
         bodies[node.id] = body
@@ -287,6 +359,43 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
                 raise ValidationError(
                     f"node {node.id} must not depend on loop body node {dependency}; depend on loop {owner[dependency]} instead"
                 )
+
+
+def _assert_valid_maps(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None:
+    """Structural rules for dynamic map nodes.
+
+    The expansion source must be a task explicitly listed as a dependency, the
+    template's task identifier must not collide with any declared node (it
+    names only the dynamically expanded instances), and a map node must not
+    itself sit inside a loop body (nested dynamic expansion is out of scope).
+    """
+    bodies = {
+        node.id: frozenset(_collect_loop_body(by_id, node.entry, node.condition))
+        for node in nodes
+        if node.kind == "loop"
+    }
+    body_members = set().union(*bodies.values()) if bodies else set()
+    declared = {node.id for node in nodes}
+    templates = {node.template.task_id for node in nodes if node.kind == "map"}
+    for node in nodes:
+        if node.kind != "map":
+            continue
+        if node.id in body_members:
+            raise ValidationError(f"map {node.id} must not belong to a loop body")
+        source = by_id.get(node.source)
+        if source is None:
+            raise ValidationError(f"map {node.id} source references an unknown node")
+        if source.kind != "task":
+            raise ValidationError(f"map {node.id} source must reference a task node")
+        if node.source not in node.depends_on:
+            raise ValidationError(f"map {node.id} must list its source task {node.source} in depends_on")
+    if len(templates) != len([node for node in nodes if node.kind == "map"]):
+        raise ValidationError("map template identifiers must be unique")
+    collided = templates & declared
+    if collided:
+        raise ValidationError(
+            f"map template id {next(iter(collided))} must not collide with a declared node identifier"
+        )
 
 
 def _assert_acyclic(nodes: tuple[Node, ...]) -> None:

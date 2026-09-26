@@ -6,8 +6,8 @@ SQLite so an execution can be inspected and replayed deterministically.
 
 The initial release intentionally supports a compact public contract:
 
-- workflows are directed acyclic graphs of `task`, `condition`, and bounded
-  `loop` nodes;
+- workflows are directed acyclic graphs of `task`, `condition`, bounded
+  `loop`, and dynamic `map` nodes;
 - a workflow may declare named versions: every declared version is kept and
   each execution is bound to the version that was current (or explicitly
   named) when it started, so upgrading a workflow never changes a running
@@ -531,6 +531,80 @@ Execution state exposes each loop under `loops`: `status`, the
 records `iteration_started`, `loop_condition_evaluated`, and `loop_completed`
 events alongside the usual per-node ones, so replay rebuilds loop state
 exactly.
+
+### Dynamic map nodes
+
+A `map` node expands at runtime into one task instance per element of a
+recorded array:
+
+```json
+{"id": "ship", "kind": "map", "depends_on": ["collect"],
+ "source": "collect", "path": "items", "max_instances": 100,
+ "template": {"id": "ship-item", "retries": 2}}
+```
+
+A map node contains exactly `id`, `kind`, `depends_on`, `source`, `path`,
+`max_instances`, and `template`; any other field is rejected as unknown.
+
+- `source` names a `task` node that is also listed in `depends_on`. Expansion
+  begins only after every dependency has completed or been skipped; the
+  element list comes solely from the source task's recorded output.
+- `path` is a non-empty dot-separated path into that recorded output, using
+  the same path syntax as a condition.
+- `max_instances` is a positive integer bounding how many elements may
+  expand.
+- `template` describes the single task each instance runs and contains
+  exactly an `id`, and optionally `retries` (an integer between 0 and 10,
+  defaulting to 0) and an `approval` point with the same shape a task node
+  uses. The template id must not collide with any declared node id and map
+  template ids must be unique; it only names the dynamically expanded
+  instances. A map node must not sit inside a loop body, and a loop body must
+  not contain a map node.
+
+When the dependencies settle, the value at `path` is read once. When it is an
+array, one instance is created per element; the instances queue in ascending
+element index order. Each `advance` still settles exactly one ready item, so
+instances are worked in index order, one per call. An instance is an ordinary
+task in every other respect: a submitted failure consumes the template's
+retry bound and re-queues that instance, and a template approval point parks
+the execution with the instance's `map_id` and `index` recorded, until an
+approver decides it. Retries and approvals are per instance: results never
+overwrite another instance.
+
+When every instance is completed, the map node completes and its output,
+recorded both in the node's `outputs` entry and under its `maps` record, is
+the list of instance outputs in ascending element order; its successors then
+become available in the usual way.
+
+A value that is missing or is not an array expands to zero instances: the map
+completes with an empty output list and releases its successors immediately.
+When the array holds more elements than `max_instances`, no instance is
+created at all: the map node fails permanently, is listed under
+`failed_nodes`, and the execution terminates with reason `retries_exhausted`
+under the usual exhaustion semantics.
+
+Execution state exposes each map under `maps`: the node's `status`
+(`pending`, `running`, `completed`, or `failed`), one record per instance
+giving its `index`, `status` (`ready`, `waiting`, `completed`, or `failed`),
+its `output`, and its `failure_reason` (null except for a permanently failed
+instance), plus the ordered completed `outputs` list and the node's single
+`failure_reason`. The `maps` field is present only when the bound workflow
+declares a map node; every other execution keeps its previous state shape.
+
+The event stream records a `map_expanded` event when expansion happens,
+carrying the map id and the number of created instances (zero for a missing
+or non-array value, and zero together with `exceeded` and the observed
+element count when the bound is exceeded), and a `map_completed` event with
+the map id and final instance count. Each instance's per-node events —
+`node_completed`, `node_failed`, and `node_retried`, plus
+`approval_requested` and `approval_decided` for a template approval point —
+carry their `map_id` and element `index` alongside the template node id, so
+replay rebuilds every instance solely from the event stream. Checkpoints are
+written at instance boundaries, so recovery resumes with the unfinished
+instances and never repeats an instance output. Per-instance completions and
+failures count toward the existing node metrics under the template node id,
+and webhook and queue subscriptions receive instance events exactly like any
+other node event.
 
 ### Workflow versions
 
@@ -1256,6 +1330,11 @@ empty object, or an acknowledgement body without exactly an
 point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.
+A map node with an unknown or missing field, a mistyped or non-positive
+`max_instances`, an invalid or colliding template, a `source` that is not a
+task dependency, an invalid `path`, or a map node inside a loop body (or a
+loop body containing a map) is likewise a validation error that rejects the
+whole request.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that
