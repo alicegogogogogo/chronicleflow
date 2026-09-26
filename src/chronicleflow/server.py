@@ -103,6 +103,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError(f"{TENANT_HEADER} header must be a non-empty string")
         return tenant
 
+    @staticmethod
+    def _instance_index(segment: str) -> int:
+        """Parse the element index path segment; a non-integer segment is malformed."""
+        digits = segment[1:] if segment.startswith("-") else segment
+        if not digits.isdigit():
+            raise ValidationError("instance index must be an integer")
+        return int(segment)
+
     def _dispatch(self) -> tuple[int, Any]:
         path = urlsplit(self.path).path
         parts = [part for part in path.split("/") if part]
@@ -153,6 +161,14 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.pull_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 5 and parts[0] == "executions" and parts[2] == "queues" and parts[4] == "ack" and self.command == "POST":
             return 200, self.service.ack_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 7 and parts[0] == "executions" and parts[2] == "maps" and parts[4] == "instances" and parts[6] == "delete" and self.command == "POST":
+            return 200, self.service.delete_map_instance(
+                parts[1], parts[3], self._instance_index(parts[5]), self._body(), self.headers.get("Idempotency-Key"), self._tenant()
+            )
+        if len(parts) == 7 and parts[0] == "executions" and parts[2] == "maps" and parts[4] == "instances" and parts[6] == "modify" and self.command == "POST":
+            return 200, self.service.modify_map_instance(
+                parts[1], parts[3], self._instance_index(parts[5]), self._body(), self.headers.get("Idempotency-Key"), self._tenant()
+            )
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "advance" and self.command == "POST":
             return 200, self.service.advance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "decision" and self.command == "POST":

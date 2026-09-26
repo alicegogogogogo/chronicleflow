@@ -85,6 +85,23 @@ def _new_map_instance(index: int) -> dict[str, Any]:
     }
 
 
+def _with_map_instance_input(instance: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
+    """Return an instance record carrying rewritten input in a stable key order.
+
+    The ``input`` field exists on an instance only once it has been rewritten.
+    Rebuilding the record with the same key order a decoded stored document
+    has keeps the order identical between the operation response, replay, and
+    later reads.
+    """
+    return {
+        "failure_reason": instance["failure_reason"],
+        "index": instance["index"],
+        "input": replacement,
+        "output": instance["output"],
+        "status": instance["status"],
+    }
+
+
 def _resolve_path(value: Any, path: str) -> Any:
     """Follow a dot-separated path; return None when any segment is missing."""
     current = value
@@ -2460,6 +2477,196 @@ class ChronicleFlow:
                 return loop_id
         return None
 
+    # --- dynamic instance deletion and modification ----------------------
+
+    def _locate_map_state(
+        self, workflow: Workflow, state: dict[str, Any], map_id: str, index: int
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Resolve a referenced dynamic node to its container, state, and context.
+
+        A map declared outside a loop body lives in the execution-level map
+        records; a map nested in a loop body belongs to its owner loop, and
+        while the loop runs only its current iteration can hold actionable
+        instances, so that iteration is the reference. Once the loop has
+        finished, the element index is looked up across its recorded
+        iterations: such an instance is already advanced, so the caller
+        answers 409 for it rather than pretending the dynamic node never
+        existed. A map with no such instance is a missing resource.
+        """
+        node = next((item for item in workflow.nodes if item.id == map_id and item.kind == "map"), None)
+        if node is None:
+            raise NotFoundError(f"map node {map_id} was not found")
+        owner_loop = next(
+            (owner for owner, body in workflow.loop_bodies().items() if map_id in body), None
+        )
+        if owner_loop is None:
+            maps = state.get("maps") or {}
+            if map_id not in maps:
+                raise NotFoundError(f"map node {map_id} was not found")
+            return state, maps[map_id], {}
+        loop_state = state.get("loops", {}).get(owner_loop)
+        if loop_state is None:
+            raise NotFoundError(f"map node {map_id} was not found")
+        iterations = loop_state["iterations"]
+        if loop_state["status"] == "running":
+            # The current iteration wins the same element index: it is the
+            # only expansion that can hold an actionable instance.
+            ordered = [loop_state["current_iteration"]]
+            ordered.extend(range(loop_state["current_iteration"] - 1, 0, -1))
+        else:
+            ordered = list(range(len(iterations), 0, -1))
+        for number in ordered:
+            iteration_record = iterations[number - 1]
+            map_state = (iteration_record.get("maps") or {}).get(map_id)
+            if map_state is not None and any(item["index"] == index for item in map_state["instances"]):
+                return iteration_record, map_state, {"loop_id": owner_loop, "iteration": number}
+        raise NotFoundError(f"map node {map_id} was not found")
+
+    def _remove_map_instance(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        container: dict[str, Any],
+        map_id: str,
+        map_state: dict[str, Any],
+        instance: dict[str, Any],
+        context: dict[str, Any],
+        tenant: str,
+    ) -> None:
+        """Drop one instance record while keeping every other record intact.
+
+        Removing the record keeps every surviving instance's element index
+        and queue order unchanged. A running map completes when every
+        retained instance is completed — including when the removal dropped
+        its last unfinished instance — with an output list of only the
+        retained outputs in ascending index order; a map or execution that
+        is already finished stays exactly as finished, so deletion never
+        changes a termination conclusion.
+        """
+        map_state["instances"] = [item for item in map_state["instances"] if item is not instance]
+        remaining = map_state["instances"]
+        if (
+            state["status"] == "running"
+            and map_state["status"] == "running"
+            and all(item["status"] == "completed" for item in remaining)
+        ):
+            # ``all`` holds for an empty retained set too: a map whose every
+            # instance was removed completes with an empty output list.
+            self._finish_map(execution_id, container, map_id, map_state, context, tenant)
+
+    def delete_map_instance(
+        self,
+        execution_id: str,
+        map_id: str,
+        index: Any,
+        raw: Any,
+        key: str | None,
+        tenant: str = DEFAULT_TENANT,
+    ) -> dict[str, Any]:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValidationError("instance index must be a non-negative integer")
+        if index < 0:
+            raise NotFoundError("instance index is out of bounds")
+        self._empty_body(raw, "delete instance")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            container, map_state, context = self._locate_map_state(workflow, state, map_id, index)
+            instance = next((item for item in map_state["instances"] if item["index"] == index), None)
+            if instance is None:
+                # A never-existing or already removed index is an
+                # out-of-bounds reference: 404, no state change.
+                raise NotFoundError(f"map {map_id} instance {index} was not found")
+            if instance["status"] not in ("ready", "failed"):
+                # An advanced instance (waiting for approval, or completed)
+                # can never be removed; no state is changed. A permanently
+                # failed instance is removable, but its map and the execution
+                # conclusion stay exactly as terminated.
+                raise ConflictError(f"map {map_id} instance {index} can no longer be deleted")
+            # The event records the action (its type), the owning dynamic
+            # node, the removed instance's index and status, and the loop
+            # context for an instance inside a body (an execution-level map
+            # carries no loop context).
+            payload = {"map_id": map_id, "index": index, "status": instance["status"]}
+            payload.update(context)
+            self._append(execution_id, "instance_deleted", payload, tenant)
+            self._remove_map_instance(
+                execution_id, state, container, map_id, map_state, instance, context, tenant
+            )
+            if state["status"] == "running" and map_state["status"] == "completed":
+                # Removing the last unfinished retained instance completes the
+                # node; run the boundary cascade so successors unlock as usual.
+                self._auto_process(execution_id, workflow, state, tenant)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            # The deletion settles an instance boundary: checkpoint it in the
+            # same transaction, exactly like an advance does.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(key, f"delete-instance:{execution_id}:{map_id}:{index}", apply, tenant)
+
+    def modify_map_instance(
+        self,
+        execution_id: str,
+        map_id: str,
+        index: Any,
+        raw: Any,
+        key: str | None,
+        tenant: str = DEFAULT_TENANT,
+    ) -> dict[str, Any]:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValidationError("instance index must be a non-negative integer")
+        if index < 0:
+            raise NotFoundError("instance index is out of bounds")
+        if not isinstance(raw, dict) or set(raw) != {"input"}:
+            raise ValidationError("modify instance body must contain exactly an input object")
+        if not isinstance(raw["input"], dict):
+            raise ValidationError("instance input must be an object")
+        _finite_json(raw["input"], "input")
+        replacement = raw["input"]
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            _, map_state, context = self._locate_map_state(workflow, state, map_id, index)
+            instance = next((item for item in map_state["instances"] if item["index"] == index), None)
+            if instance is None:
+                # An out-of-bounds, never-existing, or already removed index is
+                # a missing resource: 404, no state change.
+                raise NotFoundError(f"map {map_id} instance {index} was not found")
+            if instance["status"] != "ready":
+                # Only an instance that has never advanced may be rewritten;
+                # the output and history of an advanced (waiting, completed,
+                # or permanently failed) instance are immutable.
+                raise ConflictError(f"map {map_id} instance {index} can no longer be modified")
+            previous = instance.get("input")
+            # The event is appended before state is touched: it keeps the
+            # pre-rewrite content (null for a never-rewritten instance) and
+            # the new content, so replay rebuilds the rewrite from the stream.
+            payload = {"map_id": map_id, "index": index, "before": previous, "after": replacement}
+            payload.update(context)
+            self._append(execution_id, "instance_modified", payload, tenant)
+            position = next(
+                position for position, item in enumerate(map_state["instances"]) if item is instance
+            )
+            map_state["instances"][position] = _with_map_instance_input(instance, replacement)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            # The rewrite is recorded at an instance boundary: checkpoint it
+            # like every other instance boundary.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(key, f"modify-instance:{execution_id}:{map_id}:{index}", apply, tenant)
+
     def _launch_iteration(
         self,
         execution_id: str,
@@ -2818,6 +3025,29 @@ class ChronicleFlow:
                 else:
                     rebuilt["outputs"][payload["map_id"]] = map_state["outputs"]
                     rebuilt["completed_nodes"].append(payload["map_id"])
+            elif event_type == "instance_deleted" and rebuilt is not None:
+                # A removal drops the instance record while every retained
+                # instance keeps its index and order. When the removal empties
+                # the map, the following map_completed event (appended by the
+                # same operation) completes the node exactly as usual.
+                map_state = self._replay_map_state(rebuilt, payload)
+                map_state["instances"] = [
+                    item for item in map_state["instances"] if item["index"] != payload["index"]
+                ]
+            elif event_type == "instance_modified" and rebuilt is not None:
+                # The rewrite affects only this one unadvanced instance; its
+                # later completion records the output produced under the
+                # rewritten input. The record is rebuilt rather than mutated so
+                # the added input key keeps the same order as the stored state.
+                map_state = self._replay_map_state(rebuilt, payload)
+                position = next(
+                    position
+                    for position, item in enumerate(map_state["instances"])
+                    if item["index"] == payload["index"]
+                )
+                map_state["instances"][position] = _with_map_instance_input(
+                    map_state["instances"][position], payload["after"]
+                )
             elif event_type == "iteration_started" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 loop_state["status"] = "running"

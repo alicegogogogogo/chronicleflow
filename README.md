@@ -100,9 +100,9 @@ version is the usual `404 not_found`.
 
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
-operations, cancellation, recovery, replay, queue pulls, acknowledgements,
-and all history and status queries, as well as the usage, bill, and metrics
-queries. An empty
+operations, cancellation, recovery, replay, instance deletion and
+modification, queue pulls, acknowledgements, and all history and status
+queries, as well as the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -587,13 +587,15 @@ created at all: the map node fails permanently, is listed under
 under the usual exhaustion semantics.
 
 Execution state exposes each map under `maps`: the node's `status`
-(`pending`, `running`, `completed`, or `failed`), one record per instance
-giving its `index`, `status` (`ready`, `waiting`, `completed`, or `failed`),
-its `output`, and its `failure_reason` (null except for a permanently failed
-instance), plus the ordered completed `outputs` list and the node's single
-`failure_reason`. The `maps` field is present only when the bound workflow
-declares a map node outside any loop body; every other execution keeps its
-previous state shape.
+(`pending`, `running`, `completed`, or `failed`), one record per retained
+instance giving its `index`, `status` (`ready`, `waiting`, `completed`, or
+`failed`), its `output`, and its `failure_reason` (null except for a
+permanently failed instance), plus the ordered completed `outputs` list and
+the node's single `failure_reason`. A `ready` instance that has been
+rewritten by a successful modify additionally carries that rewritten
+`input`; every other instance record keeps exactly these fields. The `maps`
+field is present only when the bound workflow declares a map node outside
+any loop body; every other execution keeps its previous state shape.
 
 The event stream records a `map_expanded` event when expansion happens,
 carrying the map id and the number of created instances (zero for a missing
@@ -608,7 +610,9 @@ written at instance boundaries, so recovery resumes with the unfinished
 instances and never repeats an instance output. Per-instance completions and
 failures count toward the existing node metrics under the template node id,
 and webhook and queue subscriptions receive instance events exactly like any
-other node event.
+other node event. Instance deletion and modification add their own
+`instance_deleted` and `instance_modified` events, described under
+"Delete and modify expanded instances" below.
 
 ### Maps inside loop bodies
 
@@ -667,6 +671,98 @@ map never changes an execution's termination reason.
 
 Executions whose workflows declare no nested map behave exactly as before:
 state fields, event contents, and advancement results are unchanged.
+
+### Delete and modify expanded instances
+
+An expanded dynamic node offers, alongside expansion and per-instance
+advancement, two instance-level operations. Both are ordinary idempotent
+HTTP commands over the same entry points the rest of the service uses; they
+introduce no second protocol.
+
+An instance that has never advanced can be removed, and so can an instance
+that has permanently failed:
+
+```http
+POST /executions/run-1/maps/ship/instances/2/delete
+Idempotency-Key: delete-instance-2
+
+{}
+```
+
+The body must be an empty object. Removing an instance drops only that
+instance's record: every retained instance keeps its element index, its
+place in the queue, and its advancement order. When the removed instance was
+the map's last unfinished instance, the node completes under the existing
+rules with an output list containing only the retained instances' outputs,
+in ascending element-index order, and its successors unlock as usual. An
+instance that is waiting on an approval, or has already completed, can never
+be deleted; attempting it returns `409 conflict` and changes no state. A
+permanently failed instance is removable after the execution has terminated,
+but removing it never revives the execution, alters its termination reason,
+or changes the node's failed conclusion. When every retained instance of a
+map inside a loop body has ended, the iteration's other nodes advance as
+usual and the node completes or ends under the existing rules; deleting an
+instance in one iteration never touches another iteration.
+
+An instance that has never advanced can also have its input rewritten
+before it is worked:
+
+```http
+POST /executions/run-1/maps/ship/instances/1/modify
+Idempotency-Key: modify-instance-1
+
+{"input":{"address":"742 Evergreen Terrace"}}
+```
+
+The body must contain exactly `input`, an object with the new content; it is
+validated like every other request body (finite numbers only). The rewrite
+changes only the parameters used when that one instance is later advanced:
+it affects no other instance, and the output and history of an instance that
+has already advanced (waiting, completed, or permanently failed) are
+immutable — modifying such an instance returns `409 conflict` and changes no
+state. The rewritten input, including its full float precision and `-0.0`,
+is stored verbatim.
+
+Both commands apply to a map nested in a loop body exactly as to an
+execution-level map: the current running iteration's instances are
+addressed by the same path, and every event they append carries the owning
+`loop_id` and `iteration` alongside the map id; an execution-level instance
+carries no loop context.
+
+An out-of-bounds element index, a reference to a node that is not a dynamic
+`map`, a missing execution, or a cross-tenant reference is a `404 not_found`
+and writes nothing. A missing or mistyped field, a non-object modify
+`input`, an unknown field, or a non-finite number is a `400 validation_error`
+with no partial write. Reusing an idempotency key for another operation is a
+`409 conflict`; repeating the same command with the same key returns the
+first result and appends no second event.
+
+Every successful call appends exactly one event to the execution stream:
+
+- an `instance_deleted` event records the action type, the owning dynamic
+  node under `map_id`, the removed instance's element `index` and `status`
+  (`ready` or `failed`), and, for a map inside a loop body, the `loop_id`
+  and `iteration`;
+- an `instance_modified` event records the action type, the owning
+  `map_id`, the instance `index`, the content `before` the rewrite (`null`
+  for an instance that had never been rewritten) and `after` it, and the
+  same loop context when the instance belongs to an iteration.
+
+Replay rebuilds the instance list, every instance's status and ownership,
+and each rewrite solely from the event stream: a delete drops the recorded
+instance (and the subsequent `map_completed`, when the deletion finished the
+node, completes it with the retained outputs), and a modify applies the
+rewritten input to that one instance, so the rebuilt state is exactly the
+materialized state. A checkpoint is written at the instance boundary of
+every successful delete or modify; after a restart recovery continues the
+unfinished instances, repeats no instance output, and never resurrects a
+deleted instance. The operations change no advancement conclusion or
+termination semantics: cancellation, timeouts, approvals, leases, retries,
+and retry exhaustion keep their existing behavior. Executions that never
+use either operation keep exactly their current state fields, event
+contents, and advancement results. Interleaving a deletion and a
+modification on the same instance, re-expanding a map after a deletion, and
+modifying a node that is not a dynamic map are out of scope.
 
 ### Workflow versions
 
@@ -1397,6 +1493,13 @@ A map node with an unknown or missing field, a mistyped or non-positive
 task dependency, or an invalid `path` is likewise a validation error that
 rejects the whole request, whether the map stands alone or sits inside a
 loop body.
+Deleting or modifying an expanded instance whose index is out of bounds,
+whose map node does not exist, whose execution is missing, or that belongs
+to another tenant is a missing resource; deleting an instance that is
+waiting on an approval or already completed, or modifying any instance that
+has already advanced, is a conflict; a delete body that is not empty, a
+modify body without exactly an `input` object, and any unknown field or
+non-finite number are validation errors that write nothing.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that
