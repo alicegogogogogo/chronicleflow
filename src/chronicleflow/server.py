@@ -5,12 +5,20 @@ import json
 import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
 from .service import ChronicleFlow
 
 TENANT_HEADER = "X-Tenant-Id"
+
+
+class PlainTextResponse:
+    """A response rendered verbatim as text rather than compact JSON."""
+
+    def __init__(self, text: str, content_type: str = "text/plain; version=0.0.4; charset=utf-8"):
+        self.text = text
+        self.content_type = content_type
 
 
 def _reject_non_finite(constant: str) -> Any:
@@ -65,6 +73,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError(f"{TENANT_HEADER} header must be a non-empty string")
         return tenant
 
+    def _time_filters(self) -> dict[str, str]:
+        """Parse the metrics query string: only since and until are known."""
+        filters: dict[str, str] = {}
+        for name, value in parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            if name not in ("since", "until"):
+                raise ValidationError(f"unknown query parameter {name}")
+            if name in filters:
+                raise ValidationError(f"query parameter {name} was given more than once")
+            filters[name] = value
+        return filters
+
     def _dispatch(self) -> tuple[int, Any]:
         path = urlsplit(self.path).path
         parts = [part for part in path.split("/") if part]
@@ -79,7 +98,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["bill"]:
             return 200, self.service.bill(self._tenant())
         if self.command == "GET" and parts == ["metrics"]:
-            return 200, self.service.metrics(self._tenant())
+            filters = self._time_filters()
+            return 200, self.service.metrics(self._tenant(), filters.get("since"), filters.get("until"))
+        if self.command == "GET" and parts == ["metrics", "export"]:
+            filters = self._time_filters()
+            return 200, PlainTextResponse(self.service.metrics_export(self._tenant(), filters.get("since"), filters.get("until")))
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 2 and parts[0] == "workflows" and self.command == "GET":
@@ -125,7 +148,15 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self) -> None:
         try:
             status, response = self._dispatch()
-            self._json(status, response)
+            if isinstance(response, PlainTextResponse):
+                body = response.text.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", response.content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._json(status, response)
         except ChronicleFlowError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
         except Exception:

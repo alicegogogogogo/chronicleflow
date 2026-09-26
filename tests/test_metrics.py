@@ -302,6 +302,90 @@ class MetricsServiceTests(unittest.TestCase):
         self.assertEqual(state_before, self.service.get_execution("r", "acme"))
 
 
+class MetricsFilterServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = ChronicleFlow(str(Path(self.directory.name) / "metrics-filter.db"))
+        self.service.create_workflow(
+            {"id": "wf", "nodes": [{"id": "a", "kind": "task", "depends_on": []}]},
+            "wf",
+            "acme",
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_bounds_are_closed(self):
+        self.service.create_execution({"id": "r", "workflow_id": "wf", "input": {}}, "r", "acme")
+        self.service.advance("r", {"output": {}}, "adv", "acme")
+        events = {event["type"]: event["occurred_at"] for event in self.service.events("r", "acme")}
+        # The fact recorded exactly at each boundary is included.
+        metrics = self.service.metrics("acme", since=events["node_completed"], until=events["node_completed"])
+        self.assertEqual({"a": 1}, metrics["node_completions"])
+        finished_at = events["execution_completed"]
+        metrics = self.service.metrics("acme", since=finished_at, until=finished_at)
+        self.assertEqual(1, metrics["status_distribution"]["completed"])
+
+    def test_window_selects_only_inside_facts(self):
+        self.service.create_execution({"id": "r", "workflow_id": "wf", "input": {}}, "r", "acme")
+        self.service.advance("r", {"output": {}}, "adv", "acme")
+        events = self.service.events("r", "acme")
+        started_at = events[0]["occurred_at"]
+        metrics = self.service.metrics("acme", until=started_at)
+        # The execution's current status was established by its completion,
+        # which falls outside the window, so it contributes nothing here.
+        self.assertEqual(0, metrics["status_distribution"]["running"])
+        self.assertEqual(0, metrics["status_distribution"]["completed"])
+        self.assertEqual({}, metrics["node_completions"])
+        # A window covering the completion sees it.
+        completed_at = events[-1]["occurred_at"]
+        metrics = self.service.metrics("acme", since=started_at, until=completed_at)
+        self.assertEqual(1, metrics["status_distribution"]["completed"])
+        self.assertEqual({"a": 1}, metrics["node_completions"])
+
+    def test_since_after_until_is_definite_empty_result(self):
+        self.service.create_execution({"id": "r", "workflow_id": "wf", "input": {}}, "r", "acme")
+        self.service.advance("r", {"output": {}}, "adv", "acme")
+        metrics = self.service.metrics(
+            "acme", since="2026-09-27T00:00:00.000Z", until="2026-09-26T00:00:00.000Z"
+        )
+        self.assertEqual(EMPTY_METRICS, metrics)
+
+    def test_malformed_bounds_are_validation_errors(self):
+        for value in ("yesterday", "2026-13-01T00:00:00Z", "2026-01-01T00:00:00+01:00", "2026-01-01", ""):
+            with self.assertRaises(ValidationError):
+                self.service.metrics("acme", since=value)
+            with self.assertRaises(ValidationError):
+                self.service.metrics("acme", until=value)
+
+    def test_filtered_query_is_isolated_and_read_only(self):
+        self.service.create_execution({"id": "r", "workflow_id": "wf", "input": {}}, "r", "acme")
+        self.service.advance("r", {"output": {}}, "adv", "acme")
+        usage_before = self.service.usage("acme")
+        self.assertEqual(
+            EMPTY_METRICS,
+            self.service.metrics("beta", since="2026-01-01T00:00:00.000Z"),
+        )
+        self.assertEqual(usage_before, self.service.usage("acme"))
+
+    def test_schedule_triggers_are_filtered_by_trigger_time(self):
+        self.service.create_workflow(
+            {
+                "id": "sched",
+                "nodes": TASK,
+                "schedule": {"interval_seconds": 1, "input": {}, "missed_policy": "catch_up"},
+            },
+            "sched",
+            "acme",
+        )
+        time.sleep(1.2)
+        self.service.schedule_status("sched", "acme")
+        self.assertEqual({}, self.service.metrics("acme", until="2000-01-01T00:00:00.000Z")["schedule_triggers"])
+        self.assertEqual(
+            {"sched": 1}, self.service.metrics("acme", since="2000-01-01T00:00:00.000Z")["schedule_triggers"]
+        )
+
+
 class MetricsHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -379,6 +463,108 @@ class MetricsHttpTests(unittest.TestCase):
         status, data = self.call("GET", "/metrics", headers=headers)
         self.assertEqual(200, status)
         self.assertEqual(EMPTY_METRICS, json.loads(data))
+
+
+class MetricsExportHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-export.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        all_headers = {"Content-Type": "application/json"}
+        if key is not None:
+            all_headers["Idempotency-Key"] = key
+        all_headers.update(headers or {})
+        connection.request(method, path, json.dumps(body) if body is not None else None, all_headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def test_export_requires_a_tenant_header(self):
+        for headers in ({}, {"X-Tenant-Id": ""}):
+            status, data = self.call("GET", "/metrics/export", headers=headers)
+            self.assertEqual(400, status)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_export_rejects_bad_filters_and_unknown_parameters(self):
+        headers = {"X-Tenant-Id": "export-acme"}
+        for path in (
+            "/metrics/export?since=nope",
+            "/metrics/export?until=2026-02-30T00:00:00Z",
+            "/metrics/export?unknown=1",
+            "/metrics?unknown=1",
+        ):
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_export_renders_prometheus_text(self):
+        headers = {"X-Tenant-Id": "export-acme"}
+        self.call("POST", "/workflows", {"id": "wf-exp", "nodes": TASK}, key="wf-exp", headers=headers)
+        self.call(
+            "POST",
+            "/executions",
+            {"id": "r-exp", "workflow_id": "wf-exp", "input": {}},
+            key="r-exp",
+            headers=headers,
+        )
+        self.call("POST", "/executions/r-exp/advance", {"output": {}}, key="adv-exp", headers=headers)
+        status, data = self.call("GET", "/metrics/export", headers=headers)
+        self.assertEqual(200, status)
+        text = data.decode()
+        self.assertTrue(text.endswith("\n"))
+        self.assertFalse(text.endswith("\n\n"))
+        lines = text.splitlines()
+        self.assertEqual(
+            [
+                "chronicleflow_status_distribution{status=\"completed\"} 1",
+                "chronicleflow_status_distribution{status=\"running\"} 0",
+                "chronicleflow_status_distribution{reason=\"cancelled\",status=\"terminated\"} 0",
+                "chronicleflow_status_distribution{reason=\"rejected\",status=\"terminated\"} 0",
+                "chronicleflow_status_distribution{reason=\"retries_exhausted\",status=\"terminated\"} 0",
+                "chronicleflow_status_distribution{reason=\"timeout\",status=\"terminated\"} 0",
+                "chronicleflow_node_completions{node=\"a\"} 1",
+                "chronicleflow_node_failures 0",
+                "chronicleflow_retry_consumption 0",
+                "chronicleflow_delivery_succeeded 0",
+                "chronicleflow_delivery_failed 0",
+                "chronicleflow_schedule_triggers 0",
+            ],
+            lines,
+        )
+
+    def test_export_honors_the_time_window(self):
+        headers = {"X-Tenant-Id": "export-acme"}
+        status, data = self.call(
+            "GET", "/metrics/export?until=2000-01-01T00:00:00.000Z", headers=headers
+        )
+        self.assertEqual(200, status)
+        self.assertIn("chronicleflow_node_completions 0\n", data.decode())
+        status, data = self.call(
+            "GET",
+            "/metrics/export?since=2026-09-27T00:00:00.000Z&until=2026-09-26T00:00:00.000Z",
+            headers=headers,
+        )
+        self.assertEqual(200, status)
+        self.assertIn("chronicleflow_status_distribution{status=\"completed\"} 0\n", data.decode())
+
+    def test_export_does_not_leak_across_tenants(self):
+        status, data = self.call("GET", "/metrics/export", headers={"X-Tenant-Id": "export-other"})
+        self.assertEqual(200, status)
+        self.assertIn("chronicleflow_status_distribution{status=\"completed\"} 0\n", data.decode())
 
 
 if __name__ == "__main__":

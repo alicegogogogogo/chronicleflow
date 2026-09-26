@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -83,6 +84,73 @@ USAGE_UNIT_PRICES = {
 # distribution always reports every reason, zero when no execution ended for
 # it, so the breakdown shape never depends on the recorded facts.
 TERMINATION_REASONS = ("cancelled", "rejected", "retries_exhausted", "timeout")
+
+
+def _parse_time_bound(value: Any, name: str) -> datetime:
+    """Parse a since/until query bound: an ISO-8601 UTC timestamp, else 400."""
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{name} must be an ISO-8601 UTC timestamp")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError(f"{name} must be an ISO-8601 UTC timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValidationError(f"{name} must be an ISO-8601 UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def _stored_timestamp(text: str) -> datetime:
+    """Parse a persisted occurred_at/triggered_at value (always UTC ``Z``)."""
+    return datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+
+
+def _prometheus_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+
+def _prometheus_sample(name: str, labels: dict[str, str], value: int) -> str:
+    if labels:
+        rendered = ",".join(f'{key}="{_prometheus_label_value(labels[key])}"' for key in sorted(labels))
+        return f"{name}{{{rendered}}} {value}"
+    return f"{name} {value}"
+
+
+def _render_prometheus(data: dict[str, Any]) -> str:
+    """Render run metrics in the Prometheus text line protocol.
+
+    One metric family per top-level dimension, named after the dimension's
+    public key with a ``chronicleflow_`` prefix and emitted in the
+    dimensions' key order. Samples within a family sort by ascending label
+    value, and a dimension with no facts still emits a zero-valued sample.
+    Every line — including the last — ends with a single newline.
+    """
+    lines: list[str] = []
+
+    def family(name: str, samples: list[tuple[dict[str, str], int]]) -> None:
+        for labels, value in sorted(samples, key=lambda sample: tuple(sample[0].values())):
+            lines.append(_prometheus_sample(name, labels, value))
+
+    distribution = data["status_distribution"]
+    family(
+        "chronicleflow_status_distribution",
+        [
+            ({"status": "running"}, distribution["running"]),
+            ({"status": "completed"}, distribution["completed"]),
+            *[
+                ({"status": "terminated", "reason": reason}, distribution["terminated"][reason])
+                for reason in TERMINATION_REASONS
+            ],
+        ],
+    )
+    for key in ("node_completions", "node_failures", "retry_consumption"):
+        samples = [({"node": identifier}, count) for identifier, count in data[key].items()]
+        family(f"chronicleflow_{key}", samples or [({}, 0)])
+    family("chronicleflow_delivery_succeeded", [({}, data["delivery_succeeded"])])
+    family("chronicleflow_delivery_failed", [({}, data["delivery_failed"])])
+    triggers = [({"workflow": identifier}, count) for identifier, count in data["schedule_triggers"].items()]
+    family("chronicleflow_schedule_triggers", triggers or [({}, 0)])
+    return "\n".join(lines) + "\n"
 
 
 class ChronicleFlow:
@@ -377,97 +445,168 @@ class ChronicleFlow:
 
     # --- operational metrics ---------------------------------------------
 
-    def metrics(self, tenant: str) -> dict[str, Any]:
+    @staticmethod
+    def _zero_metrics() -> dict[str, Any]:
+        """The definite empty result: every dimension at zero."""
+        return {
+            "status_distribution": {
+                "running": 0,
+                "completed": 0,
+                "terminated": {reason: 0 for reason in TERMINATION_REASONS},
+            },
+            "node_completions": {},
+            "node_failures": {},
+            "retry_consumption": {},
+            "delivery_succeeded": 0,
+            "delivery_failed": 0,
+            "schedule_triggers": {},
+        }
+
+    @staticmethod
+    def _time_window(since: Any, until: Any) -> tuple[datetime | None, datetime | None]:
+        """Validate the optional since/until bounds; absent means unbounded."""
+        since_at = _parse_time_bound(since, "since") if since is not None else None
+        until_at = _parse_time_bound(until, "until") if until is not None else None
+        return since_at, until_at
+
+    def _metrics_data(self, tenant: str, since: Any = None, until: Any = None) -> dict[str, Any]:
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        since_at, until_at = self._time_window(since, until)
+        with self._operation():
+            with self.store.transaction():
+                return self._collect_metrics(tenant, since_at, until_at)
+
+    def metrics(self, tenant: str, since: Any = None, until: Any = None) -> dict[str, Any]:
         """Aggregate the tenant's persisted business facts into run metrics.
 
         The query is read-only: it appends no events, writes no usage records,
         and settles nothing (a due timeout stays unsettled until an operation
         observes it), so the answer reflects exactly what is stored. Every
         dimension is always present — a tenant with no recorded facts gets a
-        definite all-zero result rather than an error.
+        definite all-zero result rather than an error. The optional since and
+        until bounds restrict the answer to facts whose occurrence time falls
+        inside the closed interval; an empty window (since later than until)
+        is the definite all-zero result, not an error.
         """
-        if not tenant:
-            raise ValidationError("tenant id must be a non-empty string")
-        with self._operation():
-            with self.store.transaction():
-                distribution: dict[str, Any] = {
-                    "running": 0,
-                    "completed": 0,
-                    "terminated": {reason: 0 for reason in TERMINATION_REASONS},
-                }
-                rows = self.store.connection.execute(
-                    "SELECT state FROM executions WHERE tenant = ?",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    state = self.store.decode(row["state"])
-                    status = state["status"]
-                    if status == "terminated":
-                        reason = state.get("termination_reason")
-                        if reason in distribution["terminated"]:
-                            distribution["terminated"][reason] += 1
-                    elif status in ("running", "completed"):
-                        distribution[status] += 1
-                # Completion, failure, and retry consumption are counted from
-                # the recorded node events: condition evaluations and skips
-                # append their own event types and are never counted here, and
-                # loop body nodes accumulate one event per iteration. A version
-                # migration appends no node events, so facts recorded before
-                # and after it accumulate under the same node identifiers.
-                completions: dict[str, int] = {}
-                failures: dict[str, int] = {}
-                retries: dict[str, int] = {}
-                buckets = {
-                    "node_completed": completions,
-                    "node_failed": failures,
-                    "node_retried": retries,
-                }
-                rows = self.store.connection.execute(
-                    "SELECT type, payload FROM events WHERE tenant = ? "
-                    "AND type IN ('node_completed', 'node_failed', 'node_retried')",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    node_id = self.store.decode(row["payload"])["node_id"]
-                    bucket = buckets[row["type"]]
-                    bucket[node_id] = bucket.get(node_id, 0) + 1
-                # Delivery outcomes are counted per outbound HTTP attempt, so
-                # a delivery that fails and then succeeds on a retry records
-                # one of each; an attempt succeeded exactly when it received a
-                # 2xx status code.
-                succeeded = 0
-                failed = 0
-                rows = self.store.connection.execute(
-                    "SELECT document FROM deliveries WHERE tenant = ?",
-                    (tenant,),
-                ).fetchall()
-                for row in rows:
-                    attempts = self.store.decode(row["document"]).get("attempts")
-                    if not isinstance(attempts, list):
-                        continue
-                    for attempt in attempts:
-                        status_code = attempt.get("status_code") if isinstance(attempt, dict) else None
-                        if isinstance(status_code, int) and 200 <= status_code < 300:
-                            succeeded += 1
-                        else:
-                            failed += 1
-                # One trigger row exists per settled schedule period, so a
-                # repeated settlement of the same period counts nothing more.
-                rows = self.store.connection.execute(
-                    "SELECT workflow_id, COUNT(*) AS count FROM schedule_triggers "
-                    "WHERE tenant = ? GROUP BY workflow_id ORDER BY workflow_id",
-                    (tenant,),
-                ).fetchall()
-                triggers = {row["workflow_id"]: row["count"] for row in rows}
-                return {
-                    "status_distribution": distribution,
-                    "node_completions": dict(sorted(completions.items())),
-                    "node_failures": dict(sorted(failures.items())),
-                    "retry_consumption": dict(sorted(retries.items())),
-                    "delivery_succeeded": succeeded,
-                    "delivery_failed": failed,
-                    "schedule_triggers": triggers,
-                }
+        return self._metrics_data(tenant, since, until)
+
+    def metrics_export(self, tenant: str, since: Any = None, until: Any = None) -> str:
+        """Render the tenant's (optionally time-filtered) metrics as Prometheus text."""
+        return _render_prometheus(self._metrics_data(tenant, since, until))
+
+    def _collect_metrics(self, tenant: str, since_at: datetime | None, until_at: datetime | None) -> dict[str, Any]:
+        if since_at is not None and until_at is not None and since_at > until_at:
+            # An empty window selects no facts: the definite all-zero result.
+            return self._zero_metrics()
+        bounded = since_at is not None or until_at is not None
+
+        def in_window(text: str) -> bool:
+            moment = _stored_timestamp(text)
+            return (since_at is None or moment >= since_at) and (until_at is None or moment <= until_at)
+
+        distribution: dict[str, Any] = {
+            "running": 0,
+            "completed": 0,
+            "terminated": {reason: 0 for reason in TERMINATION_REASONS},
+        }
+        # An execution's status fact occurs when the event that established
+        # its current status was recorded: the start event while it runs, the
+        # completion or termination event once it finishes.
+        status_marks: dict[str, str] = {}
+        rows = self.store.connection.execute(
+            "SELECT execution_id, occurred_at FROM events WHERE tenant = ? "
+            "AND type IN ('execution_started', 'execution_completed', 'execution_terminated') ORDER BY sequence",
+            (tenant,),
+        ).fetchall()
+        for row in rows:
+            status_marks[row["execution_id"]] = row["occurred_at"]
+        rows = self.store.connection.execute(
+            "SELECT id, state FROM executions WHERE tenant = ?",
+            (tenant,),
+        ).fetchall()
+        for row in rows:
+            mark = status_marks.get(row["id"])
+            if bounded and (mark is None or not in_window(mark)):
+                continue
+            state = self.store.decode(row["state"])
+            status = state["status"]
+            if status == "terminated":
+                reason = state.get("termination_reason")
+                if reason in distribution["terminated"]:
+                    distribution["terminated"][reason] += 1
+            elif status in ("running", "completed"):
+                distribution[status] += 1
+        # Completion, failure, and retry consumption are counted from
+        # the recorded node events: condition evaluations and skips
+        # append their own event types and are never counted here, and
+        # loop body nodes accumulate one event per iteration. A version
+        # migration appends no node events, so facts recorded before
+        # and after it accumulate under the same node identifiers.
+        completions: dict[str, int] = {}
+        failures: dict[str, int] = {}
+        retries: dict[str, int] = {}
+        buckets = {
+            "node_completed": completions,
+            "node_failed": failures,
+            "node_retried": retries,
+        }
+        rows = self.store.connection.execute(
+            "SELECT type, payload, occurred_at FROM events WHERE tenant = ? "
+            "AND type IN ('node_completed', 'node_failed', 'node_retried')",
+            (tenant,),
+        ).fetchall()
+        for row in rows:
+            if bounded and not in_window(row["occurred_at"]):
+                continue
+            node_id = self.store.decode(row["payload"])["node_id"]
+            bucket = buckets[row["type"]]
+            bucket[node_id] = bucket.get(node_id, 0) + 1
+        # Delivery outcomes are counted per outbound HTTP attempt, so
+        # a delivery that fails and then succeeds on a retry records
+        # one of each; an attempt succeeded exactly when it received a
+        # 2xx status code. A record's attempts share its occurred_at.
+        succeeded = 0
+        failed = 0
+        rows = self.store.connection.execute(
+            "SELECT document FROM deliveries WHERE tenant = ?",
+            (tenant,),
+        ).fetchall()
+        for row in rows:
+            document = self.store.decode(row["document"])
+            if bounded:
+                occurred_at = document.get("occurred_at")
+                if not isinstance(occurred_at, str) or not in_window(occurred_at):
+                    continue
+            attempts = document.get("attempts")
+            if not isinstance(attempts, list):
+                continue
+            for attempt in attempts:
+                status_code = attempt.get("status_code") if isinstance(attempt, dict) else None
+                if isinstance(status_code, int) and 200 <= status_code < 300:
+                    succeeded += 1
+                else:
+                    failed += 1
+        # One trigger row exists per settled schedule period, so a
+        # repeated settlement of the same period counts nothing more.
+        triggers: dict[str, int] = {}
+        rows = self.store.connection.execute(
+            "SELECT workflow_id, triggered_at FROM schedule_triggers WHERE tenant = ?",
+            (tenant,),
+        ).fetchall()
+        for row in rows:
+            if bounded and not in_window(row["triggered_at"]):
+                continue
+            triggers[row["workflow_id"]] = triggers.get(row["workflow_id"], 0) + 1
+        return {
+            "status_distribution": distribution,
+            "node_completions": dict(sorted(completions.items())),
+            "node_failures": dict(sorted(failures.items())),
+            "retry_consumption": dict(sorted(retries.items())),
+            "delivery_succeeded": succeeded,
+            "delivery_failed": failed,
+            "schedule_triggers": dict(sorted(triggers.items())),
+        }
 
 
     def _quota_limits(self, tenant: str) -> Any:

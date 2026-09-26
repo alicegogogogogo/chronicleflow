@@ -257,8 +257,41 @@ All counts are non-negative integers. A dimension with no facts reports zero
 (or an empty group) rather than being omitted, and the groups within a
 dimension are ordered by ascending identifier. Migrating an execution to
 another version does not change attribution: facts recorded before and after
-the migration accumulate under the same names. Filtering by time range and
-export formats are out of scope.
+the migration accumulate under the same names.
+
+The metrics query accepts two optional query parameters, `since` and
+`until`, each an ISO-8601 UTC timestamp, restricting the answer to facts
+whose occurrence time falls inside the closed interval — a fact recorded
+exactly at `since` or `until` is included. With neither parameter the query
+is unbounded and reports every recorded fact, exactly as before. A malformed
+`since` or `until`, or any unknown query parameter, is a `400
+validation_error`. A `since` later than `until` is not an error: it selects
+no facts and returns the definite all-zero result.
+
+```http
+GET /metrics/export
+X-Tenant-Id: acme
+```
+
+Renders the same counts as the metrics query — with the same optional
+`since` and `until` filters, validated the same way — in the Prometheus text
+line protocol. The endpoint is read-only and requires a tenant exactly like
+the metrics query: a missing or empty `X-Tenant-Id` is a `400
+validation_error`, and cross-tenant facts are never visible. Each top-level
+dimension becomes one metric family named after the dimension's public key
+with a `chronicleflow_` prefix, in the same order as the metrics keys:
+`chronicleflow_status_distribution`, `chronicleflow_node_completions`,
+`chronicleflow_node_failures`, `chronicleflow_retry_consumption`,
+`chronicleflow_delivery_succeeded`, `chronicleflow_delivery_failed`, and
+`chronicleflow_schedule_triggers`. Status samples carry a `status` label
+(`running`, `completed`, or `terminated`), and terminated samples
+additionally carry a `reason` label with one of the four termination
+reasons. Node completion, node failure, and retry consumption samples carry
+a `node` label; schedule trigger samples carry a `workflow` label; delivery
+success and failure samples carry no labels. Sample values are decimal
+integers, a dimension with no facts still emits a zero-valued sample,
+samples within a family are ordered by ascending label value, and every
+line — including the last — ends with a single newline.
 
 ### Health
 
