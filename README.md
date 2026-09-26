@@ -92,7 +92,7 @@ version is the usual `404 not_found`.
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, and all history and status
-queries, as well as the usage and bill queries. An empty
+queries, as well as the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -207,6 +207,58 @@ no records, `items` is empty and `total` is `0`.
 Both endpoints are tenant-scoped `GET` requests: a missing or empty
 `X-Tenant-Id` is a `400 validation_error`. Usage and bill data follow the
 usual tenant isolation, so one tenant can never see another's records.
+
+### Operational metrics
+
+```http
+GET /metrics
+X-Tenant-Id: acme
+```
+
+Returns one line of compact JSON summarizing the business facts already
+recorded for the tenant, ending with the usual single newline. The endpoint
+is read-only: it appends no events, writes no usage records, and changes no
+stored data, and it reports only persisted facts — it performs no
+advancement, approval, recovery, or replay of its own, so those operations
+never change what a metrics query observes beyond the facts they themselves
+recorded. A missing or empty `X-Tenant-Id` is a `400 validation_error`, and
+the metrics follow the usual tenant isolation: another tenant's facts are
+never visible in any dimension and never affect this tenant's counts. A
+tenant with no recorded facts at all gets the definite empty result with
+every dimension at zero — not an error.
+
+The top-level keys appear in this order — status distribution, node
+completions, node failures, retry consumption, delivery successes, delivery
+failures, and schedule triggers:
+
+```json
+{"status_distribution":{"running":1,"completed":2,"terminated":{"cancelled":0,"rejected":1,"retries_exhausted":0,"timeout":0}},"node_completions":{"charge":3},"node_failures":{"charge":2},"retry_consumption":{"charge":1},"delivery_succeeded":4,"delivery_failed":1,"schedule_triggers":{"nightly-orders":2}}
+```
+
+- `status_distribution` — the tenant's executions divided into `running`,
+  `completed`, and `terminated`; `terminated` is further broken down by
+  termination reason, with every reason (`cancelled`, `rejected`,
+  `retries_exhausted`, `timeout`) always present, zero when no execution
+  ended for that reason.
+- `node_completions` — persisted node completion facts per node identifier.
+  Condition evaluations and skips are not completions and are never counted;
+  a loop body node counts once per iteration it completes.
+- `node_failures` — submitted task failures per node identifier; a loop body
+  node accumulates each iteration's failures.
+- `retry_consumption` — the number of times a failed task was re-queued for
+  another attempt, per node identifier.
+- `delivery_succeeded` and `delivery_failed` — outbound delivery attempts by
+  outcome. Every attempt counts exactly once, so a delivery that fails and
+  then succeeds on a later attempt records one of each.
+- `schedule_triggers` — schedule periods that created an execution, per
+  workflow identifier; settling the same period again counts nothing more.
+
+All counts are non-negative integers. A dimension with no facts reports zero
+(or an empty group) rather than being omitted, and the groups within a
+dimension are ordered by ascending identifier. Migrating an execution to
+another version does not change attribution: facts recorded before and after
+the migration accumulate under the same names. Filtering by time range and
+export formats are out of scope.
 
 ### Health
 
@@ -990,8 +1042,8 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations and the usage and bill queries require a tenant, and quota
-limits are positive integers validated by the
+declarations and the usage, bill, and metrics queries require a tenant, and
+quota limits are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
 Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across
