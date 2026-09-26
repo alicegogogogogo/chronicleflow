@@ -1589,6 +1589,186 @@ class ChronicleFlow:
         with self._operation():
             return self._idempotent(key, f"cancel:{execution_id}", apply, tenant)
 
+    # --- map instance delete and modify ---------------------------------
+
+    def _parse_instance_target(self, raw: Any, extra_fields: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Validate an instance operation body and normalize the addressed target.
+
+        The body names the map node and element index, plus the loop id and
+        iteration (together, and only together) when the map is nested in a
+        loop body. A negative index or a non-positive iteration is not a
+        validation error: it simply addresses no existing instance, which the
+        lookup reports as a missing resource.
+        """
+        required = {"map_id", "index", *extra_fields}
+        if not isinstance(raw, dict) or not required <= set(raw) or not set(raw) <= required | {"loop_id", "iteration"}:
+            raise ValidationError(
+                "instance operation body must contain exactly map_id and index"
+                + (", " + ", ".join(extra_fields) if extra_fields else "")
+                + ", and optionally loop_id and iteration"
+            )
+        if ("loop_id" in raw) != ("iteration" in raw):
+            raise ValidationError("loop_id and iteration must be declared together")
+        target: dict[str, Any] = {"map_id": _identifier(raw["map_id"], "map id")}
+        index = raw["index"]
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValidationError("index must be an integer")
+        target["index"] = index
+        if "loop_id" in raw:
+            target["loop_id"] = _identifier(raw["loop_id"], "loop id")
+            iteration = raw["iteration"]
+            if isinstance(iteration, bool) or not isinstance(iteration, int):
+                raise ValidationError("iteration must be an integer")
+            target["iteration"] = iteration
+        return target
+
+    def _instance_location(
+        self, workflow: Workflow, state: dict[str, Any], target: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Resolve an addressed instance to its container, map state, event
+        context, and instance record.
+
+        Every unresolvable reference — an unknown or nested-elsewhere map, an
+        unknown loop, an iteration the loop never reached, or an index with no
+        instance — is a missing resource, exactly like a missing execution.
+        """
+        map_id = target["map_id"]
+        by_id = {node.id: node for node in workflow.nodes}
+        node = by_id.get(map_id)
+        if node is None or node.kind != "map":
+            raise NotFoundError(f"map {map_id} was not found")
+        bodies = workflow.loop_bodies()
+        if target.get("loop_id") is None:
+            if any(map_id in body for body in bodies.values()):
+                # A nested map is only addressable with its loop context.
+                raise NotFoundError(f"map {map_id} was not found")
+            map_state = state.get("maps", {}).get(map_id)
+            if map_state is None:
+                raise NotFoundError(f"map {map_id} was not found")
+            container, context = state, {}
+        else:
+            loop_id = target["loop_id"]
+            body = bodies.get(loop_id)
+            if body is None or map_id not in body:
+                raise NotFoundError(f"map {map_id} was not found in loop {loop_id}")
+            loop_state = state["loops"][loop_id]
+            iteration = target["iteration"]
+            if not 1 <= iteration <= len(loop_state["iterations"]):
+                raise NotFoundError(f"loop {loop_id} has no iteration {iteration}")
+            container = loop_state["iterations"][iteration - 1]
+            map_state = container.get("maps", {}).get(map_id)
+            if map_state is None:
+                raise NotFoundError(f"map {map_id} was not found in loop {loop_id} iteration {iteration}")
+            context = {"loop_id": loop_id, "iteration": iteration}
+        instance = next((item for item in map_state["instances"] if item["index"] == target["index"]), None)
+        if instance is None:
+            raise NotFoundError(f"map {map_id} has no instance {target['index']}")
+        return container, map_state, context, instance
+
+    @staticmethod
+    def _instance_scope(target: dict[str, Any]) -> str:
+        """Idempotency scope of one addressed instance: repeating the same
+        target with the same key returns the first result, while the same key
+        naming another instance is a cross-operation conflict."""
+        return json.dumps(
+            [target["map_id"], target.get("loop_id"), target.get("iteration"), target["index"]],
+            separators=(",", ":"),
+        )
+
+    def delete_instance(
+        self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        target = self._parse_instance_target(raw)
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            container, map_state, context, instance = self._instance_location(workflow, state, target)
+            # Only an instance that was never advanced (still ready) or one
+            # that failed permanently may be removed; anything else conflicts
+            # and changes nothing.
+            if instance["status"] not in ("ready", "failed"):
+                raise ConflictError(
+                    f"map {target['map_id']} instance {target['index']} was already advanced and cannot be deleted"
+                )
+            map_id = target["map_id"]
+            map_state["instances"] = [
+                item for item in map_state["instances"] if item["index"] != target["index"]
+            ]
+            self._append(
+                execution_id,
+                "map_instance_deleted",
+                {"map_id": map_id, "index": target["index"], "status": instance["status"], **context},
+                tenant,
+            )
+            # When every retained instance has already completed, the map
+            # finishes under the usual rules; the remaining instances keep
+            # their queue and advancement order either way.
+            if (
+                state["status"] == "running"
+                and state.get("waiting_approval") is None
+                and map_state["status"] == "running"
+                and all(item["status"] == "completed" for item in map_state["instances"])
+            ):
+                self._finish_map(execution_id, container, map_id, map_state, context, tenant)
+                self._auto_process(execution_id, workflow, state, tenant)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            # The removal is an instance boundary like any other: checkpoint
+            # so recovery continues the retained instances and never resurrects
+            # the deleted one.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(
+                key, f"delete-instance:{execution_id}:{self._instance_scope(target)}", apply, tenant
+            )
+
+    def modify_instance(
+        self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
+    ) -> dict[str, Any]:
+        target = self._parse_instance_target(raw, ("input",))
+        _finite_json(raw["input"], "input")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            _, _, context, instance = self._instance_location(workflow, state, target)
+            # Only an instance that was never advanced may be rewritten; an
+            # advanced instance keeps its recorded output and history.
+            if instance["status"] != "ready":
+                raise ConflictError(
+                    f"map {target['map_id']} instance {target['index']} was already advanced and cannot be modified"
+                )
+            before = instance.get("input")
+            instance["input"] = raw["input"]
+            self._append(
+                execution_id,
+                "map_instance_modified",
+                {
+                    "map_id": target["map_id"],
+                    "index": target["index"],
+                    "before": before,
+                    "after": raw["input"],
+                    **context,
+                },
+                tenant,
+            )
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(
+                key, f"modify-instance:{execution_id}:{self._instance_scope(target)}", apply, tenant
+            )
+
     @staticmethod
     def _reconcile_state_for_definition(state: dict[str, Any], workflow: Workflow) -> None:
         """Align the materialized summary with a newly bound revision.
@@ -2818,6 +2998,16 @@ class ChronicleFlow:
                 else:
                     rebuilt["outputs"][payload["map_id"]] = map_state["outputs"]
                     rebuilt["completed_nodes"].append(payload["map_id"])
+            elif event_type == "map_instance_deleted" and rebuilt is not None:
+                # The removal is rebuilt exactly as it was recorded: the
+                # instance leaves its map's list and is never resurrected.
+                map_state = self._replay_map_state(rebuilt, payload)
+                map_state["instances"] = [
+                    item for item in map_state["instances"] if item["index"] != payload["index"]
+                ]
+            elif event_type == "map_instance_modified" and rebuilt is not None:
+                instance = self._replay_map_instance(rebuilt, payload)
+                instance["input"] = payload["after"]
             elif event_type == "iteration_started" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 loop_state["status"] = "running"

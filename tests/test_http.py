@@ -602,5 +602,171 @@ class ApprovalHttpTests(unittest.TestCase):
         self.assertEqual("validation_error", json.loads(data)["error"]["code"])
 
 
+class MapInstanceHttpTests(unittest.TestCase):
+    @staticmethod
+    def _request(port, method, path, body=None, raw=None, key=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        payload = raw if raw is not None else (json.dumps(body) if body is not None else None)
+        headers = {"Content-Type": "application/json"}
+        if key is not None:
+            headers["Idempotency-Key"] = key
+        connection.request(method, path, payload, headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-instances.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls._request(
+            cls.port,
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-inst",
+                "nodes": [
+                    {"id": "collect", "kind": "task", "depends_on": []},
+                    {
+                        "id": "fanout",
+                        "kind": "map",
+                        "depends_on": ["collect"],
+                        "source": "collect",
+                        "path": "items",
+                        "max_instances": 10,
+                        "template": {"id": "work"},
+                    },
+                ],
+            },
+            key="wf-inst",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, raw=None):
+        return self._request(self.port, method, path, body=body, raw=raw, key=key)
+
+    def expand(self, execution_id, items):
+        self.call("POST", "/executions", {"id": execution_id, "workflow_id": "wf-inst", "input": {}}, f"ex-{execution_id}")
+        self.call("POST", f"/executions/{execution_id}/advance", {"output": {"items": items}}, f"adv-{execution_id}-expand")
+
+    def test_delete_and_modify_round_trip(self):
+        self.expand("run-i1", [1, 2, 3])
+        status, data = self.call(
+            "POST", "/executions/run-i1/instances/delete", {"map_id": "fanout", "index": 1}, "del-i1"
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        state = json.loads(data)
+        self.assertEqual([0, 2], [i["index"] for i in state["maps"]["fanout"]["instances"]])
+        status, data = self.call(
+            "POST",
+            "/executions/run-i1/instances/modify",
+            {"map_id": "fanout", "index": 0, "input": {"sku": "s-1", "weight": -0.0}},
+            "mod-i1",
+        )
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        instance = state["maps"]["fanout"]["instances"][0]
+        self.assertEqual({"sku": "s-1", "weight": -0.0}, instance["input"])
+        self.assertIn(b"-0.0", data)
+        # The remaining instances advance in order and the map output holds
+        # only the retained instances.
+        self.call("POST", "/executions/run-i1/advance", {"output": {"v": 0}}, "adv-i1-1")
+        status, data = self.call("POST", "/executions/run-i1/advance", {"output": {"v": 2}}, "adv-i1-2")
+        self.assertEqual(200, status)
+        state = json.loads(data)
+        self.assertEqual([{"v": 0}, {"v": 2}], state["outputs"]["fanout"])
+        self.assertEqual("completed", state["status"])
+        status, data = self.call("POST", "/executions/run-i1/replay")
+        self.assertTrue(json.loads(data)["consistent"])
+
+    def test_delete_events_are_queryable(self):
+        self.expand("run-i2", [1, 2])
+        self.call("POST", "/executions/run-i2/instances/delete", {"map_id": "fanout", "index": 0}, "del-i2")
+        status, data = self.call("GET", "/executions/run-i2/events")
+        self.assertEqual(200, status)
+        deleted = [e for e in json.loads(data)["events"] if e["type"] == "map_instance_deleted"]
+        self.assertEqual(1, len(deleted))
+        self.assertEqual({"map_id": "fanout", "index": 0, "status": "ready"}, deleted[0]["payload"])
+
+    def test_delete_errors_over_http(self):
+        self.expand("run-i3", [1])
+        status, data = self.call(
+            "POST", "/executions/nope/instances/delete", {"map_id": "fanout", "index": 0}, "del-missing"
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "POST", "/executions/run-i3/instances/delete", {"map_id": "fanout", "index": 5}, "del-range"
+        )
+        self.assertEqual(404, status)
+        status, data = self.call(
+            "POST", "/executions/run-i3/instances/delete", {"map_id": "fanout"}, "del-bad"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "POST", "/executions/run-i3/instances/delete", raw=b'{"map_id":"fanout","index":NaN}', key="del-nan"
+        )
+        self.assertEqual(400, status)
+        # Completing the only instance makes later deletes conflict.
+        self.call("POST", "/executions/run-i3/advance", {"output": {"v": 0}}, "adv-i3-1")
+        status, data = self.call(
+            "POST", "/executions/run-i3/instances/delete", {"map_id": "fanout", "index": 0}, "del-done"
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+
+    def test_modify_errors_over_http(self):
+        self.expand("run-i4", [1])
+        status, data = self.call(
+            "POST", "/executions/run-i4/instances/modify", {"map_id": "fanout", "index": 0}, "mod-bad"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "POST",
+            "/executions/run-i4/instances/modify",
+            raw=b'{"map_id":"fanout","index":0,"input":Infinity}',
+            key="mod-inf",
+        )
+        self.assertEqual(400, status)
+        self.call("POST", "/executions/run-i4/advance", {"output": {"v": 0}}, "adv-i4-1")
+        status, data = self.call(
+            "POST", "/executions/run-i4/instances/modify", {"map_id": "fanout", "index": 0, "input": 1}, "mod-done"
+        )
+        self.assertEqual(409, status)
+
+    def test_instance_idempotency_over_http(self):
+        self.expand("run-i5", [1, 2])
+        self.call("POST", "/executions/run-i5/instances/delete", {"map_id": "fanout", "index": 0}, "del-i5")
+        # A repeat of the same command returns the first result.
+        status, data = self.call(
+            "POST", "/executions/run-i5/instances/delete", {"map_id": "fanout", "index": 0}, "del-i5"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([1], [i["index"] for i in json.loads(data)["maps"]["fanout"]["instances"]])
+        # The same key on another instance or operation conflicts.
+        status, data = self.call(
+            "POST", "/executions/run-i5/instances/delete", {"map_id": "fanout", "index": 1}, "del-i5"
+        )
+        self.assertEqual(409, status)
+        status, data = self.call(
+            "POST", "/executions/run-i5/instances/modify", {"map_id": "fanout", "index": 1, "input": 1}, "del-i5"
+        )
+        self.assertEqual(409, status)
+
+
 if __name__ == "__main__":
     unittest.main()

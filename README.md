@@ -668,6 +668,73 @@ map never changes an execution's termination reason.
 Executions whose workflows declare no nested map behave exactly as before:
 state fields, event contents, and advancement results are unchanged.
 
+### Delete a map instance
+
+```http
+POST /executions/run-1/instances/delete
+Idempotency-Key: delete-instance-1
+
+{"map_id": "ship", "index": 2}
+```
+
+A dynamically expanded instance that has not been advanced yet — or one that
+failed permanently — can be removed from its map. The body contains exactly
+`map_id` and `index`; for a map nested in a loop body it additionally
+contains `loop_id` and `iteration` (always together), naming the round the
+instance expanded in. The response is the updated execution state.
+
+The removal leaves every other instance's queue and advancement order
+untouched. When the map node completes, its result list holds only the
+retained instances' outputs, in ascending element index order; when the
+deletion leaves every retained instance already completed, the map finishes
+under the usual rules, and a nested map's iteration and loop then proceed
+exactly as before. Deleting an instance that was already advanced —
+completed, or parked at a template approval point — is a `409 conflict` and
+changes nothing. Each successful call appends one `map_instance_deleted`
+event recording the map id, the removed instance's index and status, and,
+inside a loop body, the loop id and iteration. A checkpoint is written at
+the boundary, so recovery continues the retained instances and never
+resurrects a deleted one, and replay rebuilds the instance list solely from
+the event stream.
+
+### Modify a map instance
+
+```http
+POST /executions/run-1/instances/modify
+Idempotency-Key: modify-instance-1
+
+{"map_id": "ship", "index": 0, "input": {"sku": "s-9"}}
+```
+
+An instance that has not been advanced yet can have the input its later
+advancement uses rewritten. The body contains exactly `map_id`, `index`,
+and `input` — any finite JSON value — plus the loop context for a nested
+map, exactly like a deletion. The rewrite affects only this one instance:
+its record gains an `input` field holding the new value (an instance never
+modified carries no such field), and every other instance, every recorded
+output, and every history entry is untouched. Modifying an instance that
+was already advanced is a `409 conflict` and changes nothing. Each
+successful call appends one `map_instance_modified` event recording the map
+id, the index, the content before and after the rewrite (`before` is `null`
+on the first rewrite), and, inside a loop body, the loop id and iteration.
+A checkpoint is written at the boundary, and replay rebuilds the rewritten
+input solely from the event stream.
+
+Both operations are idempotent commands like every other operation; the
+idempotency key is scoped to the addressed instance, so repeating the same
+command with the same key returns the first result without appending another
+event, while reusing the key for another instance or another operation is a
+`409 conflict`. An index with no instance, an iteration the loop never
+reached, a map the bound workflow does not declare (or a nested map
+addressed without its loop context), and a missing or cross-tenant
+execution are `404 not_found`. A body with a missing, mistyped, or unknown
+field, or one carrying a non-finite number, is a `400 validation_error`
+that writes nothing. Neither operation changes advancement conclusions or
+termination semantics: cancellation, timeouts, approvals, leases, retries,
+and exhaustion behave exactly as before, and executions that never use them
+keep exactly the previous state shape, event stream, and advancement
+results.
+
 ### Workflow versions
 
 A workflow can declare a version tag alongside its nodes:
@@ -1396,7 +1463,10 @@ A map node with an unknown or missing field, a mistyped or non-positive
 `max_instances`, an invalid template, a `source` that is not a
 task dependency, or an invalid `path` is likewise a validation error that
 rejects the whole request, whether the map stands alone or sits inside a
-loop body.
+loop body. Deleting or modifying a map instance that was already advanced
+is a conflict that changes nothing; addressing an instance, iteration, map,
+or execution that does not exist is a missing resource, and a malformed
+delete or modify body is a validation error that writes nothing.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that

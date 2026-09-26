@@ -165,6 +165,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.heartbeat(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "release" and self.command == "POST":
             return 200, self.service.release(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 4 and parts[0] == "executions" and parts[2] == "instances" and parts[3] == "delete" and self.command == "POST":
+            return 200, self.service.delete_instance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 4 and parts[0] == "executions" and parts[2] == "instances" and parts[3] == "modify" and self.command == "POST":
+            return 200, self.service.modify_instance(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "cancel" and self.command == "POST":
             return 200, self.service.cancel(parts[1], self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "recover" and self.command == "POST":
