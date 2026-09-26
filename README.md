@@ -556,10 +556,9 @@ A map node contains exactly `id`, `kind`, `depends_on`, `source`, `path`,
 - `template` describes the single task each instance runs and contains
   exactly an `id`, and optionally `retries` (an integer between 0 and 10,
   defaulting to 0) and an `approval` point with the same shape a task node
-  uses. The template id must not collide with any declared node id and map
-  template ids must be unique; it only names the dynamically expanded
-  instances. A map node must not sit inside a loop body, and a loop body must
-  not contain a map node.
+  uses. The template id is free-form: it may repeat across map nodes and may
+  match a declared node id, since it only names the dynamically expanded
+  instances.
 
 When the dependencies settle, the value at `path` is read once. When it is an
 array, one instance is created per element; the instances queue in ascending
@@ -605,6 +604,60 @@ instances and never repeats an instance output. Per-instance completions and
 failures count toward the existing node metrics under the template node id,
 and webhook and queue subscriptions receive instance events exactly like any
 other node event.
+
+### Maps inside loop bodies
+
+A map node may also sit inside a loop body, expanding independently once per
+iteration:
+
+```json
+{"id": "retry-loop", "kind": "loop", "depends_on": [], "entry": "settle", "condition": "again", "max_iterations": 3}
+```
+
+with the map and its source task both belonging to the body (the map is an
+ancestor of the loop's entry task or its condition, exactly as every other
+body node is). All the usual loop rules still hold: bodies of different
+loops must not overlap or nest, and nodes outside the body must not depend
+on nodes inside it.
+
+Each iteration expands the map on its own: once the iteration's dependencies
+are all completed or skipped, the element list is read from the source
+task's output recorded in that same iteration. The instances belong only to
+their round — they queue in ascending element index order and are settled
+one per `advance`, and no iteration's results overwrite another's. Instance
+retries, approval points, and failure handling follow exactly the same rules
+as a top-level map, unaffected by the round. When the iteration's element
+count exceeds `max_instances`, no instance is created: the map node fails
+permanently and the execution terminates with the usual exhaustion
+semantics. When the path is missing or not an array in that round, the map
+expands to zero instances, completes that round with an empty output list,
+and the iteration proceeds to its next-iteration decision.
+
+A nested map's state lives in its iteration record: each entry of the loop's
+`iterations` list carries a `maps` field (present only when the body
+declares a map node) with one record per nested map, shaped exactly like the
+execution-level map state — `status`, one record per instance with its
+`index`, `status`, `output`, and `failure_reason`, the ordered completed
+`outputs` list, and the node's single `failure_reason`. The map's own output
+list lands in the iteration's `outputs`, and the map node id joins the
+iteration's `completed_nodes` when it finishes; once the loop completes, the
+map id also appears in the execution-level `completed_nodes` list, once, in
+first-completion order like every other body node. A workflow whose map
+nodes are all nested has no execution-level `maps` field at all.
+
+Every event a nested map or one of its instances produces — `map_expanded`,
+`map_completed`, the per-instance `node_completed`, `node_failed`, and
+`node_retried`, and the `approval_requested` and `approval_decided` of a
+template approval point — additionally carries the owning `loop_id` and
+`iteration` alongside the `map_id` and element `index`, and the
+`iteration_started` event of a loop whose body declares a map node carries
+the iteration's map skeleton, so replay rebuilds every round's instance
+list, status, and ownership solely from the event stream, consistent with
+the materialized state. Checkpoints are written at instance boundaries
+within the round, so recovery continues with the current iteration's
+unfinished instances and never repeats an instance output. Cancellation,
+timeout, approval, lease, and retry semantics are unchanged by nesting, and
+a nested map never changes the termination reason.
 
 ### Workflow versions
 
@@ -870,7 +923,7 @@ A subscription may declare a queue target instead of a webhook `url`:
 
 A queue subscription contains exactly:
 
-- `queue`: a non-empty queue name of at most 100 characters;
+- `queue`: a non-empty queue name (any length);
 - `events`: the same non-empty event-type list a webhook subscription takes;
 - `visibility_seconds` (optional): a positive number of seconds a pulled
   message stays invisible while awaiting acknowledgement, defaulting to 30.
@@ -1331,10 +1384,10 @@ point with an empty approver list, a duplicate or non-string approver, an
 approval on a non-task node, and a decision body that is malformed or carries
 a decision other than `approved` or `rejected` are validation errors.
 A map node with an unknown or missing field, a mistyped or non-positive
-`max_instances`, an invalid or colliding template, a `source` that is not a
-task dependency, an invalid `path`, or a map node inside a loop body (or a
-loop body containing a map) is likewise a validation error that rejects the
-whole request.
+`max_instances`, an invalid template, a `source` that is not a task
+dependency, or an invalid `path` is likewise a validation error that rejects
+the whole request; a map node inside a loop body follows the same rules and
+is validated the same way.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that

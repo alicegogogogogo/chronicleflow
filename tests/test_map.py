@@ -418,10 +418,13 @@ class MapValidationTests(unittest.TestCase):
             self.base(template={"id": "work", "approval": {"approvers": ["a", "a"]}})
         )
 
-    def test_template_id_must_not_collide_with_a_declared_node(self):
-        self.assert_invalid(self.base(template={"id": "collect"}))
+    def test_template_id_may_collide_with_a_declared_node(self):
+        # Template identifiers are free-form: they only name the dynamically
+        # expanded instances, so matching a declared node id is allowed.
+        stored = self.service.create_workflow(self.base(template={"id": "collect"}), "w1")
+        self.assertEqual({"id": "collect"}, stored["nodes"][1]["template"])
 
-    def test_template_ids_must_be_unique(self):
+    def test_template_ids_may_repeat_across_maps(self):
         document = {
             "id": "orders",
             "nodes": [
@@ -438,37 +441,43 @@ class MapValidationTests(unittest.TestCase):
                 {
                     "id": "m2",
                     "kind": "map",
-                    "depends_on": ["m1"],
-                    "source": "m1",
+                    "depends_on": ["collect", "m1"],
+                    "source": "collect",
                     "path": "b",
                     "max_instances": 5,
                     "template": {"id": "work"},
                 },
             ],
         }
-        self.assert_invalid(document)
+        stored = self.service.create_workflow(document, "w1")
+        self.assertEqual(
+            [{"id": "work"}, {"id": "work"}],
+            [node["template"] for node in stored["nodes"][1:]],
+        )
 
-    def test_map_must_not_nest_with_a_loop(self):
-        # A map node inside a loop body.
+    def test_map_may_nest_in_a_loop_body(self):
+        # A map node inside a loop body expands independently per iteration.
         document = {
             "id": "orders",
             "nodes": [
-                {"id": "entry", "kind": "task", "depends_on": []},
-                {"id": "check", "kind": "condition", "depends_on": ["entry"], "path": "x", "equals": 1},
-                {"id": "loop", "kind": "loop", "depends_on": [], "entry": "entry",
-                 "condition": "check", "max_iterations": 3},
+                {"id": "collect", "kind": "task", "depends_on": []},
                 {
                     "id": "fanout",
                     "kind": "map",
-                    "depends_on": ["entry"],
-                    "source": "entry",
+                    "depends_on": ["collect"],
+                    "source": "collect",
                     "path": "items",
                     "max_instances": 5,
                     "template": {"id": "work"},
                 },
+                {"id": "settle", "kind": "task", "depends_on": ["fanout"]},
+                {"id": "again", "kind": "condition", "depends_on": ["settle"], "path": "more", "equals": True},
+                {"id": "loop", "kind": "loop", "depends_on": [], "entry": "settle",
+                 "condition": "again", "max_iterations": 3},
             ],
         }
-        self.assert_invalid(document)
+        stored = self.service.create_workflow(document, "w1")
+        self.assertEqual("map", stored["nodes"][1]["kind"])
 
 
 class MapObservabilityTests(unittest.TestCase):

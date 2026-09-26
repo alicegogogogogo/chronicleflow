@@ -340,8 +340,6 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
             raise ValidationError(f"loop {node.id} entry must not depend on the loop itself")
         if any(by_id[member].kind == "loop" for member in body):
             raise ValidationError(f"loop {node.id} body must not contain another loop")
-        if any(by_id[member].kind == "map" for member in body):
-            raise ValidationError(f"loop {node.id} body must not contain a map node")
         if judge.id not in body:
             raise ValidationError(f"loop {node.id} condition must belong to the loop body")
         bodies[node.id] = body
@@ -364,24 +362,15 @@ def _assert_valid_loops(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None
 def _assert_valid_maps(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None:
     """Structural rules for dynamic map nodes.
 
-    The expansion source must be a task explicitly listed as a dependency, the
-    template's task identifier must not collide with any declared node (it
-    names only the dynamically expanded instances), and a map node must not
-    itself sit inside a loop body (nested dynamic expansion is out of scope).
+    The expansion source must be a task explicitly listed as a dependency.
+    Template identifiers are free-form: they may repeat across map nodes and
+    may match a declared node id, since they only name the dynamically
+    expanded instances. A map node may sit inside a loop body, in which case
+    it expands independently per iteration (see the service layer).
     """
-    bodies = {
-        node.id: frozenset(_collect_loop_body(by_id, node.entry, node.condition))
-        for node in nodes
-        if node.kind == "loop"
-    }
-    body_members = set().union(*bodies.values()) if bodies else set()
-    declared = {node.id for node in nodes}
-    templates = {node.template.task_id for node in nodes if node.kind == "map"}
     for node in nodes:
         if node.kind != "map":
             continue
-        if node.id in body_members:
-            raise ValidationError(f"map {node.id} must not belong to a loop body")
         source = by_id.get(node.source)
         if source is None:
             raise ValidationError(f"map {node.id} source references an unknown node")
@@ -389,13 +378,6 @@ def _assert_valid_maps(nodes: tuple[Node, ...], by_id: dict[str, Node]) -> None:
             raise ValidationError(f"map {node.id} source must reference a task node")
         if node.source not in node.depends_on:
             raise ValidationError(f"map {node.id} must list its source task {node.source} in depends_on")
-    if len(templates) != len([node for node in nodes if node.kind == "map"]):
-        raise ValidationError("map template identifiers must be unique")
-    collided = templates & declared
-    if collided:
-        raise ValidationError(
-            f"map template id {next(iter(collided))} must not collide with a declared node identifier"
-        )
 
 
 def _assert_acyclic(nodes: tuple[Node, ...]) -> None:

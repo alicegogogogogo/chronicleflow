@@ -64,8 +64,19 @@ def _evaluate_condition(node: Node, input_data: Any) -> bool:
     return _json_type(current) == _json_type(node.equals) and current == node.equals
 
 
-def _new_iteration() -> dict[str, Any]:
-    return {"completed_nodes": [], "skipped_nodes": [], "condition_results": {}, "outputs": {}, "attempts": {}}
+def _new_iteration(map_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+    iteration: dict[str, Any] = {
+        "completed_nodes": [],
+        "skipped_nodes": [],
+        "condition_results": {},
+        "outputs": {},
+        "attempts": {},
+    }
+    if map_ids:
+        # A loop body containing map nodes tracks each nested map per
+        # iteration: instances belong to the round that expanded them.
+        iteration["maps"] = {map_id: _new_map_state() for map_id in map_ids}
+    return iteration
 
 
 def _new_loop_state() -> dict[str, Any]:
@@ -83,6 +94,30 @@ def _new_map_instance(index: int) -> dict[str, Any]:
         "output": None,
         "failure_reason": None,
     }
+
+
+def _map_state_for(
+    state: dict[str, Any], map_id: str, loop_id: str | None = None, iteration: int | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Locate a map node's state record and the container holding its conclusions.
+
+    A map node inside a loop body keeps its record in the owning iteration
+    (instances belong to that round alone); every other map keeps its record
+    at the execution level.
+    """
+    if loop_id is not None:
+        container = state["loops"][loop_id]["iterations"][iteration - 1]
+        return container["maps"][map_id], container
+    return state["maps"][map_id], state
+
+
+def _iteration_started_payload(loop_id: str, iteration: int, map_ids: tuple[str, ...]) -> dict[str, Any]:
+    """The iteration-start record; a nested map's skeleton rides along so
+    replay can rebuild the iteration's map ownership from the event stream."""
+    payload: dict[str, Any] = {"loop_id": loop_id, "iteration": iteration}
+    if map_ids:
+        payload["maps"] = {map_id: _new_map_state() for map_id in map_ids}
+    return payload
 
 
 def _resolve_path(value: Any, path: str) -> Any:
@@ -106,7 +141,26 @@ def _has_approval_points(workflow: Workflow) -> bool:
 
 
 def _declared_map_states(workflow: Workflow) -> dict[str, dict[str, Any]]:
-    return {node.id: _new_map_state() for node in workflow.nodes if node.kind == "map"}
+    """Execution-level map records: maps inside a loop body are excluded —
+    their state lives in the loop's per-iteration records instead."""
+    bodies = workflow.loop_bodies()
+    body_members = set().union(*bodies.values()) if bodies else set()
+    return {
+        node.id: _new_map_state()
+        for node in workflow.nodes
+        if node.kind == "map" and node.id not in body_members
+    }
+
+
+def _nested_map_ids(workflow: Workflow) -> dict[str, tuple[str, ...]]:
+    """Map each loop id to the sorted ids of the map nodes inside its body."""
+    by_id = {node.id: node for node in workflow.nodes}
+    nested: dict[str, tuple[str, ...]] = {}
+    for loop_id, body in workflow.loop_bodies().items():
+        map_ids = tuple(sorted(member for member in body if by_id[member].kind == "map"))
+        if map_ids:
+            nested[loop_id] = map_ids
+    return nested
 
 
 # Requests without a tenant identifier live in the legacy namespace, whose
@@ -1435,26 +1489,27 @@ class ChronicleFlow:
                 target: dict[str, Any] = {"node_id": node_id}
                 if "map_id" in waiting:
                     target = {"map_id": waiting["map_id"], "node_id": node_id, "index": waiting["index"]}
+                    if "loop_id" in waiting:
+                        target["loop_id"] = waiting["loop_id"]
+                        target["iteration"] = waiting["iteration"]
                 self._complete_target(execution_id, workflow, state, target, output, tenant)
                 if state["status"] == "running":
                     self._auto_process(execution_id, workflow, state, tenant)
             elif "map_id" in waiting:
                 map_id = waiting["map_id"]
                 index = waiting["index"]
-                map_state = state["maps"][map_id]
+                map_state, _ = _map_state_for(state, map_id, waiting.get("loop_id"), waiting.get("iteration"))
                 instance = next(item for item in map_state["instances"] if item["index"] == index)
                 instance["status"] = "failed"
                 instance["failure_reason"] = reason
                 map_state["status"] = "failed"
                 map_state["failure_reason"] = reason
                 state["failed_nodes"].append(map_id)
-                self._terminate(
-                    execution_id,
-                    state,
-                    "rejected",
-                    tenant,
-                    {"node_id": map_id, "map_id": map_id, "index": index},
-                )
+                extra = {"node_id": map_id, "map_id": map_id, "index": index}
+                if "loop_id" in waiting:
+                    extra["loop_id"] = waiting["loop_id"]
+                    extra["iteration"] = waiting["iteration"]
+                self._terminate(execution_id, state, "rejected", tenant, extra)
             else:
                 state["failed_nodes"].append(node_id)
                 self._terminate(execution_id, state, "rejected", tenant, {"node_id": node_id})
@@ -1487,7 +1542,7 @@ class ChronicleFlow:
     @staticmethod
     def _recorded_output(state: dict[str, Any], record: dict[str, Any]) -> Any:
         if "map_id" in record:
-            map_state = state["maps"][record["map_id"]]
+            map_state, _ = _map_state_for(state, record["map_id"], record.get("loop_id"), record.get("iteration"))
             instance = next(item for item in map_state["instances"] if item["index"] == record["index"])
             return instance["output"]
         if "loop_id" in record:
@@ -1514,19 +1569,22 @@ class ChronicleFlow:
             node = next(node for node in workflow.nodes if node.id == node_id)
             approvers = list(node.approval.approvers)
         waiting: dict[str, Any] = {"node_id": node_id, "approvers": approvers}
-        loop_id = self._active_loop(workflow, state, node_id)
-        if loop_id is not None:
-            waiting["loop_id"] = loop_id
-            waiting["iteration"] = state["loops"][loop_id]["current_iteration"]
         if target.get("map_id") is not None:
+            # The loop context travels with the target: a nested map's
+            # template id is not a declared node, so it cannot be looked up.
+            if "loop_id" in target:
+                waiting["loop_id"] = target["loop_id"]
+                waiting["iteration"] = target["iteration"]
             waiting["map_id"] = target["map_id"]
             waiting["index"] = target["index"]
-            instance = next(
-                item
-                for item in state["maps"][target["map_id"]]["instances"]
-                if item["index"] == target["index"]
-            )
+            map_state, _ = _map_state_for(state, target["map_id"], target.get("loop_id"), target.get("iteration"))
+            instance = next(item for item in map_state["instances"] if item["index"] == target["index"])
             instance["status"] = "waiting"
+        else:
+            loop_id = self._active_loop(workflow, state, node_id)
+            if loop_id is not None:
+                waiting["loop_id"] = loop_id
+                waiting["iteration"] = state["loops"][loop_id]["current_iteration"]
         state["waiting_approval"] = waiting
         self._append(
             execution_id,
@@ -2115,6 +2173,13 @@ class ChronicleFlow:
         else:
             self._fail_node(execution_id, workflow, state, target["node_id"], reason, tenant)
 
+    @staticmethod
+    def _map_context(target: dict[str, Any]) -> dict[str, Any]:
+        """The loop ownership of a nested map target; empty for a top-level map."""
+        if target.get("loop_id") is not None:
+            return {"loop_id": target["loop_id"], "iteration": target["iteration"]}
+        return {}
+
     def _complete_map_instance(
         self,
         execution_id: str,
@@ -2126,26 +2191,36 @@ class ChronicleFlow:
     ) -> None:
         map_id = target["map_id"]
         index = target["index"]
-        map_state = state["maps"][map_id]
+        context = self._map_context(target)
+        map_state, container = _map_state_for(state, map_id, target.get("loop_id"), target.get("iteration"))
         instance = next(item for item in map_state["instances"] if item["index"] == index)
         instance["status"] = "completed"
         instance["output"] = output
         self._append(
             execution_id,
             "node_completed",
-            {"node_id": target["node_id"], "output": output, "map_id": map_id, "index": index},
+            {"node_id": target["node_id"], "output": output, "map_id": map_id, "index": index, **context},
             tenant,
         )
         if all(item["status"] == "completed" for item in map_state["instances"]):
-            self._finish_map(execution_id, workflow, state, map_id, map_state, tenant)
+            self._finish_map(execution_id, workflow, state, map_id, map_state, tenant, container, context)
 
-    def _map_instance_attempt(self, execution_id: str, map_id: str, index: int, tenant: str) -> int:
+    def _map_instance_attempt(
+        self,
+        execution_id: str,
+        map_id: str,
+        index: int,
+        tenant: str,
+        loop_id: str | None = None,
+        iteration: int | None = None,
+    ) -> int:
         """Count node_failed events already recorded for one map instance.
 
         Instance records carry only index, status, output, and failure reason,
         so the attempt number is derived from the event stream (its durable
         source) rather than kept as extra state. The next failure is attempt
-        ``count + 1``.
+        ``count + 1``. A nested instance is matched by its loop and iteration
+        as well, since the same map id and index recur every round.
         """
         rows = self.store.connection.execute(
             "SELECT payload FROM events WHERE tenant = ? AND execution_id = ? AND type = 'node_failed'",
@@ -2154,7 +2229,12 @@ class ChronicleFlow:
         failures = 0
         for row in rows:
             payload = self.store.decode(row["payload"])
-            if payload.get("map_id") == map_id and payload.get("index") == index:
+            if (
+                payload.get("map_id") == map_id
+                and payload.get("index") == index
+                and payload.get("loop_id") == loop_id
+                and payload.get("iteration") == iteration
+            ):
                 failures += 1
         return failures + 1
 
@@ -2169,11 +2249,14 @@ class ChronicleFlow:
     ) -> None:
         map_id = target["map_id"]
         index = target["index"]
+        context = self._map_context(target)
         map_node = next(node for node in workflow.nodes if node.id == map_id)
         retries = map_node.template.retries or 0
-        map_state = state["maps"][map_id]
+        map_state, _ = _map_state_for(state, map_id, target.get("loop_id"), target.get("iteration"))
         instance = next(item for item in map_state["instances"] if item["index"] == index)
-        attempt = self._map_instance_attempt(execution_id, map_id, index, tenant)
+        attempt = self._map_instance_attempt(
+            execution_id, map_id, index, tenant, target.get("loop_id"), target.get("iteration")
+        )
         self._append(
             execution_id,
             "node_failed",
@@ -2183,6 +2266,7 @@ class ChronicleFlow:
                 "reason": reason,
                 "map_id": map_id,
                 "index": index,
+                **context,
             },
             tenant,
         )
@@ -2196,6 +2280,7 @@ class ChronicleFlow:
                     "reason": reason,
                     "map_id": map_id,
                     "index": index,
+                    **context,
                 },
                 tenant,
             )
@@ -2210,7 +2295,7 @@ class ChronicleFlow:
                 state,
                 "retries_exhausted",
                 tenant,
-                {"node_id": map_id, "map_id": map_id, "index": index},
+                {"node_id": map_id, "map_id": map_id, "index": index, **context},
             )
 
     def _expand_map(
@@ -2221,17 +2306,22 @@ class ChronicleFlow:
         map_node: Node,
         map_state: dict[str, Any],
         tenant: str,
+        container: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Expand a pending map once every dependency is completed or skipped.
 
         The element list is a dot-separated path into the recorded output of
-        the source task. A missing path or a value that is not an array
+        the source task — for a nested map, the output the source recorded in
+        the owning iteration. A missing path or a value that is not an array
         expands to zero instances and completes the map with an empty output
         list. More elements than the declared bound create no instances: the
         map fails permanently and the execution terminates.
         """
-        source_output = state["outputs"].get(map_node.source)
-        if map_node.source in state["skipped_nodes"]:
+        container = container if container is not None else state
+        context = context if context is not None else {}
+        source_output = container["outputs"].get(map_node.source)
+        if map_node.source in container["skipped_nodes"]:
             # A skipped source task never recorded an output; expand zero.
             elements: Any = None
         else:
@@ -2260,6 +2350,7 @@ class ChronicleFlow:
                     "max_instances": map_node.max_instances,
                     "exceeded": True,
                     "reason": reason,
+                    **context,
                 },
                 tenant,
             )
@@ -2268,7 +2359,7 @@ class ChronicleFlow:
                 state,
                 "retries_exhausted",
                 tenant,
-                {"node_id": map_node.id, "map_id": map_node.id},
+                {"node_id": map_node.id, "map_id": map_node.id, **context},
             )
             return
         map_state["instances"] = [_new_map_instance(index) for index in range(len(elements))]
@@ -2276,11 +2367,11 @@ class ChronicleFlow:
         self._append(
             execution_id,
             "map_expanded",
-            {"map_id": map_node.id, "instance_count": len(elements), "exceeded": False},
+            {"map_id": map_node.id, "instance_count": len(elements), "exceeded": False, **context},
             tenant,
         )
         if not elements:
-            self._finish_map(execution_id, workflow, state, map_node.id, map_state, tenant)
+            self._finish_map(execution_id, workflow, state, map_node.id, map_state, tenant, container, context)
 
     def _finish_map(
         self,
@@ -2290,16 +2381,24 @@ class ChronicleFlow:
         map_id: str,
         map_state: dict[str, Any],
         tenant: str,
+        container: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
-        """Complete a map node; its output is the ordered list of instance outputs."""
+        """Complete a map node; its output is the ordered list of instance outputs.
+
+        The conclusion lands in the owning container: the execution state for
+        a top-level map, the owning iteration record for a nested one.
+        """
+        container = container if container is not None else state
+        context = context if context is not None else {}
         map_state["status"] = "completed"
         map_state["outputs"] = [instance["output"] for instance in sorted(map_state["instances"], key=lambda item: item["index"])]
-        state["outputs"][map_id] = map_state["outputs"]
-        state["completed_nodes"].append(map_id)
+        container["outputs"][map_id] = map_state["outputs"]
+        container["completed_nodes"].append(map_id)
         self._append(
             execution_id,
             "map_completed",
-            {"map_id": map_id, "instance_count": len(map_state["instances"])},
+            {"map_id": map_id, "instance_count": len(map_state["instances"]), **context},
             tenant,
         )
 
@@ -2345,21 +2444,34 @@ class ChronicleFlow:
         """All ready work items: declared tasks and expanded map instances.
 
         Map instances queue in ascending element index once their map is
-        expanded; every advance still settles exactly the first target.
+        expanded; every advance still settles exactly the first target. A
+        nested map's instances belong to the iteration that expanded them and
+        carry its loop id and iteration number.
         """
         targets: list[dict[str, Any]] = [{"node_id": node_id} for node_id in self._ready_tasks(workflow, state)]
-        maps = state.get("maps")
-        if maps:
-            map_nodes = {node.id: node for node in workflow.nodes if node.kind == "map"}
-            for map_id, map_node in map_nodes.items():
-                map_state = maps.get(map_id)
-                if map_state is None or map_state["status"] != "running":
-                    continue
-                for instance in map_state["instances"]:
-                    if instance["status"] == "ready":
-                        targets.append(
-                            {"map_id": map_id, "node_id": map_node.template.task_id, "index": instance["index"]}
-                        )
+        map_nodes = {node.id: node for node in workflow.nodes if node.kind == "map"}
+        nested: dict[str, tuple[str, int]] = {}
+        for loop_id, loop_state in state["loops"].items():
+            if loop_state["status"] != "running":
+                continue
+            iteration = loop_state["iterations"][-1]
+            for map_id in iteration.get("maps", {}):
+                nested[map_id] = (loop_id, loop_state["current_iteration"])
+        for map_id, map_node in map_nodes.items():
+            context: dict[str, Any] = {}
+            if map_id in nested:
+                loop_id, iteration_no = nested[map_id]
+                map_state = state["loops"][loop_id]["iterations"][iteration_no - 1]["maps"][map_id]
+                context = {"loop_id": loop_id, "iteration": iteration_no}
+            else:
+                map_state = state.get("maps", {}).get(map_id)
+            if map_state is None or map_state["status"] != "running":
+                continue
+            for instance in map_state["instances"]:
+                if instance["status"] == "ready":
+                    targets.append(
+                        {"map_id": map_id, "node_id": map_node.template.task_id, "index": instance["index"], **context}
+                    )
         return sorted(targets, key=self._target_sort_key)
 
     def _active_loop(self, workflow: Workflow, state: dict[str, Any], node_id: str) -> str | None:
@@ -2374,6 +2486,7 @@ class ChronicleFlow:
         by_id = {node.id: node for node in workflow.nodes}
         bodies = workflow.loop_bodies()
         body_members = set().union(*bodies.values()) if bodies else set()
+        nested = _nested_map_ids(workflow)
         completed = set(state["completed_nodes"])
         skipped = set(state["skipped_nodes"])
         changed = True
@@ -2403,6 +2516,8 @@ class ChronicleFlow:
                     self._append(execution_id, "node_skipped", {"node_id": node.id}, tenant)
                     changed = True
             for loop_node in sorted((node for node in workflow.nodes if node.kind == "loop"), key=lambda item: item.id):
+                if state["status"] != "running":
+                    break
                 loop_state = state["loops"][loop_node.id]
                 if loop_state["status"] == "pending":
                     if not set(loop_node.depends_on) <= completed | skipped:
@@ -2417,8 +2532,13 @@ class ChronicleFlow:
                     if result:
                         loop_state["status"] = "running"
                         loop_state["current_iteration"] = 1
-                        loop_state["iterations"].append(_new_iteration())
-                        self._append(execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": 1}, tenant)
+                        loop_state["iterations"].append(_new_iteration(nested.get(loop_node.id, ())))
+                        self._append(
+                            execution_id,
+                            "iteration_started",
+                            _iteration_started_payload(loop_node.id, 1, nested.get(loop_node.id, ())),
+                            tenant,
+                        )
                     else:
                         self._finish_loop(execution_id, state, loop_node.id, loop_state, "condition_false", tenant)
                         completed.add(loop_node.id)
@@ -2460,7 +2580,39 @@ class ChronicleFlow:
                                 tenant,
                             )
                             changed = True
-                    if bodies[loop_node.id] <= iteration_completed | iteration_skipped:
+                    for map_id in nested.get(loop_node.id, ()):
+                        # A nested map expands once the iteration's own
+                        # dependencies settle, reading the source task's output
+                        # recorded in this iteration. Iterations started before
+                        # a migration introduced the map carry no skeleton and
+                        # are left to their recorded conclusions.
+                        if state["status"] != "running":
+                            break
+                        map_state = iteration.get("maps", {}).get(map_id)
+                        if map_state is None or map_state["status"] != "pending":
+                            continue
+                        map_node = by_id[map_id]
+                        if not set(map_node.depends_on) <= iteration_completed | iteration_skipped:
+                            continue
+                        self._expand_map(
+                            execution_id,
+                            workflow,
+                            state,
+                            map_node,
+                            map_state,
+                            tenant,
+                            container=iteration,
+                            context={"loop_id": loop_node.id, "iteration": loop_state["current_iteration"]},
+                        )
+                        if map_state["status"] == "completed":
+                            # A zero-instance expansion finishes at once,
+                            # releasing the iteration's successors.
+                            iteration_completed.add(map_id)
+                        changed = True
+                    if state["status"] == "running" and (
+                        bodies[loop_node.id] - {mid for mid in nested.get(loop_node.id, ()) if mid not in iteration.get("maps", {})}
+                        <= iteration_completed | iteration_skipped
+                    ):
                         current = loop_state["current_iteration"]
                         result = _evaluate_condition(by_id[loop_node.condition], state["input"])
                         self._append(
@@ -2477,12 +2629,20 @@ class ChronicleFlow:
                             completed.add(loop_node.id)
                         else:
                             loop_state["current_iteration"] = current + 1
-                            loop_state["iterations"].append(_new_iteration())
-                            self._append(execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": current + 1}, tenant)
+                            loop_state["iterations"].append(_new_iteration(nested.get(loop_node.id, ())))
+                            self._append(
+                                execution_id,
+                                "iteration_started",
+                                _iteration_started_payload(loop_node.id, current + 1, nested.get(loop_node.id, ())),
+                                tenant,
+                            )
                         changed = True
             for map_node in sorted((node for node in workflow.nodes if node.kind == "map"), key=lambda item: item.id):
                 if state["status"] != "running":
                     break
+                if map_node.id in body_members:
+                    # A nested map expands inside its loop's current iteration.
+                    continue
                 map_state = state["maps"][map_node.id]
                 if map_state["status"] != "pending":
                     continue
@@ -2532,8 +2692,11 @@ class ChronicleFlow:
         )
 
     @staticmethod
-    def _replay_map_instance(rebuilt: dict[str, Any], map_id: str, index: int) -> dict[str, Any]:
-        return next(item for item in rebuilt["maps"][map_id]["instances"] if item["index"] == index)
+    def _replay_map_instance(
+        rebuilt: dict[str, Any], map_id: str, index: int, loop_id: str | None = None, iteration: int | None = None
+    ) -> dict[str, Any]:
+        map_state, _ = _map_state_for(rebuilt, map_id, loop_id, iteration)
+        return next(item for item in map_state["instances"] if item["index"] == index)
 
     def replay(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         stored = self.get_execution(execution_id, tenant)
@@ -2583,7 +2746,9 @@ class ChronicleFlow:
             elif event_type == "node_completed" and rebuilt is not None:
                 node_id = payload["node_id"]
                 if "map_id" in payload:
-                    instance = self._replay_map_instance(rebuilt, payload["map_id"], payload["index"])
+                    instance = self._replay_map_instance(
+                        rebuilt, payload["map_id"], payload["index"], payload.get("loop_id"), payload.get("iteration")
+                    )
                     instance["status"] = "completed"
                     instance["output"] = payload["output"]
                     instance["failure_reason"] = None
@@ -2599,7 +2764,9 @@ class ChronicleFlow:
             elif event_type == "node_failed" and rebuilt is not None:
                 node_id = payload["node_id"]
                 if "map_id" in payload:
-                    instance = self._replay_map_instance(rebuilt, payload["map_id"], payload["index"])
+                    instance = self._replay_map_instance(
+                        rebuilt, payload["map_id"], payload["index"], payload.get("loop_id"), payload.get("iteration")
+                    )
                     instance["status"] = "failed"
                     instance["failure_reason"] = payload["reason"]
                 elif "loop_id" in payload:
@@ -2614,7 +2781,9 @@ class ChronicleFlow:
             elif event_type == "node_retried" and rebuilt is not None:
                 node_id = payload["node_id"]
                 if "map_id" in payload:
-                    instance = self._replay_map_instance(rebuilt, payload["map_id"], payload["index"])
+                    instance = self._replay_map_instance(
+                        rebuilt, payload["map_id"], payload["index"], payload.get("loop_id"), payload.get("iteration")
+                    )
                     # A consumed failure with retries left re-queues it; the
                     # transient failure reason is not part of its final record.
                     instance["status"] = "ready"
@@ -2625,7 +2794,9 @@ class ChronicleFlow:
                 else:
                     rebuilt["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})["attempt"] = payload["attempt"]
             elif event_type == "map_expanded" and rebuilt is not None:
-                map_state = rebuilt["maps"][payload["map_id"]]
+                map_state, _ = _map_state_for(
+                    rebuilt, payload["map_id"], payload.get("loop_id"), payload.get("iteration")
+                )
                 if payload.get("exceeded"):
                     # Over-limit expansion creates no instances; the map fails
                     # permanently and the termination event ends the execution.
@@ -2635,19 +2806,26 @@ class ChronicleFlow:
                     map_state["instances"] = [_new_map_instance(index) for index in range(payload["instance_count"])]
                     map_state["status"] = "running"
             elif event_type == "map_completed" and rebuilt is not None:
-                map_state = rebuilt["maps"][payload["map_id"]]
+                map_state, container = _map_state_for(
+                    rebuilt, payload["map_id"], payload.get("loop_id"), payload.get("iteration")
+                )
                 map_state["status"] = "completed"
                 map_state["outputs"] = [
                     instance["output"]
                     for instance in sorted(map_state["instances"], key=lambda item: item["index"])
                 ]
-                rebuilt["outputs"][payload["map_id"]] = map_state["outputs"]
-                rebuilt["completed_nodes"].append(payload["map_id"])
+                container["outputs"][payload["map_id"]] = map_state["outputs"]
+                container["completed_nodes"].append(payload["map_id"])
             elif event_type == "iteration_started" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 loop_state["status"] = "running"
                 loop_state["current_iteration"] = payload["iteration"]
-                loop_state["iterations"].append(_new_iteration())
+                iteration = _new_iteration()
+                if "maps" in payload:
+                    # The nested-map skeleton rides on the start record so the
+                    # iteration's map ownership is rebuilt exactly.
+                    iteration["maps"] = {map_id: _new_map_state() for map_id in payload["maps"]}
+                loop_state["iterations"].append(iteration)
             elif event_type == "loop_completed" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 # Mirror the materialized roll-up: body nodes completed in any
@@ -2671,7 +2849,9 @@ class ChronicleFlow:
                 if "map_id" in payload:
                     waiting_record["map_id"] = payload["map_id"]
                     waiting_record["index"] = payload["index"]
-                    instance = self._replay_map_instance(rebuilt, payload["map_id"], payload["index"])
+                    instance = self._replay_map_instance(
+                        rebuilt, payload["map_id"], payload["index"], payload.get("loop_id"), payload.get("iteration")
+                    )
                     instance["status"] = "waiting"
                 rebuilt["waiting_approval"] = waiting_record
             elif event_type == "version_migrated" and rebuilt is not None:
@@ -2713,9 +2893,13 @@ class ChronicleFlow:
                 if "waiting_approval" in rebuilt:
                     rebuilt["waiting_approval"] = None
                 if "map_id" in payload:
-                    map_state = rebuilt["maps"][payload["map_id"]]
+                    map_state, _ = _map_state_for(
+                        rebuilt, payload["map_id"], payload.get("loop_id"), payload.get("iteration")
+                    )
                     if "index" in payload:
-                        instance = self._replay_map_instance(rebuilt, payload["map_id"], payload["index"])
+                        instance = self._replay_map_instance(
+                            rebuilt, payload["map_id"], payload["index"], payload.get("loop_id"), payload.get("iteration")
+                        )
                         instance["status"] = "failed"
                         if payload["reason"] == "rejected":
                             # A rejected instance writes no node_failed event;
@@ -2726,6 +2910,8 @@ class ChronicleFlow:
                                 for record in reversed(rebuilt.get("approvals", []))
                                 if record.get("map_id") == payload["map_id"]
                                 and record.get("index") == payload["index"]
+                                and record.get("loop_id") == payload.get("loop_id")
+                                and record.get("iteration") == payload.get("iteration")
                             )
                             instance["failure_reason"] = text
                             map_state["failure_reason"] = text

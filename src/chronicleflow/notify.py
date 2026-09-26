@@ -82,8 +82,8 @@ def parse_subscriptions(raw: Any) -> list[dict[str, Any]]:
                     "each queue subscription must contain queue and events, and optionally visibility_seconds"
                 )
             name = item["queue"]
-            if not isinstance(name, str) or not name or len(name) > 100:
-                raise ValidationError("subscription queue must be a non-empty string of at most 100 characters")
+            if not isinstance(name, str) or not name:
+                raise ValidationError("subscription queue must be a non-empty string")
             visibility = item.get("visibility_seconds", DEFAULT_VISIBILITY_SECONDS)
             if isinstance(visibility, bool) or not isinstance(visibility, (int, float)):
                 raise ValidationError("subscription visibility_seconds must be a positive number of seconds")

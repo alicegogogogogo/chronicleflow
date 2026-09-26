@@ -114,6 +114,15 @@ class QueueServiceTests(unittest.TestCase):
             with self.assertRaises(NotFoundError):
                 self.service.get_execution(f"run-bad-{index}")
 
+    def test_queue_name_has_no_length_limit(self):
+        # Only an empty queue name is a validation error; long names are fine.
+        name = "q" * 200
+        make_workflow(self.service, "wf-long", TASK, [{"queue": name, "events": ["node_completed"]}], "wf-long")
+        state = start(self.service, "run-long", "wf-long")
+        self.assertEqual("running", state["status"])
+        queues = self.service.queues("run-long")["queues"]
+        self.assertEqual(name, queues[0]["queue"])
+
     def test_queue_names_are_unique_per_tenant_across_owners(self):
         make_workflow(self.service, "wf-q1", TASK, [{"queue": "shared", "events": ["node_completed"]}], "wf-q1")
         make_workflow(self.service, "wf-q2", TASK, None, "wf-q2")
