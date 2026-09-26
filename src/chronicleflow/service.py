@@ -64,12 +64,46 @@ def _evaluate_condition(node: Node, input_data: Any) -> bool:
     return _json_type(current) == _json_type(node.equals) and current == node.equals
 
 
+_MISSING = object()
+
+
+def _resolve_path(data: Any, path: str) -> Any:
+    """Read a dot-separated path; a missing segment yields the sentinel."""
+    current = data
+    for segment in path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return _MISSING
+        current = current[segment]
+    return current
+
+
 def _new_iteration() -> dict[str, Any]:
     return {"completed_nodes": [], "skipped_nodes": [], "condition_results": {}, "outputs": {}, "attempts": {}}
 
 
 def _new_loop_state() -> dict[str, Any]:
     return {"status": "pending", "current_iteration": 0, "iterations": [], "end_reason": None}
+
+
+def _new_map_state() -> dict[str, Any]:
+    # Keys are inserted in stable (alphabetical) order so a state rebuilt from
+    # the event stream renders exactly like one round-tripped through storage.
+    return {"failure_reason": None, "instances": [], "status": "pending"}
+
+
+def _new_map_instance(index: int, ready: bool) -> dict[str, Any]:
+    return {
+        "attempts": {"attempt": 1, "failures": 0},
+        "failure_reason": None,
+        "index": index,
+        "output": None,
+        "status": "ready" if ready else "waiting",
+    }
+
+
+# The permanent failure recorded on a map whose expanded element count exceeds
+# the declared instance cap.
+MAP_INSTANCE_LIMIT_REASON = "instance_limit_exceeded"
 
 
 # Requests without a tenant identifier live in the legacy namespace, whose
@@ -1147,7 +1181,12 @@ class ChronicleFlow:
             raise ConflictError(f"execution {execution_id} already exists")
         self._assert_within_quota(tenant, "executions")
         loops = {node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"}
-        has_approvals = any(node.approval is not None for node in workflow.nodes)
+        maps = {node.id: _new_map_state() for node in workflow.nodes if node.kind == "map"}
+        has_approvals = any(node.approval is not None for node in workflow.nodes) or any(
+            node.template is not None and node.template.approval is not None
+            for node in workflow.nodes
+            if node.kind == "map"
+        )
         deadline = time.time() + timeout if timeout is not None else None
         state = {
             "id": execution_id,
@@ -1165,6 +1204,10 @@ class ChronicleFlow:
             "attempts": {},
             "loops": loops,
         }
+        # Dynamic map state exists only on executions whose workflow declares
+        # a map node, so every other execution keeps its baseline state shape.
+        if maps:
+            state["maps"] = maps
         # Approval state exists only for workflows that declare approval
         # points, so every other execution keeps its baseline state shape.
         if has_approvals:
@@ -1200,6 +1243,8 @@ class ChronicleFlow:
             "timeout_seconds": timeout,
             "deadline_at": deadline,
         }
+        if maps:
+            started_payload["maps"] = maps
         if bound_version:
             started_payload["version"] = bound_version
         if has_approvals:
@@ -1305,17 +1350,27 @@ class ChronicleFlow:
             workflow = self._bound_workflow(execution_id, tenant)
             self._auto_process(execution_id, workflow, state, tenant)
             if state["status"] == "running":
-                ready = self._ready_tasks(workflow, state)
-                if not ready:
-                    raise ConflictError("execution has no ready node")
-                node_id = ready[0]
-                node = next(node for node in workflow.nodes if node.id == node_id)
-                if node.approval is not None:
-                    self._request_approval(execution_id, workflow, state, node, tenant)
-                elif "failure" in raw:
-                    self._fail_node(execution_id, workflow, state, node_id, raw["failure"]["reason"], tenant)
+                node_id, map_id = self._select_ready(workflow, state)
+                by_id = {node.id: node for node in workflow.nodes}
+                if map_id is not None:
+                    map_node = by_id[map_id]
+                    instance = self._ready_map_instance(state, map_id)
+                    if map_node.template.approval is not None:
+                        self._request_map_approval(execution_id, state, map_node, instance, tenant)
+                    elif "failure" in raw:
+                        self._fail_map_instance(
+                            execution_id, state, map_node, instance, raw["failure"]["reason"], tenant
+                        )
+                    else:
+                        self._complete_map_instance(execution_id, state, map_node, instance, raw["output"], tenant)
                 else:
-                    self._complete_node(execution_id, workflow, state, node_id, raw["output"], tenant)
+                    node = by_id[node_id]
+                    if node.approval is not None:
+                        self._request_approval(execution_id, workflow, state, node, tenant)
+                    elif "failure" in raw:
+                        self._fail_node(execution_id, workflow, state, node_id, raw["failure"]["reason"], tenant)
+                    else:
+                        self._complete_node(execution_id, workflow, state, node_id, raw["output"], tenant)
                 if state["status"] == "running" and state.get("waiting_approval") is None:
                     self._auto_process(execution_id, workflow, state, tenant)
             self.store.connection.execute(
@@ -1383,12 +1438,37 @@ class ChronicleFlow:
                 payload["reason"] = reason
             self._append(execution_id, "approval_decided", payload, tenant)
             if verdict == "approved":
-                self._complete_node(execution_id, workflow, state, node_id, output, tenant)
+                if "map_id" in waiting:
+                    map_node = next(node for node in workflow.nodes if node.id == waiting["map_id"])
+                    instance = next(
+                        item for item in state["maps"][waiting["map_id"]]["instances"] if item["index"] == waiting["index"]
+                    )
+                    self._complete_map_instance(execution_id, state, map_node, instance, output, tenant)
+                else:
+                    self._complete_node(execution_id, workflow, state, node_id, output, tenant)
                 if state["status"] == "running":
                     self._auto_process(execution_id, workflow, state, tenant)
             else:
-                state["failed_nodes"].append(node_id)
-                self._terminate(execution_id, state, "rejected", tenant, {"node_id": node_id})
+                if "map_id" in waiting:
+                    map_state = state["maps"][waiting["map_id"]]
+                    instance = next(item for item in map_state["instances"] if item["index"] == waiting["index"])
+                    instance["status"] = "failed"
+                    instance["failure_reason"] = reason
+                    map_state["status"] = "failed"
+                    map_state["failure_reason"] = reason
+                    self._append(
+                        execution_id,
+                        "map_instance_failed",
+                        {"map_id": waiting["map_id"], "index": waiting["index"], "reason": reason},
+                        tenant,
+                    )
+                    state["failed_nodes"].append(waiting["map_id"])
+                    self._terminate(
+                        execution_id, state, "rejected", tenant, {"node_id": waiting["map_id"], "map_id": waiting["map_id"], "index": waiting["index"]}
+                    )
+                else:
+                    state["failed_nodes"].append(node_id)
+                    self._terminate(execution_id, state, "rejected", tenant, {"node_id": node_id})
             self.store.connection.execute(
                 "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
                 (self.store.encode(state), tenant, execution_id),
@@ -1417,6 +1497,9 @@ class ChronicleFlow:
 
     @staticmethod
     def _recorded_output(state: dict[str, Any], record: dict[str, Any]) -> Any:
+        if "map_id" in record:
+            instances = state["maps"][record["map_id"]]["instances"]
+            return next(instance["output"] for instance in instances if instance["index"] == record["index"])
         if "loop_id" in record:
             iteration = state["loops"][record["loop_id"]]["iterations"][record["iteration"] - 1]
             return iteration["outputs"].get(record["node_id"])
@@ -1424,7 +1507,7 @@ class ChronicleFlow:
 
     @staticmethod
     def _approval_context(waiting: dict[str, Any]) -> dict[str, Any]:
-        return {key: waiting[key] for key in ("loop_id", "iteration") if key in waiting}
+        return {key: waiting[key] for key in ("loop_id", "iteration", "map_id", "index") if key in waiting}
 
     def _request_approval(
         self, execution_id: str, workflow: Workflow, state: dict[str, Any], node: Node, tenant: str
@@ -1470,7 +1553,19 @@ class ChronicleFlow:
         for node in workflow.nodes:
             if node.kind == "loop" and node.id not in state["loops"]:
                 state["loops"][node.id] = _new_loop_state()
-        if any(node.approval is not None for node in workflow.nodes) and "approvals" not in state:
+        maps = {node.id: _new_map_state() for node in workflow.nodes if node.kind == "map"}
+        if maps:
+            # Map state appears as soon as the bound definition declares a map
+            # node; maps the old definition knew keep their recorded instances.
+            state.setdefault("maps", {})
+            for map_id, skeleton in maps.items():
+                state["maps"].setdefault(map_id, skeleton)
+        has_approvals = any(node.approval is not None for node in workflow.nodes) or any(
+            node.template is not None and node.template.approval is not None
+            for node in workflow.nodes
+            if node.kind == "map"
+        )
+        if has_approvals and "approvals" not in state:
             state["waiting_approval"] = None
             state["approvals"] = []
 
@@ -1516,7 +1611,15 @@ class ChronicleFlow:
             payload["loops"] = {
                 node.id: _new_loop_state() for node in workflow.nodes if node.kind == "loop"
             }
-            if any(node.approval is not None for node in workflow.nodes):
+            maps = {node.id: _new_map_state() for node in workflow.nodes if node.kind == "map"}
+            if maps:
+                payload["maps"] = maps
+            has_approvals = any(node.approval is not None for node in workflow.nodes) or any(
+                node.template is not None and node.template.approval is not None
+                for node in workflow.nodes
+                if node.kind == "map"
+            )
+            if has_approvals:
                 payload["waiting_approval"] = None
                 payload["approvals"] = []
             self._append(execution_id, "version_migrated", payload, tenant)
@@ -2016,6 +2119,215 @@ class ChronicleFlow:
                 return loop_id
         return None
 
+    # --- dynamic map nodes ------------------------------------------------
+
+    def _map_ids(self, workflow: Workflow) -> list[str]:
+        return [node.id for node in workflow.nodes if node.kind == "map"]
+
+    @staticmethod
+    def _ready_map_instance(state: dict[str, Any], map_id: str) -> dict[str, Any]:
+        ready = next(instance for instance in state["maps"][map_id]["instances"] if instance["status"] == "ready")
+        return ready
+
+    def _select_ready(self, workflow: Workflow, state: dict[str, Any]) -> tuple[str, str | None]:
+        """Pick the single ready item for this advance, FIFO across map queues.
+
+        Every queued map instance is enqueued in ascending element index; the
+        ordinary ready tasks and the map heads are merged lexicographically so
+        exactly one ready item is completed per advance. The returned pair is
+        the task id and, for a map instance, the owning map node id.
+        """
+        candidates: list[tuple[str, str | None]] = [(node_id, None) for node_id in self._ready_tasks(workflow, state)]
+        for map_id in self._map_ids(workflow):
+            map_state = state["maps"][map_id]
+            if map_state["status"] != "running":
+                continue
+            if any(instance["status"] == "ready" for instance in map_state["instances"]):
+                template_id = next(node.template.task_id for node in workflow.nodes if node.id == map_id)
+                candidates.append((template_id, map_id))
+        if not candidates:
+            raise ConflictError("execution has no ready node")
+        # Key only on the task id: the second tuple element may be None for an
+        # ordinary task, which is not orderable against a map id string. The
+        # stable sort keeps deterministic insertion order on a tie.
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0]
+
+    def _expand_map(
+        self, execution_id: str, state: dict[str, Any], node: Node, tenant: str = DEFAULT_TENANT
+    ) -> None:
+        """Expand a map node from a dependency's recorded output.
+
+        A missing path or a non-array value expands to zero instances and the
+        node completes with an empty output list. More elements than the
+        declared cap create nothing and fail the node permanently, terminating
+        the execution under the usual retries-exhausted semantics.
+        """
+        map_state = state["maps"][node.id]
+        value = _resolve_path(state["outputs"].get(node.source), node.path)
+        if value is _MISSING or not isinstance(value, list):
+            count = 0
+        else:
+            count = len(value)
+        if count > node.max_instances:
+            map_state["status"] = "failed"
+            map_state["failure_reason"] = MAP_INSTANCE_LIMIT_REASON
+            self._append(
+                execution_id,
+                "map_expanded",
+                {"map_id": node.id, "count": count, "limit": node.max_instances, "exceeded": True},
+                tenant,
+            )
+            state["failed_nodes"].append(node.id)
+            self._terminate(
+                execution_id,
+                state,
+                "retries_exhausted",
+                tenant,
+                {"node_id": node.id, "map_id": node.id},
+            )
+            return
+        # The first instance is queued immediately; the rest wait in element
+        # order, each promoted when its predecessor settles.
+        for index in range(count):
+            map_state["instances"].append(_new_map_instance(index, ready=(index == 0)))
+        map_state["status"] = "running"
+        self._append(
+            execution_id,
+            "map_expanded",
+            {"map_id": node.id, "count": count, "limit": node.max_instances, "exceeded": False},
+            tenant,
+        )
+
+    def _map_instance_context(self, map_id: str, instance: dict[str, Any]) -> dict[str, Any]:
+        return {"map_id": map_id, "index": instance["index"]}
+
+    def _request_map_approval(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        node: Node,
+        instance: dict[str, Any],
+        tenant: str = DEFAULT_TENANT,
+    ) -> None:
+        context = self._map_instance_context(node.id, instance)
+        approvers = list(node.template.approval.approvers)
+        state["waiting_approval"] = {"node_id": node.template.task_id, "approvers": approvers, **context}
+        self._append(
+            execution_id,
+            "approval_requested",
+            {"node_id": node.template.task_id, "approvers": approvers, **context},
+            tenant,
+        )
+
+    def _complete_map_instance(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        node: Node,
+        instance: dict[str, Any],
+        output: Any,
+        tenant: str = DEFAULT_TENANT,
+    ) -> None:
+        instance["output"] = output
+        instance["status"] = "completed"
+        context = self._map_instance_context(node.id, instance)
+        self._append(
+            execution_id,
+            "node_completed",
+            {"node_id": node.template.task_id, "output": output, **context},
+            tenant,
+        )
+        self._settle_map_instance(execution_id, state, node, instance, tenant)
+
+    def _fail_map_instance(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        node: Node,
+        instance: dict[str, Any],
+        reason: str,
+        tenant: str = DEFAULT_TENANT,
+    ) -> None:
+        retries = node.template.retries or 0
+        context = self._map_instance_context(node.id, instance)
+        instance["attempts"]["failures"] += 1
+        self._append(
+            execution_id,
+            "node_failed",
+            {"node_id": node.template.task_id, "attempt": instance["attempts"]["attempt"], "reason": reason, **context},
+            tenant,
+        )
+        if instance["attempts"]["failures"] <= retries:
+            instance["attempts"]["attempt"] += 1
+            instance["status"] = "ready"
+            self._append(
+                execution_id,
+                "node_retried",
+                {"node_id": node.template.task_id, "attempt": instance["attempts"]["attempt"], "reason": reason, **context},
+                tenant,
+            )
+        else:
+            instance["status"] = "failed"
+            instance["failure_reason"] = reason
+            map_state = state["maps"][node.id]
+            map_state["status"] = "failed"
+            map_state["failure_reason"] = reason
+            self._append(
+                execution_id,
+                "map_instance_failed",
+                {"map_id": node.id, "index": instance["index"], "reason": reason},
+                tenant,
+            )
+            state["failed_nodes"].append(node.id)
+            self._terminate(
+                execution_id,
+                state,
+                "retries_exhausted",
+                tenant,
+                {"node_id": node.id, "map_id": node.id, "index": instance["index"]},
+            )
+
+    def _settle_map_instance(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        node: Node,
+        instance: dict[str, Any],
+        tenant: str = DEFAULT_TENANT,
+    ) -> None:
+        """Promote the next waiting instance, or finish the map when none remain."""
+        map_state = state["maps"][node.id]
+        following = next(
+            (candidate for candidate in map_state["instances"] if candidate["status"] == "waiting"),
+            None,
+        )
+        if following is not None:
+            following["status"] = "ready"
+            return
+        if all(candidate["status"] in ("completed", "skipped") for candidate in map_state["instances"]):
+            self._finish_map(execution_id, state, node, tenant)
+
+    def _finish_map(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        node: Node,
+        tenant: str = DEFAULT_TENANT,
+    ) -> None:
+        """All instances are settled: complete the node with ordered instance outputs."""
+        map_state = state["maps"][node.id]
+        outputs = [instance["output"] for instance in map_state["instances"] if instance["status"] == "completed"]
+        map_state["status"] = "completed"
+        state["outputs"][node.id] = outputs
+        state["completed_nodes"].append(node.id)
+        self._append(
+            execution_id,
+            "map_completed",
+            {"map_id": node.id, "outputs": outputs},
+            tenant,
+        )
+
     def _auto_process(
         self, execution_id: str, workflow: Workflow, state: dict[str, Any], tenant: str = DEFAULT_TENANT
     ) -> None:
@@ -2028,7 +2340,7 @@ class ChronicleFlow:
         while changed:
             changed = False
             for node in sorted(workflow.nodes, key=lambda item: item.id):
-                if node.kind == "loop" or node.id in body_members:
+                if node.kind in ("loop", "map") or node.id in body_members:
                     continue
                 if node.id in completed or node.id in skipped:
                     continue
@@ -2124,6 +2436,22 @@ class ChronicleFlow:
                             loop_state["iterations"].append(_new_iteration())
                             self._append(execution_id, "iteration_started", {"loop_id": loop_node.id, "iteration": current + 1}, tenant)
                         changed = True
+            for map_node in sorted((node for node in workflow.nodes if node.kind == "map"), key=lambda item: item.id):
+                map_state = state["maps"][map_node.id]
+                if map_state["status"] != "pending":
+                    continue
+                if not set(map_node.depends_on) <= completed | skipped:
+                    continue
+                # Expansion happens automatically once every dependency is
+                # completed or skipped; a zero-element expansion completes the
+                # node at once with an empty output list.
+                self._expand_map(execution_id, state, map_node, tenant)
+                if map_state["status"] == "failed":
+                    return
+                if not map_state["instances"]:
+                    self._finish_map(execution_id, state, map_node, tenant)
+                    completed.add(map_node.id)
+                changed = True
         finished = completed | skipped
         if all(node.id in finished for node in workflow.nodes if node.id not in body_members):
             state["status"] = "completed"
@@ -2159,6 +2487,14 @@ class ChronicleFlow:
             tenant,
         )
 
+    @staticmethod
+    def _replay_settle_map_instance(rebuilt: dict[str, Any], map_id: str) -> None:
+        """Mirror the queue promotion after an instance settles (no events here)."""
+        instances = rebuilt["maps"][map_id]["instances"]
+        following = next((candidate for candidate in instances if candidate["status"] == "waiting"), None)
+        if following is not None:
+            following["status"] = "ready"
+
     def replay(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         stored = self.get_execution(execution_id, tenant)
         rebuilt: dict[str, Any] | None = None
@@ -2182,6 +2518,10 @@ class ChronicleFlow:
                     "attempts": {},
                     "loops": {loop_id: _new_loop_state() for loop_id in payload.get("loops", {})},
                 }
+                # Dynamic map state is rebuilt solely from the start record,
+                # exactly like the loop skeletons.
+                if "maps" in payload:
+                    rebuilt["maps"] = {map_id: _new_map_state() for map_id in payload["maps"]}
                 # The version binding is rebuilt solely from the start record.
                 if payload.get("version"):
                     rebuilt["version"] = payload["version"]
@@ -2204,7 +2544,12 @@ class ChronicleFlow:
                     rebuilt["skipped_nodes"].append(payload["node_id"])
             elif event_type == "node_completed" and rebuilt is not None:
                 node_id = payload["node_id"]
-                if "loop_id" in payload:
+                if "map_id" in payload:
+                    instance = rebuilt["maps"][payload["map_id"]]["instances"][payload["index"]]
+                    instance["output"] = payload["output"]
+                    instance["status"] = "completed"
+                    self._replay_settle_map_instance(rebuilt, payload["map_id"])
+                elif "loop_id" in payload:
                     iteration = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
                     iteration["completed_nodes"].append(node_id)
                     iteration["outputs"][node_id] = payload["output"]
@@ -2215,20 +2560,48 @@ class ChronicleFlow:
                     rebuilt["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
             elif event_type == "node_failed" and rebuilt is not None:
                 node_id = payload["node_id"]
-                if "loop_id" in payload:
-                    container = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
+                if "map_id" in payload:
+                    entry = rebuilt["maps"][payload["map_id"]]["instances"][payload["index"]]["attempts"]
                 else:
-                    container = rebuilt
-                entry = container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
+                    if "loop_id" in payload:
+                        container = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
+                    else:
+                        container = rebuilt
+                    entry = container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})
                 entry["attempt"] = payload["attempt"]
                 entry["failures"] += 1
             elif event_type == "node_retried" and rebuilt is not None:
                 node_id = payload["node_id"]
-                if "loop_id" in payload:
+                if "map_id" in payload:
+                    instance = rebuilt["maps"][payload["map_id"]]["instances"][payload["index"]]
+                    instance["attempts"]["attempt"] = payload["attempt"]
+                    instance["status"] = "ready"
+                elif "loop_id" in payload:
                     container = rebuilt["loops"][payload["loop_id"]]["iterations"][-1]
+                    container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})["attempt"] = payload["attempt"]
                 else:
-                    container = rebuilt
-                container["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})["attempt"] = payload["attempt"]
+                    rebuilt["attempts"].setdefault(node_id, {"attempt": 1, "failures": 0})["attempt"] = payload["attempt"]
+            elif event_type == "map_expanded" and rebuilt is not None:
+                map_state = rebuilt["maps"][payload["map_id"]]
+                if payload["exceeded"]:
+                    map_state["status"] = "failed"
+                    map_state["failure_reason"] = MAP_INSTANCE_LIMIT_REASON
+                else:
+                    for index in range(payload["count"]):
+                        map_state["instances"].append(_new_map_instance(index, ready=(index == 0)))
+                    map_state["status"] = "running"
+            elif event_type == "map_completed" and rebuilt is not None:
+                map_state = rebuilt["maps"][payload["map_id"]]
+                map_state["status"] = "completed"
+                rebuilt["outputs"][payload["map_id"]] = payload["outputs"]
+                rebuilt["completed_nodes"].append(payload["map_id"])
+            elif event_type == "map_instance_failed" and rebuilt is not None:
+                map_state = rebuilt["maps"][payload["map_id"]]
+                instance = map_state["instances"][payload["index"]]
+                instance["status"] = "failed"
+                instance["failure_reason"] = payload["reason"]
+                map_state["status"] = "failed"
+                map_state["failure_reason"] = payload["reason"]
             elif event_type == "iteration_started" and rebuilt is not None:
                 loop_state = rebuilt["loops"][payload["loop_id"]]
                 loop_state["status"] = "running"
@@ -2252,7 +2625,7 @@ class ChronicleFlow:
                 rebuilt["waiting_approval"] = {
                     "node_id": payload["node_id"],
                     "approvers": list(payload["approvers"]),
-                    **({"loop_id": payload["loop_id"], "iteration": payload["iteration"]} if "loop_id" in payload else {}),
+                    **({key: payload[key] for key in ("loop_id", "iteration", "map_id", "index") if key in payload}),
                 }
             elif event_type == "version_migrated" and rebuilt is not None:
                 # Rebuild the migration point from the record alone: add the
@@ -2262,6 +2635,11 @@ class ChronicleFlow:
                 for loop_id in payload.get("loops", {}):
                     if loop_id not in rebuilt["loops"]:
                         rebuilt["loops"][loop_id] = _new_loop_state()
+                if "maps" in payload:
+                    rebuilt.setdefault("maps", {})
+                    for map_id in payload["maps"]:
+                        if map_id not in rebuilt["maps"]:
+                            rebuilt["maps"][map_id] = _new_map_state()
                 if "approvals" in payload and "approvals" not in rebuilt:
                     rebuilt["waiting_approval"] = None
                     rebuilt["approvals"] = []
@@ -2277,6 +2655,9 @@ class ChronicleFlow:
                 if "loop_id" in payload:
                     record["loop_id"] = payload["loop_id"]
                     record["iteration"] = payload["iteration"]
+                if "map_id" in payload:
+                    record["map_id"] = payload["map_id"]
+                    record["index"] = payload["index"]
                 rebuilt["waiting_approval"] = None
                 rebuilt["approvals"].append(record)
             elif event_type == "execution_completed" and rebuilt is not None:
