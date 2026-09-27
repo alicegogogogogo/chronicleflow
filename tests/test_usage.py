@@ -359,6 +359,127 @@ class UsageServiceTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.service.bill("", _ts(T0), _ts(T1))
 
+    def test_type_filter_counts_only_named_types(self):
+        self._metered_records()
+        # A single named type reports just that type's aggregate.
+        self.assertEqual(
+            {"usage": [{"type": "workflow_created", "count": 1}]},
+            self.service.usage("acme", types=("workflow_created",)),
+        )
+        self.assertEqual(
+            {"usage": [{"type": "execution_started", "count": 2}]},
+            self.service.usage("acme", types=("execution_started",)),
+        )
+        # Several named types keep ascending type-identifier order and omit a
+        # named type that has no record.
+        self.assertEqual(
+            {
+                "usage": [
+                    {"type": "execution_started", "count": 2},
+                    {"type": "workflow_created", "count": 1},
+                ]
+            },
+            self.service.usage("acme", types=("workflow_created", "execution_started")),
+        )
+        self.assertEqual(
+            {"usage": [{"type": "workflow_created", "count": 1}]},
+            self.service.usage(
+                "acme", types=("workflow_created", "schedule_triggered")
+            ),
+        )
+
+    def test_type_filter_and_window_intersect(self):
+        self._metered_records()
+        # Workflow_created sits at T0, the two execution starts at T_MID/T1.
+        self.assertEqual(
+            {"usage": [{"type": "execution_started", "count": 1}]},
+            self.service.usage("acme", _ts(T0), _ts(T_MID), ("execution_started",)),
+        )
+        # The named type has no record inside this window: definite empty list.
+        self.assertEqual(
+            {"usage": []},
+            self.service.usage("acme", _ts(T_MID), _ts(T1), ("workflow_created",)),
+        )
+        # Both named types, window reaching only T0: the workflow at T0 hits.
+        self.assertEqual(
+            {"usage": [{"type": "workflow_created", "count": 1}]},
+            self.service.usage(
+                "acme", _ts(T0), _ts(T0), ("execution_started", "workflow_created")
+            ),
+        )
+
+    def test_filter_matching_nothing_is_a_definite_empty_result(self):
+        self._metered_records()
+        for types in (("schedule_triggered",), ("delivery_attempted",)):
+            self.assertEqual({"usage": []}, self.service.usage("acme", types=types))
+            self.assertEqual(
+                {"bill": {"items": [], "total": 0}},
+                self.service.bill("acme", types=types),
+            )
+        # Empty tenant keeps the same definite empty results under a filter.
+        self.assertEqual(
+            {"usage": []}, self.service.usage("beta", types=("execution_started",))
+        )
+        self.assertEqual(
+            {"bill": {"items": [], "total": 0}},
+            self.service.bill("beta", types=("execution_started",)),
+        )
+
+    def test_filtered_bill_lists_only_named_items_and_sums_just_them(self):
+        self._metered_records()
+        bill = self.service.bill("acme", types=("workflow_created",))["bill"]
+        self.assertEqual(
+            [
+                {
+                    "type": "workflow_created",
+                    "count": 1,
+                    "unit_price": USAGE_UNIT_PRICES["workflow_created"],
+                    "subtotal": USAGE_UNIT_PRICES["workflow_created"],
+                }
+            ],
+            bill["items"],
+        )
+        self.assertEqual(USAGE_UNIT_PRICES["workflow_created"], bill["total"])
+        # The closed window reaches the execution starts at T_MID and T1.
+        windowed = self.service.bill(
+            "acme", _ts(T_MID), _ts(T1), ("execution_started",)
+        )["bill"]
+        self.assertEqual(
+            [
+                {
+                    "type": "execution_started",
+                    "count": 2,
+                    "unit_price": USAGE_UNIT_PRICES["execution_started"],
+                    "subtotal": 2 * USAGE_UNIT_PRICES["execution_started"],
+                }
+            ],
+            windowed["items"],
+        )
+        self.assertEqual(2 * USAGE_UNIT_PRICES["execution_started"], windowed["total"])
+
+    def test_filtered_usage_and_bill_still_require_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.usage("", types=("execution_started",))
+        with self.assertRaises(ValidationError):
+            self.service.bill("", types=("execution_started",))
+        with self.assertRaises(ValidationError):
+            self.service.usage("", _ts(T0), _ts(T1), ("execution_started",))
+        with self.assertRaises(ValidationError):
+            self.service.bill("", _ts(T0), _ts(T1), ("execution_started",))
+
+    def test_type_filter_is_read_only_and_tenant_isolated(self):
+        self._metered_records()
+        self.service.create_workflow({"id": "wf-b", "nodes": TASK}, "wf-b", "beta")
+        before = self.service.usage("acme")
+        self.service.usage("acme", types=("execution_started",))
+        self.service.bill("acme", _ts(T0), _ts(T1), ("execution_started",))
+        self.assertEqual(before, self.service.usage("acme"))
+        # Another tenant's records never enter this tenant's filtered result.
+        self.assertEqual(
+            {"usage": []},
+            self.service.usage("beta", _ts(T0), _ts(T1), ("workflow_created",)),
+        )
+
     def test_legacy_namespace_keeps_no_usage_records(self):
         _Receiver.calls = 0
         _Receiver.fail_once = False
@@ -561,6 +682,110 @@ class UsageHttpTests(unittest.TestCase):
             status, data = self.call("GET", path)
             self.assertEqual(400, status, path)
             self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_type_filter_over_http(self):
+        headers = {"X-Tenant-Id": "http-type-filter"}
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-tf", "nodes": TASK},
+            key="wf-tf",
+            headers=headers,
+        )
+        self.call(
+            "POST",
+            "/executions",
+            {"id": "r-tf", "workflow_id": "wf-tf", "input": {}},
+            key="r-tf",
+            headers=headers,
+        )
+        status, data = self.call("GET", "/usage?type=workflow_created", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            json.loads(data)["usage"],
+        )
+        status, data = self.call(
+            "GET",
+            "/usage?type=execution_started,workflow_created",
+            headers=headers,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 1},
+                {"type": "workflow_created", "count": 1},
+            ],
+            json.loads(data)["usage"],
+        )
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        status, data = self.call("GET", "/bill?type=workflow_created", headers=headers)
+        self.assertEqual(200, status)
+        bill = json.loads(data)["bill"]
+        self.assertEqual(["workflow_created"], [item["type"] for item in bill["items"]])
+        self.assertEqual(
+            sum(item["subtotal"] for item in bill["items"]), bill["total"]
+        )
+        # A known type with no records is omitted, giving the definite empties.
+        status, data = self.call(
+            "GET", "/usage?type=schedule_triggered", headers=headers
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        status, data = self.call(
+            "GET", "/bill?type=schedule_triggered", headers=headers
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+
+    def test_type_filter_without_type_is_byte_for_byte_the_old_query(self):
+        headers = {"X-Tenant-Id": "http-type-absent"}
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-ta", "nodes": TASK},
+            key="wf-ta",
+            headers=headers,
+        )
+        for path in ("/usage", "/bill", "/usage?", "/bill?"):
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(200, status, path)
+            self.assertTrue(data.endswith(b"\n"), path)
+            self.assertFalse(data.endswith(b"\n\n"), path)
+        status, plain = self.call("GET", "/usage", headers=headers)
+        status, marked = self.call("GET", "/usage?", headers=headers)
+        self.assertEqual(plain, marked)
+
+    def test_type_filter_is_validated_on_both_routes(self):
+        headers = {"X-Tenant-Id": "http-type-bad"}
+        bad_paths = (
+            "/usage?type=not_a_type",
+            "/bill?type=not_a_type",
+            "/usage?type=execution_started,execution_started",
+            "/bill?type=execution_started,",
+            "/usage?type=",
+            "/bill?type=,execution_started",
+            "/usage?type=execution_started&type=workflow_created",
+            "/bill?type=execution_started&bogus=1",
+            "/usage?type=execution_started&since=not-a-time",
+            "/bill?type=execution_started&until=not-a-time",
+        )
+        for path in bad_paths:
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_type_filter_validation_failure_writes_nothing_and_reveals_nothing(self):
+        headers = {"X-Tenant-Id": "http-type-empty"}
+        status, _ = self.call("GET", "/usage?type=", headers=headers)
+        self.assertEqual(400, status)
+        status, data = self.call("GET", "/usage", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        status, data = self.call("GET", "/bill", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
 
 
 if __name__ == "__main__":

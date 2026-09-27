@@ -711,6 +711,7 @@ class ChronicleFlow:
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, int]:
         """Cumulative per-type counts of the tenant's usage records.
 
@@ -718,7 +719,9 @@ class ChronicleFlow:
         cumulative baseline. ``since`` and ``until`` bound a closed interval on
         each record's own occurrence time (``created_at``): a record equal to
         either boundary counts. A window with ``since`` later than ``until``
-        contains no records, so every type is omitted.
+        contains no records, so every type is omitted. ``types`` keeps only
+        records whose metered type is in the set and combines with the window
+        as an intersection; when it is ``None`` every type is counted.
         """
         if since is None and until is None:
             rows = self.store.connection.execute(
@@ -736,24 +739,30 @@ class ChronicleFlow:
                 if not self._within_window(_parse_stored_time(row["created_at"]), since, until):
                     continue
                 counts[row["type"]] = counts.get(row["type"], 0) + 1
-        return {usage_type: counts[usage_type] for usage_type in USAGE_TYPES if counts.get(usage_type)}
+        return {
+            usage_type: counts[usage_type]
+            for usage_type in USAGE_TYPES
+            if counts.get(usage_type) and (types is None or usage_type in types)
+        }
 
     def usage(
         self,
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
         with self._operation():
             with self.store.transaction():
                 # Types are reported in ascending identifier order; a type
-                # with no records in the window is omitted, so a window that
-                # matches nothing gets a definite empty list.
+                # with no records in the window, or one the filter does not
+                # name, is omitted, so a filter or window that matches nothing
+                # gets a definite empty list.
                 entries = [
                     {"type": usage_type, "count": count}
-                    for usage_type, count in sorted(self._usage_counts(tenant, since, until).items())
+                    for usage_type, count in sorted(self._usage_counts(tenant, since, until, types).items())
                 ]
                 return {"usage": entries}
 
@@ -762,6 +771,7 @@ class ChronicleFlow:
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
@@ -769,10 +779,11 @@ class ChronicleFlow:
             with self.store.transaction():
                 items = []
                 total = 0
-                # Only types with a record in the window appear, each with its
-                # usual unit price and a subtotal of count times that price; a
-                # window that matches nothing yields an empty bill totaling 0.
-                for usage_type, count in sorted(self._usage_counts(tenant, since, until).items()):
+                # Only types with a record in the window and in the type filter
+                # appear, each with its usual unit price and a subtotal of
+                # count times that price; a filter or window that matches
+                # nothing yields an empty bill totaling 0.
+                for usage_type, count in sorted(self._usage_counts(tenant, since, until, types).items()):
                     unit_price = USAGE_UNIT_PRICES[usage_type]
                     subtotal = count * unit_price
                     total += subtotal
