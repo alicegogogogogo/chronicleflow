@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS executions (
   workflow_id TEXT NOT NULL,
   state TEXT NOT NULL,
   workflow_version TEXT,
+  created_at TEXT,
   PRIMARY KEY (tenant, id),
   FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
 );
@@ -157,7 +158,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
 # Legacy (pre-tenancy) column layouts, used only when migrating an old file.
 LEGACY_COLUMNS = {
     "workflows": "id, document, NULL",
-    "executions": "id, workflow_id, state, NULL",
+    "executions": "id, workflow_id, state, NULL, NULL",
     "events": "execution_id, sequence, type, payload, occurred_at",
     "idempotency": "key, operation, response",
     "checkpoints": "execution_id, sequence, event_sequence, document, created_at",
@@ -178,6 +179,13 @@ ADDED_COLUMNS = {
     "subscriptions": ("version", "TEXT NOT NULL DEFAULT ''"),
 }
 
+# Columns added in a later additive migration. ``created_at`` on executions is
+# nullable only so it can be added to an existing table; every execution gets
+# a value either at creation or via ``_backfill_execution_created_at``.
+ADDED_COLUMNS_LATE = {
+    "executions": ("created_at", "TEXT"),
+}
+
 
 class Store:
     def __init__(self, path: str):
@@ -192,6 +200,7 @@ class Store:
         self._migrate_added_columns()
         self.connection.executescript(SCHEMA)
         self._backfill_versions()
+        self._backfill_execution_created_at()
         self._normalize_delivery_attempts()
 
     def _normalize_delivery_attempts(self) -> None:
@@ -262,11 +271,34 @@ class Store:
 
     def _migrate_added_columns(self) -> None:
         """Add columns introduced after a table first existed to an existing database."""
-        for table, (column, declaration) in ADDED_COLUMNS.items():
-            existing = [info["name"] for info in self.connection.execute(f'PRAGMA table_info("{table}")')]
-            if not existing or column in existing:
-                continue
-            self.connection.execute(f'ALTER TABLE "{table}" ADD COLUMN {column} {declaration}')
+        for additions in (ADDED_COLUMNS, ADDED_COLUMNS_LATE):
+            for table, (column, declaration) in additions.items():
+                existing = [info["name"] for info in self.connection.execute(f'PRAGMA table_info("{table}")')]
+                if not existing or column in existing:
+                    continue
+                self.connection.execute(f'ALTER TABLE "{table}" ADD COLUMN {column} {declaration}')
+
+    def _backfill_execution_created_at(self) -> None:
+        """Give executions created before the column their start event's time.
+
+        The creation time is the occurrence time of the execution's first
+        event (its ``execution_started`` event), which is exactly what new
+        executions stamp at creation. Executions without an event stream keep
+        a null value. A legacy database fragment without an events table has
+        nothing to backfill from.
+        """
+        has_events = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        if not has_events:
+            return
+        self.connection.execute(
+            "UPDATE executions SET created_at = ("
+            "SELECT e2.occurred_at FROM events e2 "
+            "WHERE e2.tenant = executions.tenant AND e2.execution_id = executions.id "
+            "ORDER BY e2.sequence ASC LIMIT 1) "
+            "WHERE created_at IS NULL"
+        )
 
     def _backfill_versions(self) -> None:
         """Give workflows created before versioning an immutable unversioned revision."""

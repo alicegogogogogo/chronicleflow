@@ -35,9 +35,18 @@ PREVIEW_QUERY_PARAMETERS = ("limit",)
 
 # The list queries share keyset pagination (a cursor identifier and a page
 # size). The workflows list accepts nothing else; the executions list also
-# takes a workflow identifier, a lifecycle status, and a termination reason.
+# takes a workflow identifier, a lifecycle status, a termination reason, and
+# a closed creation-time window.
 LIST_QUERY_PARAMETERS = ("cursor", "limit")
-EXECUTIONS_QUERY_PARAMETERS = ("workflow_id", "status", "termination_reason", "cursor", "limit")
+EXECUTIONS_QUERY_PARAMETERS = (
+    "workflow_id",
+    "status",
+    "termination_reason",
+    "since",
+    "until",
+    "cursor",
+    "limit",
+)
 
 # A response rendered as a non-JSON text body (the Prometheus export).
 TextResponse = namedtuple("TextResponse", ("content_type", "body"))
@@ -200,8 +209,10 @@ class Handler(BaseHTTPRequestHandler):
         """Parse the executions list filters together with its pagination.
 
         ``status`` must name a lifecycle status and ``termination_reason`` a
-        termination reason; an unknown value is a 400 validation_error. A
-        ``workflow_id`` filter is checked against the namespace by the
+        termination reason; an unknown value is a 400 validation_error.
+        ``since`` and ``until`` are ISO-8601 UTC timestamps ending in Z and
+        bound a closed creation-time interval the same way the events query
+        does. A ``workflow_id`` filter is checked against the namespace by the
         service, where a missing or another tenant's workflow is a 404.
         """
         parsed, query = self._list_query(EXECUTIONS_QUERY_PARAMETERS)
@@ -217,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
         if reason is not None and reason not in TERMINATION_REASONS:
             raise ValidationError(f"unknown termination reason: {reason}")
         parsed["termination_reason"] = reason
+        parsed["since"] = _parse_timestamp(query["since"][0], "since") if "since" in query else None
+        parsed["until"] = _parse_timestamp(query["until"][0], "until") if "until" in query else None
         return parsed
 
     def _body(self) -> Any:

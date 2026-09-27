@@ -1353,6 +1353,16 @@ class ChronicleFlow:
             started_payload,
             tenant,
         )
+        # The creation time is the occurrence time of the start event, the
+        # same value an older database backfills from that event.
+        started_at = self.store.connection.execute(
+            "SELECT occurred_at FROM events WHERE tenant = ? AND execution_id = ? ORDER BY sequence ASC LIMIT 1",
+            (tenant, execution_id),
+        ).fetchone()["occurred_at"]
+        self.store.connection.execute(
+            "UPDATE executions SET created_at = ? WHERE tenant = ? AND id = ?",
+            (started_at, tenant, execution_id),
+        )
         # An execution is metered once at creation; the same insert path backs
         # scheduled runs, which additionally record a schedule_triggered usage.
         self._record_usage(tenant, USAGE_TYPE_EXECUTION_STARTED)
@@ -1376,6 +1386,8 @@ class ChronicleFlow:
         workflow_id: str | None = None,
         status: str | None = None,
         termination_reason: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
         cursor: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
@@ -1385,10 +1397,14 @@ class ChronicleFlow:
         records, and never settles a due timeout, so a repeated query returns
         the same answer and stored state is unchanged. Filters combine as an
         intersection: ``workflow_id`` keeps one workflow's executions,
-        ``status`` keeps one lifecycle status, and ``termination_reason``
-        keeps executions that terminated for exactly that reason. The reason
-        filter only matches terminated executions, so running and completed
-        executions never appear under it even combined with other filters.
+        ``status`` keeps one lifecycle status, ``termination_reason`` keeps
+        executions that terminated for exactly that reason, and ``since`` and
+        ``until`` bound a closed interval on each execution's creation time (a
+        time equal to either boundary matches; an absent bound is open). The
+        reason filter only matches terminated executions, so running and
+        completed executions never appear under it even combined with other
+        filters. When ``since`` is later than ``until`` the window is simply
+        empty, so the result is a definite empty list rather than an error.
         ``cursor`` is the previous page's last execution identifier: the page
         holds only strictly greater identifiers, and ``limit`` caps its size,
         so consecutive pages neither overlap nor skip.
@@ -1400,6 +1416,11 @@ class ChronicleFlow:
                 # tenants' workflows.
                 if workflow_id is not None:
                     self._assert_workflow_exists(workflow_id, tenant)
+                # A window with since later than until matches nothing; it is
+                # a definite empty result, not an error.
+                empty_window = since is not None and until is not None and since > until
+                if empty_window:
+                    return {"executions": []}
                 conditions = ["tenant = ?"]
                 parameters: list[Any] = [tenant]
                 if workflow_id is not None:
@@ -1409,7 +1430,7 @@ class ChronicleFlow:
                     conditions.append("id > ?")
                     parameters.append(cursor)
                 query = (
-                    "SELECT id, state FROM executions WHERE "
+                    "SELECT id, state, created_at FROM executions WHERE "
                     + " AND ".join(conditions)
                     + " ORDER BY id ASC"
                 )
@@ -1427,12 +1448,21 @@ class ChronicleFlow:
                             continue
                         if state.get("termination_reason") != termination_reason:
                             continue
+                    if since is not None or until is not None:
+                        # A legacy fragment row can predate the creation-time
+                        # column and have no event stream to backfill from; it
+                        # can never match an actual time window.
+                        if row["created_at"] is None or not self._within_window(
+                            _parse_stored_time(row["created_at"]), since, until
+                        ):
+                            continue
                     executions.append(
                         {
                             "id": state["id"],
                             "workflow_id": state["workflow_id"],
                             "status": state["status"],
                             "termination_reason": state.get("termination_reason"),
+                            "created_at": row["created_at"],
                         }
                     )
                     if limit is not None and len(executions) >= limit:
