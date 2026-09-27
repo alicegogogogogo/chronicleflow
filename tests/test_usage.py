@@ -13,9 +13,18 @@ from chronicleflow.service import (
     USAGE_TYPES,
     USAGE_UNIT_PRICES,
     ChronicleFlow,
+    _parse_timestamp,
 )
 
 TASK = [{"id": "a", "kind": "task", "depends_on": []}]
+
+T0 = "2026-01-01T08:00:00.000Z"
+T1 = "2026-01-01T09:00:00.000Z"
+T_MID = "2026-01-01T08:30:00.000Z"
+
+
+def _ts(value):
+    return _parse_timestamp(value, "since")
 
 
 class _Receiver(BaseHTTPRequestHandler):
@@ -217,6 +226,139 @@ class UsageServiceTests(unittest.TestCase):
         self.assertEqual([], self.service.usage("beta")["usage"])
         self.assertEqual({"bill": {"items": [], "total": 0}}, self.service.bill("beta"))
 
+    def _metered_records(self):
+        """Create one workflow record and two execution records at known times.
+
+        Record sequence 1 is the workflow creation; sequences 2 and 3 are the
+        two execution starts. Their occurrence times are stamped explicitly so
+        the window behavior is deterministic.
+        """
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "acme")
+        self.service.create_execution({"id": "r1", "workflow_id": "wf", "input": {}}, "r1", "acme")
+        self.service.create_execution({"id": "r2", "workflow_id": "wf", "input": {}}, "r2", "acme")
+        self._stamp(1, T0)
+        self._stamp(2, T_MID)
+        self._stamp(3, T1)
+
+    def _stamp(self, sequence, created_at):
+        with self.service.store.transaction() as connection:
+            connection.execute(
+                "UPDATE usage_records SET created_at = ? WHERE tenant = ? AND sequence = ?",
+                (created_at, "acme", sequence),
+            )
+
+    def test_no_window_matches_the_cumulative_baseline(self):
+        self._metered_records()
+        full = {
+            "usage": [
+                {"type": "execution_started", "count": 2},
+                {"type": "workflow_created", "count": 1},
+            ]
+        }
+        self.assertEqual(full, self.service.usage("acme"))
+        self.assertEqual(full, self.service.usage("acme", None, None))
+        bill = self.service.bill("acme")
+        self.assertEqual(bill, self.service.bill("acme", None, None))
+        self.assertEqual(
+            2 * USAGE_UNIT_PRICES["execution_started"] + USAGE_UNIT_PRICES["workflow_created"],
+            bill["bill"]["total"],
+        )
+
+    def test_window_counts_only_records_inside_it(self):
+        self._metered_records()
+        # The open-since window reaches the two records at T_MID and T1.
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 2},
+            ],
+            self.service.usage("acme", _ts(T_MID), None)["usage"],
+        )
+        # The open-until window reaches T0 and the record at T_MID.
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 1},
+                {"type": "workflow_created", "count": 1},
+            ],
+            self.service.usage("acme", None, _ts(T_MID))["usage"],
+        )
+        # A window after every record and one before it match nothing.
+        self.assertEqual({"usage": []}, self.service.usage("acme", _ts("2027-01-01T00:00:00.000Z"), None))
+        self.assertEqual({"usage": []}, self.service.usage("acme", None, _ts("2025-01-01T00:00:00.000Z")))
+
+    def test_window_is_closed_at_both_endpoints(self):
+        self._metered_records()
+        # A record whose time equals either boundary is counted.
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("acme", _ts(T0), _ts(T0))["usage"],
+        )
+        point = self.service.bill("acme", _ts(T1), _ts(T1))["bill"]
+        self.assertEqual(
+            [{"type": "execution_started", "count": 1,
+              "unit_price": USAGE_UNIT_PRICES["execution_started"],
+              "subtotal": USAGE_UNIT_PRICES["execution_started"]}],
+            point["items"],
+        )
+        self.assertEqual(USAGE_UNIT_PRICES["execution_started"], point["total"])
+
+    def test_since_after_until_is_an_empty_window_not_an_error(self):
+        self._metered_records()
+        self.assertEqual(
+            {"usage": []},
+            self.service.usage("acme", _ts(T1), _ts(T0)),
+        )
+        self.assertEqual(
+            {"bill": {"items": [], "total": 0}},
+            self.service.bill("acme", _ts(T1), _ts(T0)),
+        )
+
+    def test_windowed_bill_keeps_price_subtotal_and_sorting_basis(self):
+        self._metered_records()
+        bill = self.service.bill("acme", _ts(T0), _ts(T_MID))["bill"]
+        types = [item["type"] for item in bill["items"]]
+        self.assertEqual(sorted(types), types)
+        self.assertEqual(
+            ["execution_started", "workflow_created"],
+            types,
+        )
+        for item in bill["items"]:
+            self.assertEqual(USAGE_UNIT_PRICES[item["type"]], item["unit_price"])
+            self.assertEqual(item["count"] * item["unit_price"], item["subtotal"])
+        self.assertEqual(sum(item["subtotal"] for item in bill["items"]), bill["total"])
+        self.assertIsInstance(bill["total"], int)
+
+    def test_windowed_queries_are_read_only_and_tenant_isolated(self):
+        self._metered_records()
+        self.service.create_workflow({"id": "wf-b", "nodes": TASK}, "wf-b", "beta")
+        window = (_ts(T0), _ts(T1))
+        alpha_before = self.service.usage("acme")
+        beta_before = self.service.usage("beta")
+        self.service.usage("acme", *window)
+        self.service.bill("acme", *window)
+        self.assertEqual(alpha_before, self.service.usage("acme"))
+        self.assertEqual(beta_before, self.service.usage("beta"))
+        # Another tenant's records are never visible, in any window: the window
+        # holds all of acme's stamped records but none of beta's, since beta's
+        # record carries the wall-clock creation time outside the Jan window.
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 2},
+                {"type": "workflow_created", "count": 1},
+            ],
+            self.service.usage("acme", *window)["usage"],
+        )
+        self.assertEqual({"usage": []}, self.service.usage("beta", *window))
+        self.assertEqual(
+            {"bill": {"items": [], "total": 0}},
+            self.service.bill("beta", *window),
+        )
+
+    def test_windowed_usage_and_bill_still_require_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.usage("", _ts(T0), _ts(T1))
+        with self.assertRaises(ValidationError):
+            self.service.bill("", _ts(T0), _ts(T1))
+
     def test_legacy_namespace_keeps_no_usage_records(self):
         _Receiver.calls = 0
         _Receiver.fail_once = False
@@ -336,6 +478,89 @@ class UsageHttpTests(unittest.TestCase):
         self.assertEqual({"usage": []}, json.loads(data))
         status, data = self.call("GET", "/bill", headers=headers)
         self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+
+    def test_window_parameters_are_validated_on_both_routes(self):
+        headers = {"X-Tenant-Id": "http-windowed"}
+        bad_paths = (
+            "/usage?since=not-a-time",
+            "/usage?until=2026-01-01",
+            "/bill?since=not-a-time",
+            "/bill?since=2026-01-01T00:00:00Z&bogus=1",
+            "/usage?unknown=1",
+            "/usage?since=2026-01-01T00:00:00Z&since=2026-02-01T00:00:00Z",
+            "/bill?until=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z",
+            "/bill?since=",
+        )
+        for path in bad_paths:
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_window_validation_failure_writes_no_usage(self):
+        headers = {"X-Tenant-Id": "http-window-empty"}
+        status, _ = self.call(
+            "GET", "/usage?since=not-a-time", headers=headers
+        )
+        self.assertEqual(400, status)
+        status, data = self.call("GET", "/usage", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+
+    def test_reverse_window_is_empty_over_http(self):
+        headers = {"X-Tenant-Id": "http-window-reverse"}
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-rw", "nodes": TASK},
+            key="wf-rw",
+            headers=headers,
+        )
+        query = "?since=2099-01-01T00:00:00.000Z&until=2000-01-01T00:00:00.000Z"
+        status, data = self.call("GET", "/usage" + query, headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        status, data = self.call("GET", "/bill" + query, headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+
+    def test_window_filters_windowed_tenant_over_http(self):
+        headers = {"X-Tenant-Id": "http-windowed-hit"}
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-wh", "nodes": TASK},
+            key="wf-wh",
+            headers=headers,
+        )
+        # A window entirely before the request was made matches nothing and is
+        # not an error.
+        past = "?since=2000-01-01T00:00:00.000Z&until=2000-02-01T00:00:00.000Z"
+        status, data = self.call("GET", "/usage" + past, headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        # The same tenant's cumulative result with no parameters is unchanged.
+        status, data = self.call("GET", "/usage", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            json.loads(data)["usage"],
+        )
+        status, data = self.call("GET", "/bill" + past, headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+
+    def test_missing_tenant_is_a_400_even_with_a_window(self):
+        for path in (
+            "/usage?since=2026-01-01T00:00:00Z",
+            "/bill?until=2026-01-01T00:00:00Z",
+        ):
+            status, data = self.call("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
 
 
 if __name__ == "__main__":

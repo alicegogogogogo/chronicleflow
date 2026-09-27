@@ -219,9 +219,40 @@ that is also returned in the response, and a `subtotal` equal to
 `count * unit_price`; `total` is the integer-cent sum of every subtotal. With
 no records, `items` is empty and `total` is `0`.
 
+Both endpoints accept the same two optional query parameters the events and
+metrics queries accept, each an ISO-8601 UTC timestamp ending in `Z`:
+
+```http
+GET /usage?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
+GET /bill?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
+X-Tenant-Id: acme
+```
+
+- `since` and `until` bound a **closed** interval on each usage record's
+  occurrence time: a record whose time equals `since` or `until` is counted.
+  When either parameter is absent the corresponding bound is open, so omitting
+  both returns exactly the cumulative result above;
+- a malformed `since` or `until`, a repeated parameter, or any unknown query
+  parameter is a `400 validation_error` that writes nothing;
+- when `since` is later than `until` the request is not an error: the window
+  simply contains no records. Usage then reports the definite empty result
+  `{"usage":[]}`, and the bill reports an empty `items` list with a `total` of
+  `0`.
+
+Only records whose occurrence time falls in the window are counted. Within
+the window the bill keeps the same basis as always: each present type reports
+its windowed count, its usual `unit_price`, and a `subtotal` of the two; items
+stay sorted by ascending type identifier, and a type with no record in the
+window is omitted rather than reported at zero. The query is read-only: it
+writes no usage records, changes no prices or metering conclusions, and never
+alters already recorded usage — under event replay or recovery the same window
+always gives the same answer.
+
 Both endpoints are tenant-scoped `GET` requests: a missing or empty
-`X-Tenant-Id` is a `400 validation_error`. Usage and bill data follow the
-usual tenant isolation, so one tenant can never see another's records.
+`X-Tenant-Id` is a `400 validation_error` that reveals no usage. Usage and
+bill data follow the usual tenant isolation, so one tenant can never see
+another's records in any window, and another tenant's records never affect
+this tenant's counts or totals.
 
 ### Operational metrics
 
