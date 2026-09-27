@@ -254,6 +254,66 @@ bill data follow the usual tenant isolation, so one tenant can never see
 another's records in any window, and another tenant's records never affect
 this tenant's counts or totals.
 
+### Per-record usage history
+
+The cumulative usage query reports only per-type totals. A separate endpoint
+returns the individual usage records themselves, so each billed action can be
+checked against the moment it occurred:
+
+```http
+GET /usage/records?limit=50
+X-Tenant-Id: acme
+```
+
+Returns `{"records":[...]}` with the matching records in ascending order of
+occurrence time; records sharing one instant are ordered by ascending
+sequence. Each record is:
+
+```json
+{"sequence":7,"type":"execution_started","occurred_at":"2026-09-26T08:30:00.000Z"}
+```
+
+- `sequence` is a stable, strictly increasing positive integer per tenant. It
+  identifies the record across every query and is never renumbered by a
+  filter or a page;
+- `type` is the metered action type;
+- `occurred_at` is the record's occurrence time as an ISO-8601 UTC string
+  ending in `Z`.
+
+A tenant with no matching records gets the definite empty result
+`{"records":[]}`, never an error. The response ends with a single newline,
+like every other JSON endpoint.
+
+The endpoint accepts the same optional closed time window the events and
+usage queries accept, plus cursor pagination:
+
+```http
+GET /usage/records?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `since` and `until` are ISO-8601 UTC timestamps ending in `Z` and bind a
+  **closed** interval on each record's occurrence time: a record whose time
+  equals either boundary is included. When either is absent the corresponding
+  bound is open; when `since` is later than `until` the window matches
+  nothing and the definite empty list is returned;
+- `limit` is **required** and must be a positive integer; a page never
+  contains more than that many records;
+- `cursor` is the `sequence` of the previous page's last record; only records
+  whose `sequence` is strictly greater are returned, so pages neither overlap
+  nor skip. It is omitted on the first page and must be a positive integer;
+- the time window and pagination apply together as an intersection, and
+  filtering never changes a record's `sequence`.
+
+A malformed timestamp, a missing or non-positive-integer `limit`, a
+non-positive-integer `cursor`, a repeated parameter, or any unknown query
+parameter is a `400 validation_error`. A missing or empty `X-Tenant-Id` is a
+`400 validation_error` that reveals no records. The query is read-only: it
+appends no usage records, writes no events, and changes no metering, prices,
+quotas, or billing conclusions. Records follow the usual tenant isolation, so
+another tenant's records are never visible under any window or page and never
+affect this tenant's result; replay and recovery leave every recorded
+sequence, time, and billing conclusion unchanged.
+
 ### Operational metrics
 
 ```http
