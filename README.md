@@ -1004,6 +1004,71 @@ addition to the ones its workflow declares:
 }
 ```
 
+### List workflows
+
+```http
+GET /workflows?limit=50
+X-Tenant-Id: acme
+```
+
+Enumerates the workflows declared in the request's namespace. The response
+is `{"workflows":[{"id":"order-flow"}, ...]}`: one entry per workflow, each
+carrying its identifier, in ascending identifier order. A namespace with no
+workflows gets the definite empty result `{"workflows":[]}`, not an error.
+The query is read-only: it creates nothing, appends no events, and records
+no usage, so repeating it returns the same answer and changes no stored
+state.
+
+The list is paged with a keyset cursor:
+
+- `limit` — required; the maximum number of entries in the page, a positive
+  integer. The page never holds more entries than the limit;
+- `cursor` — optional; the identifier of the previous page's last entry.
+  Only entries whose identifier sorts strictly after the cursor are
+  returned, so paging with the previous page's last identifier yields
+  consecutive pages that neither overlap nor skip. A cursor past the end
+  returns the definite empty list.
+
+### List executions
+
+```http
+GET /executions?workflow_id=order-flow&status=terminated&termination_reason=timeout&cursor=run-41&limit=50
+X-Tenant-Id: acme
+```
+
+Enumerates the executions in the request's namespace in ascending execution
+identifier order. The response is `{"executions":[...]}`; each entry carries
+the execution `id`, its `workflow_id`, its `status` (`running`, `completed`,
+or `terminated`, always a string), and its `termination_reason` (one of the
+four termination reasons for a terminated execution, otherwise `null`). A
+namespace with no executions gets the definite empty result
+`{"executions":[]}`. Like the workflows list this query is read-only and
+never settles a due timeout, appends an event, writes a checkpoint, or
+records usage, so repeated calls return the same answer and change no state
+or metering conclusion.
+
+The same `limit` and `cursor` pagination applies, with the cursor taken
+from the previous page's last execution identifier. In addition, three
+filters may be combined, and every given filter must match:
+
+- `workflow_id` — only executions of that workflow. Referencing a workflow
+  the namespace does not contain, including one owned by another tenant, is
+  the usual `404 not_found` and reveals nothing about its existence;
+- `status` — only executions in that lifecycle status. A value other than
+  `running`, `completed`, or `terminated` is a `400 validation_error`;
+- `termination_reason` — only executions that terminated for exactly that
+  reason. The filter is meaningful solely for terminated executions:
+  running and completed executions never appear under it, even when other
+  filters are given alongside it. An unknown reason is a
+  `400 validation_error`.
+
+Both list endpoints follow the usual tenant scope: omitting
+`X-Tenant-Id` keeps the single legacy namespace, and a tenant sees only its
+own workflows and executions under every combination of filters. Every
+parameter may appear at most once; a repeated parameter, an unknown
+parameter, a missing `limit`, or a `limit` that is not a positive integer is
+a `400 validation_error` that writes nothing.
+
 ### Inspect an execution
 
 ```http

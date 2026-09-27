@@ -204,6 +204,11 @@ USAGE_UNIT_PRICES = {
 # it, so the breakdown shape never depends on the recorded facts.
 TERMINATION_REASONS = ("cancelled", "rejected", "retries_exhausted", "timeout")
 
+# The three lifecycle statuses an execution state records. The executions
+# list validates its status filter against this set; any other value is a
+# validation error.
+EXECUTION_STATUSES = ("completed", "running", "terminated")
+
 
 class ChronicleFlow:
     def __init__(self, database: str):
@@ -1135,6 +1140,40 @@ class ChronicleFlow:
                     versions.append(document)
                 return {"current_version": row["current_version"], "id": workflow_id, "versions": versions}
 
+    def list_workflows(
+        self,
+        tenant: str = DEFAULT_TENANT,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Enumerate the workflow identifiers declared in the namespace.
+
+        The query is read-only: it creates nothing, appends no events, and
+        records no usage. Identifiers are returned in ascending order; the
+        ``cursor`` is the identifier of the previous page's last entry, so a
+        page holds only identifiers strictly greater than it, and ``limit``
+        caps the page size. The result is the same whether or not the
+        namespace holds any workflows — an empty namespace gets the definite
+        empty list.
+        """
+        with self._operation():
+            with self.store.transaction():
+                conditions = ["tenant = ?"]
+                parameters: list[Any] = [tenant]
+                if cursor is not None:
+                    conditions.append("id > ?")
+                    parameters.append(cursor)
+                query = (
+                    "SELECT id FROM workflows WHERE "
+                    + " AND ".join(conditions)
+                    + " ORDER BY id ASC"
+                )
+                if limit is not None:
+                    query += " LIMIT ?"
+                    parameters.append(limit)
+                rows = self.store.connection.execute(query, parameters).fetchall()
+                return {"workflows": [{"id": row["id"]} for row in rows]}
+
     def _load_workflow(
         self, workflow_id: str, tenant: str, version: str | None = None
     ) -> tuple[dict[str, Any], str | None]:
@@ -1330,6 +1369,75 @@ class ChronicleFlow:
             state = self.store.decode(row["state"])
             self._maybe_timeout(execution_id, state, tenant)
             return state
+
+    def list_executions(
+        self,
+        tenant: str = DEFAULT_TENANT,
+        workflow_id: str | None = None,
+        status: str | None = None,
+        termination_reason: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Enumerate the namespace's executions in ascending identifier order.
+
+        Read-only: it appends no events, writes no checkpoints or usage
+        records, and never settles a due timeout, so a repeated query returns
+        the same answer and stored state is unchanged. Filters combine as an
+        intersection: ``workflow_id`` keeps one workflow's executions,
+        ``status`` keeps one lifecycle status, and ``termination_reason``
+        keeps executions that terminated for exactly that reason. The reason
+        filter only matches terminated executions, so running and completed
+        executions never appear under it even combined with other filters.
+        ``cursor`` is the previous page's last execution identifier: the page
+        holds only strictly greater identifiers, and ``limit`` caps its size,
+        so consecutive pages neither overlap nor skip.
+        """
+        with self._operation():
+            with self.store.transaction():
+                # A filter naming a workflow the namespace cannot see is the
+                # usual missing resource and reveals nothing about other
+                # tenants' workflows.
+                if workflow_id is not None:
+                    self._assert_workflow_exists(workflow_id, tenant)
+                conditions = ["tenant = ?"]
+                parameters: list[Any] = [tenant]
+                if workflow_id is not None:
+                    conditions.append("workflow_id = ?")
+                    parameters.append(workflow_id)
+                if cursor is not None:
+                    conditions.append("id > ?")
+                    parameters.append(cursor)
+                query = (
+                    "SELECT id, state FROM executions WHERE "
+                    + " AND ".join(conditions)
+                    + " ORDER BY id ASC"
+                )
+                rows = self.store.connection.execute(query, parameters).fetchall()
+                executions: list[dict[str, Any]] = []
+                for row in rows:
+                    state = self.store.decode(row["state"])
+                    if status is not None and state.get("status") != status:
+                        continue
+                    if termination_reason is not None:
+                        # The reason filter is meaningful only for terminated
+                        # executions: running and completed ones carry no
+                        # termination reason and never match it.
+                        if state.get("status") != "terminated":
+                            continue
+                        if state.get("termination_reason") != termination_reason:
+                            continue
+                    executions.append(
+                        {
+                            "id": state["id"],
+                            "workflow_id": state["workflow_id"],
+                            "status": state["status"],
+                            "termination_reason": state.get("termination_reason"),
+                        }
+                    )
+                    if limit is not None and len(executions) >= limit:
+                        break
+                return {"executions": executions}
 
     def _maybe_timeout(self, execution_id: str, state: dict[str, Any], tenant: str) -> None:
         deadline = state.get("deadline_at")
