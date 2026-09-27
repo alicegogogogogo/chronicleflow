@@ -13,6 +13,7 @@ from .service import (
     EVENT_TYPES,
     EXECUTION_STATUSES,
     TERMINATION_REASONS,
+    USAGE_TYPES,
     ChronicleFlow,
     _parse_timestamp,
 )
@@ -28,10 +29,11 @@ WINDOW_QUERY_PARAMETERS = ("since", "until")
 # error exactly like an unknown field.
 EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
 
-# The only query parameters the per-record usage query accepts: a closed time
-# window and cursor pagination, exactly like the events query minus its type
-# set. Anything else is a validation error exactly like an unknown field.
-USAGE_RECORDS_QUERY_PARAMETERS = ("since", "until", "cursor", "limit")
+# The only query parameters the per-record usage query accepts: an optional
+# metered-type set, a closed time window, and cursor pagination, exactly like
+# the events query. Anything else is a validation error exactly like an
+# unknown field.
+USAGE_RECORDS_QUERY_PARAMETERS = ("type", "since", "until", "cursor", "limit")
 
 # The only query parameter the schedule preview accepts: the number of
 # projected trigger times. Anything else is a validation error exactly like
@@ -166,6 +168,8 @@ class Handler(BaseHTTPRequestHandler):
     def _usage_records_query(self) -> dict[str, Any]:
         """Parse the filter and pagination parameters of the usage records query.
 
+        ``type`` is a single metered type or a comma-separated set of them,
+        without empty or duplicate entries and naming only known types;
         ``since`` and ``until`` are ISO-8601 UTC timestamps ending in Z, and
         ``cursor`` and ``limit`` are positive integers. Every parameter may
         appear at most once, and any other parameter is a 400
@@ -182,7 +186,19 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValidationError(f"query parameter {name} must appear at most once")
         if "limit" not in query:
             raise ValidationError("query parameter limit is required")
+        types = None
+        if "type" in query:
+            entries = query["type"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError("type must be a comma-separated set of metered types without empty entries")
+            if len(set(entries)) != len(entries):
+                raise ValidationError("type must not contain duplicate metered types")
+            unknown_types = [entry for entry in entries if entry not in USAGE_TYPES]
+            if unknown_types:
+                raise ValidationError(f"unknown metered type: {unknown_types[0]}")
+            types = tuple(entries)
         parsed: dict[str, Any] = {
+            "types": types,
             "since": _parse_timestamp(query["since"][0], "since") if "since" in query else None,
             "until": _parse_timestamp(query["until"][0], "until") if "until" in query else None,
             "cursor": _positive_integer(query["cursor"][0], "cursor") if "cursor" in query else None,
