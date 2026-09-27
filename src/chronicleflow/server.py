@@ -28,6 +28,11 @@ WINDOW_QUERY_PARAMETERS = ("since", "until")
 # error exactly like an unknown field.
 EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
 
+# The only query parameters the usage records query accepts: a closed time
+# window and cursor pagination. Anything else is a validation error exactly
+# like an unknown field.
+USAGE_RECORDS_QUERY_PARAMETERS = ("since", "until", "cursor", "limit")
+
 # The only query parameter the schedule preview accepts: the number of
 # projected trigger times. Anything else is a validation error exactly like
 # an unknown field.
@@ -158,6 +163,34 @@ class Handler(BaseHTTPRequestHandler):
                 parsed[name] = _positive_integer(query[name][0], name)
         return parsed
 
+    def _usage_records_query(self) -> dict[str, Any]:
+        """Parse the window and pagination parameters of the usage records query.
+
+        ``since`` and ``until`` are the same closed-interval ISO-8601 UTC
+        timestamps the usage query accepts; ``limit`` is required and a
+        positive integer; ``cursor`` is an optional positive-integer record
+        sequence. Every parameter may appear at most once, and any other
+        parameter — or a missing, repeated, or malformed value — is a 400
+        validation_error that writes nothing.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in USAGE_RECORDS_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in USAGE_RECORDS_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        if "limit" not in query:
+            raise ValidationError("query parameter limit is required")
+        parsed: dict[str, Any] = {"limit": _positive_integer(query["limit"][0], "limit")}
+        if "cursor" in query:
+            parsed["cursor"] = _positive_integer(query["cursor"][0], "cursor")
+        if "since" in query:
+            parsed["since"] = _parse_timestamp(query["since"][0], "since")
+        if "until" in query:
+            parsed["until"] = _parse_timestamp(query["until"][0], "until")
+        return parsed
+
     def _preview_limit(self) -> int:
         """Parse the required limit parameter of the schedule preview query.
 
@@ -277,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["usage"]:
             since, until = self._window()
             return 200, self.service.usage(self._tenant(), since, until)
+        if self.command == "GET" and parts == ["usage", "records"]:
+            return 200, self.service.usage_records(self._tenant(), **self._usage_records_query())
         if self.command == "GET" and parts == ["bill"]:
             since, until = self._window()
             return 200, self.service.bill(self._tenant(), since, until)

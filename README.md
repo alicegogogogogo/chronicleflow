@@ -254,6 +254,54 @@ bill data follow the usual tenant isolation, so one tenant can never see
 another's records in any window, and another tenant's records never affect
 this tenant's counts or totals.
 
+### Usage records
+
+```http
+GET /usage/records?limit=50
+X-Tenant-Id: acme
+```
+
+Returns the tenant's individual metered records, so each billing line can be
+traced to the exact action that caused it:
+
+```json
+{"records":[
+  {"sequence":1,"type":"workflow_created","occurred_at":"2026-09-26T08:00:00.000000Z"},
+  {"sequence":2,"type":"execution_started","occurred_at":"2026-09-26T08:00:01.000000Z"}
+]}
+```
+
+Records are ordered by ascending occurrence time, ties broken by ascending
+sequence; each record gives its stable positive-integer `sequence`, the
+metered `type`, and the `occurred_at` ISO-8601 UTC timestamp ending in `Z`.
+A tenant with no records gets the definite empty result `{"records":[]}`.
+
+The query accepts the same optional `since`/`until` closed-interval window
+the usage and bill queries accept, plus keyset pagination:
+
+```http
+GET /usage/records?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+X-Tenant-Id: acme
+```
+
+- `limit` is required and must be a positive integer; a page holds at most
+  that many records;
+- `cursor` is the sequence of the previous page's last record, so a page
+  holds only records with a strictly greater sequence; consecutive pages
+  neither overlap nor skip;
+- the time window and pagination combine as an intersection, and sequences
+  are never renumbered by filtering;
+- a malformed timestamp, a non-positive `limit` or `cursor`, a missing
+  `limit`, a repeated parameter, or any unknown query parameter is a
+  `400 validation_error` that writes nothing.
+
+The query is read-only: it appends no usage records, writes no events, and
+changes no metering or billing conclusion, so recorded usage and bills are
+the same whether or not the records query runs. It is tenant-scoped exactly
+like the usage query: a missing or empty `X-Tenant-Id` is a
+`400 validation_error`, and another tenant's records are never visible in
+any window or page.
+
 ### Operational metrics
 
 ```http
