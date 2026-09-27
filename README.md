@@ -1016,6 +1016,37 @@ ordered event stream. The third returns the ordered checkpoints; each entry
 gives its `sequence`, the `event_sequence` position it was taken at, the full
 `state` summary, and `created_at`.
 
+The events query is read-only: it appends no events, records no usage, and
+changes no state, so advancement, approvals, recovery, and replay never alter
+what it observes. With no query parameters it returns the complete ordered
+event list exactly as before. It also accepts optional filter and pagination
+parameters, which combine as an intersection:
+
+```http
+GET /executions/run-1/events?types=node_completed,node_failed&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `types` — a comma-separated set of event types; only events whose type is
+  in the set are returned. An empty entry, a duplicate entry, or an unknown
+  event type is a `400 validation_error`;
+- `since` and `until` — the same closed-interval occurrence-time bounds the
+  metrics query accepts: an event whose time equals either boundary is
+  returned. When `since` is later than `until` the window matches nothing and
+  the result is an empty list, not an error;
+- `cursor` — the sequence of the last event of the previous page; only events
+  with a strictly greater sequence are returned;
+- `limit` — the maximum number of events in the page, in ascending sequence
+  order.
+
+Every parameter may appear at most once; a repeated parameter, an unknown
+parameter, a malformed timestamp, or a cursor or limit that is not a positive
+integer is a `400 validation_error` that writes nothing. Filtering never
+renumbers events, so paging with `cursor` set to the previous page's last
+sequence yields consecutive pages that neither overlap nor skip. A filter
+that matches nothing returns the definite empty result `{"events":[]}`, and
+querying a missing or another tenant's execution is the usual
+`404 not_found`.
+
 ### Webhook notifications
 
 Subscriptions declared on a workflow or an execution deliver outbound webhook

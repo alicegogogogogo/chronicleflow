@@ -19,6 +19,31 @@ from .store import Store
 
 logger = logging.getLogger("chronicleflow")
 
+# Every event type the service can append to an execution's event stream, in
+# alphabetical order. The events query's type filter validates against this
+# set; an unknown type is a validation error.
+EVENT_TYPES = (
+    "approval_decided",
+    "approval_requested",
+    "condition_evaluated",
+    "execution_completed",
+    "execution_started",
+    "execution_terminated",
+    "instance_deleted",
+    "instance_modified",
+    "iteration_started",
+    "loop_completed",
+    "loop_condition_evaluated",
+    "map_completed",
+    "map_expanded",
+    "map_reexpanded",
+    "node_completed",
+    "node_failed",
+    "node_retried",
+    "node_skipped",
+    "version_migrated",
+)
+
 
 def _parse_timestamp(value: str | None, field: str) -> datetime | None:
     """Parse an ISO-8601 UTC timestamp ending in Z; absent means no boundary."""
@@ -1330,17 +1355,48 @@ class ChronicleFlow:
             payload.update(extra)
         self._append(execution_id, "execution_terminated", payload, tenant)
 
-    def events(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> list[dict[str, Any]]:
+    def events(
+        self,
+        execution_id: str,
+        tenant: str = DEFAULT_TENANT,
+        types: tuple[str, ...] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the execution's ordered event stream, optionally filtered and paged.
+
+        The query is read-only: it appends no events and records no usage.
+        ``types`` keeps only events whose type is in the set; ``since`` and
+        ``until`` bound a closed interval on each event's occurrence time (a
+        window with ``since`` later than ``until`` simply matches nothing);
+        ``cursor`` keeps only events with a sequence strictly greater than it;
+        ``limit`` caps the page at that many events. Filters combine as an
+        intersection and sequences are never renumbered, so consecutive pages
+        neither overlap nor skip. With no arguments the full ordered stream is
+        returned exactly as before.
+        """
         self.get_execution(execution_id, tenant)
         rows = self.store.connection.execute(
             "SELECT sequence, type, payload, occurred_at FROM events "
             "WHERE tenant = ? AND execution_id = ? ORDER BY sequence",
             (tenant, execution_id),
         ).fetchall()
-        return [
-            {"sequence": row["sequence"], "type": row["type"], "payload": self.store.decode(row["payload"]), "occurred_at": row["occurred_at"]}
-            for row in rows
-        ]
+        events = []
+        for row in rows:
+            if types is not None and row["type"] not in types:
+                continue
+            if not self._within_window(_parse_stored_time(row["occurred_at"]), since, until):
+                continue
+            if cursor is not None and row["sequence"] <= cursor:
+                continue
+            events.append(
+                {"sequence": row["sequence"], "type": row["type"], "payload": self.store.decode(row["payload"]), "occurred_at": row["occurred_at"]}
+            )
+            if limit is not None and len(events) >= limit:
+                break
+        return events
 
     def advance(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT

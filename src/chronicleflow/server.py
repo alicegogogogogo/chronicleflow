@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
-from .service import ChronicleFlow, _parse_timestamp
+from .service import EVENT_TYPES, ChronicleFlow, _parse_timestamp
 
 TENANT_HEADER = "X-Tenant-Id"
 
@@ -17,12 +17,27 @@ TENANT_HEADER = "X-Tenant-Id"
 # accept; anything else is a validation error exactly like an unknown field.
 METRICS_QUERY_PARAMETERS = ("since", "until")
 
+# The only query parameters the execution events query accepts: a type set, a
+# closed time window, and cursor pagination. Anything else is a validation
+# error exactly like an unknown field.
+EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
+
 # A response rendered as a non-JSON text body (the Prometheus export).
 TextResponse = namedtuple("TextResponse", ("content_type", "body"))
 
 
 def _reject_non_finite(constant: str) -> Any:
     raise ValidationError(f"request body must not contain {constant}")
+
+
+def _positive_integer(raw: str, name: str) -> int:
+    """Parse a query parameter that must be a positive integer."""
+    if not raw or not all(character in "0123456789" for character in raw):
+        raise ValidationError(f"{name} must be a positive integer")
+    value = int(raw)
+    if value < 1:
+        raise ValidationError(f"{name} must be a positive integer")
+    return value
 
 
 def _assert_finite(value: Any) -> None:
@@ -79,6 +94,42 @@ class Handler(BaseHTTPRequestHandler):
             _parse_timestamp(query.get("since", [None])[0], "since"),
             _parse_timestamp(query.get("until", [None])[0], "until"),
         )
+
+    def _events_query(self) -> dict[str, Any]:
+        """Parse the optional filter and pagination parameters of the events query.
+
+        ``types`` is a comma-separated set of known event types without empty
+        or duplicate entries; ``since`` and ``until`` are ISO-8601 UTC
+        timestamps ending in Z; ``cursor`` and ``limit`` are positive
+        integers. Every parameter may appear at most once, and any other
+        parameter is a 400 validation_error, as is any malformed value.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in EVENTS_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in EVENTS_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        parsed: dict[str, Any] = {}
+        if "types" in query:
+            entries = query["types"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError("types must be a comma-separated set of event types without empty entries")
+            if len(set(entries)) != len(entries):
+                raise ValidationError("types must not contain duplicate event types")
+            unknown_types = [entry for entry in entries if entry not in EVENT_TYPES]
+            if unknown_types:
+                raise ValidationError(f"unknown event type: {unknown_types[0]}")
+            parsed["types"] = tuple(entries)
+        if "since" in query:
+            parsed["since"] = _parse_timestamp(query["since"][0], "since")
+        if "until" in query:
+            parsed["until"] = _parse_timestamp(query["until"][0], "until")
+        for name in ("cursor", "limit"):
+            if name in query:
+                parsed[name] = _positive_integer(query[name][0], name)
+        return parsed
 
     def _body(self) -> Any:
         content_type = self.headers.get("Content-Type", "")
@@ -150,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "executions" and self.command == "GET":
             return 200, self.service.get_execution(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "events" and self.command == "GET":
-            return 200, {"events": self.service.events(parts[1], self._tenant())}
+            return 200, {"events": self.service.events(parts[1], self._tenant(), **self._events_query())}
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "checkpoints" and self.command == "GET":
             return 200, self.service.checkpoints(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "deliveries" and self.command == "GET":
