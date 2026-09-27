@@ -9,7 +9,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .errors import ChronicleFlowError, NotFoundError, ValidationError
-from .service import EVENT_TYPES, ChronicleFlow, _parse_timestamp
+from .service import (
+    EVENT_TYPES,
+    EXECUTION_STATUSES,
+    TERMINATION_REASONS,
+    ChronicleFlow,
+    _parse_timestamp,
+)
 
 TENANT_HEADER = "X-Tenant-Id"
 
@@ -26,6 +32,12 @@ EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
 # projected trigger times. Anything else is a validation error exactly like
 # an unknown field.
 PREVIEW_QUERY_PARAMETERS = ("limit",)
+
+# The list queries share keyset pagination (a cursor identifier and a page
+# size). The workflows list accepts nothing else; the executions list also
+# takes a workflow identifier, a lifecycle status, and a termination reason.
+LIST_QUERY_PARAMETERS = ("cursor", "limit")
+EXECUTIONS_QUERY_PARAMETERS = ("workflow_id", "status", "termination_reason", "cursor", "limit")
 
 # A response rendered as a non-JSON text body (the Prometheus export).
 TextResponse = namedtuple("TextResponse", ("content_type", "body"))
@@ -153,6 +165,60 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError("query parameter limit is required")
         return _positive_integer(query["limit"][0], "limit")
 
+    def _list_query(self, parameters: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, list[str]]]:
+        """Parse the shared cursor/limit pagination of the enumeration queries.
+
+        ``limit`` is required and a positive integer; ``cursor`` is an opaque
+        identifier and may appear at most once, as may every accepted
+        parameter. A missing or non-positive limit, a repeated parameter, or
+        any other parameter is a 400 validation_error that writes nothing.
+        Returns the parsed pagination and the raw query map so callers can
+        validate their own filter values.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in parameters]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in parameters:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        if "limit" not in query:
+            raise ValidationError("query parameter limit is required")
+        cursor = query["cursor"][0] if "cursor" in query else None
+        if cursor is not None and not cursor:
+            raise ValidationError("cursor must be a non-empty identifier")
+        parsed: dict[str, Any] = {
+            "cursor": cursor,
+            "limit": _positive_integer(query["limit"][0], "limit"),
+        }
+        return parsed, query
+
+    def _workflows_list_query(self) -> dict[str, Any]:
+        return self._list_query(LIST_QUERY_PARAMETERS)[0]
+
+    def _executions_list_query(self) -> dict[str, Any]:
+        """Parse the executions list filters together with its pagination.
+
+        ``status`` must name a lifecycle status and ``termination_reason`` a
+        termination reason; an unknown value is a 400 validation_error. A
+        ``workflow_id`` filter is checked against the namespace by the
+        service, where a missing or another tenant's workflow is a 404.
+        """
+        parsed, query = self._list_query(EXECUTIONS_QUERY_PARAMETERS)
+        workflow_id = query["workflow_id"][0] if "workflow_id" in query else None
+        if workflow_id is not None and not workflow_id:
+            raise ValidationError("workflow_id must be a non-empty string")
+        parsed["workflow_id"] = workflow_id
+        status = query["status"][0] if "status" in query else None
+        if status is not None and status not in EXECUTION_STATUSES:
+            raise ValidationError(f"unknown execution status: {status}")
+        parsed["status"] = status
+        reason = query["termination_reason"][0] if "termination_reason" in query else None
+        if reason is not None and reason not in TERMINATION_REASONS:
+            raise ValidationError(f"unknown termination reason: {reason}")
+        parsed["termination_reason"] = reason
+        return parsed
+
     def _body(self) -> Any:
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -208,6 +274,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         if self.command == "POST" and parts == ["workflows"]:
             return 201, self.service.create_workflow(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "GET" and parts == ["workflows"]:
+            return 200, self.service.list_workflows(self._tenant(), **self._workflows_list_query())
         if len(parts) == 2 and parts[0] == "workflows" and self.command == "GET":
             return 200, self.service.get_workflow(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
@@ -222,6 +290,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.resume_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "POST" and parts == ["executions"]:
             return 201, self.service.create_execution(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "GET" and parts == ["executions"]:
+            return 200, self.service.list_executions(self._tenant(), **self._executions_list_query())
         if len(parts) == 2 and parts[0] == "executions" and self.command == "GET":
             return 200, self.service.get_execution(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "executions" and parts[2] == "events" and self.command == "GET":
