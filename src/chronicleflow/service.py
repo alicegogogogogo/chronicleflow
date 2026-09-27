@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -61,6 +61,11 @@ def _parse_timestamp(value: str | None, field: str) -> datetime | None:
 def _parse_stored_time(value: str) -> datetime:
     """Parse a timestamp the service itself stored (always a UTC value ending in Z)."""
     return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
+def _iso_utc(epoch_seconds: float) -> str:
+    """Render epoch seconds as an ISO-8601 UTC timestamp string ending in Z."""
+    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _prometheus_label(value: str) -> str:
@@ -1960,6 +1965,52 @@ class ChronicleFlow:
                 return self._schedule_status(self._schedule_row(workflow_id, tenant))
 
     @staticmethod
+    def _preview_points(document: dict[str, Any], anchor: float, cursor: str, limit: int) -> list[float]:
+        """Project up to ``limit`` trigger times from the first unsettled period.
+
+        A fixed interval projects continuously from the next unsettled index;
+        a cron plan takes the next minute matching its field rules, then the
+        one after that, and so on. An unreachable cron expression simply
+        yields fewer points.
+        """
+        if "interval_seconds" in document:
+            interval = document["interval_seconds"]
+            consumed = int(cursor) if cursor else 0
+            return [anchor + (consumed + offset) * interval for offset in range(1, limit + 1)]
+        cron = Cron.parse(document["cron"])
+        candidate = int(cursor) if cursor else cron.next_after(anchor)
+        points: list[float] = []
+        while candidate is not None and len(points) < limit:
+            points.append(float(candidate))
+            candidate = cron.next_after(candidate)
+        return points
+
+    def schedule_preview(self, workflow_id: str, limit: int, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
+        """Project the next trigger times of a declared schedule, read-only.
+
+        The projection starts at the first unsettled period — the schedule's
+        cursor — and follows the plan from there. It creates no execution,
+        appends no event, and never moves the cursor; a paused schedule
+        projects exactly like a running one, and the missed policy only
+        governs due-time creation, never the projection.
+        """
+        with self._operation():
+            self._assert_workflow_exists(workflow_id, tenant)
+            row = self._schedule_row(workflow_id, tenant)
+            if row is None:
+                # A workflow without a declared schedule has a definite empty
+                # result, exactly like the status query.
+                return {"schedule": None}
+            document = self.store.decode(row["document"])
+            points = self._preview_points(document, row["anchor_at"], row["cursor"], limit)
+            return {
+                "schedule": document,
+                "previews": [
+                    {"trigger_at": _iso_utc(epoch), "input": document["input"]} for epoch in points
+                ],
+            }
+
+    @staticmethod
     def _empty_body(raw: Any, operation: str) -> None:
         if not isinstance(raw, dict) or raw:
             raise ValidationError(f"{operation} body must be an empty object")
@@ -2375,7 +2426,8 @@ class ChronicleFlow:
         """
         source_output = container["outputs"].get(map_node.source)
         if map_node.source in container["skipped_nodes"]:
-            # A skipped source task never recorded an output; expand zero.
+            # A skipped source task never recorded an output, so the map
+            # expands to zero instances.
             elements: Any = None
         else:
             elements = _resolve_path(source_output, map_node.path) if source_output is not None else None

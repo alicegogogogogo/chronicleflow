@@ -50,8 +50,9 @@ The initial release intentionally supports a compact public contract:
 - a workflow may declare a schedule — a fixed interval in seconds or a
   five-field cron plan — and the service automatically creates one execution
   per due period with the declared input; schedules can be paused and
-  resumed, and periods missed while paused are either caught up once or
-  skipped, according to the declared missed policy.
+  resumed, periods missed while paused are either caught up once or
+  skipped, according to the declared missed policy, and a read-only preview
+  query projects the upcoming trigger times and their inputs.
 
 ## Requirements
 
@@ -1297,6 +1298,46 @@ The fields are:
 
 `last_triggered_at` and `last_execution_id` are `null` (not omitted) until
 the first trigger. A missing workflow returns 404 `not_found`.
+
+### Preview upcoming triggers
+
+```http
+GET /workflows/nightly-orders/schedule/preview?limit=3
+```
+
+Returns the trigger times the declared plan would settle next, starting
+from the first period that has not been settled yet, together with the
+input each created execution would carry:
+
+```json
+{
+  "schedule": {"interval_seconds": 3600, "input": {"mode": "nightly"}, "missed_policy": "catch_up"},
+  "previews": [
+    {"trigger_at": "2026-09-27T09:00:00.000000Z", "input": {"mode": "nightly"}},
+    {"trigger_at": "2026-09-27T10:00:00.000000Z", "input": {"mode": "nightly"}},
+    {"trigger_at": "2026-09-27T11:00:00.000000Z", "input": {"mode": "nightly"}}
+  ]
+}
+```
+
+- `schedule`: the declared plan exactly as stored, like the status query;
+- `previews`: up to `limit` entries in ascending time order, each carrying
+  `trigger_at` (an ISO-8601 UTC timestamp string ending in `Z`) and `input`
+  (the declared input object verbatim).
+
+A fixed interval projects continuously from the next unsettled period; a
+cron plan takes the next minute matching its field rules, then the one
+after that, and so on. The `limit` query parameter is required, must be a
+positive integer, and may appear at most once; a missing, repeated, or
+malformed value — or any other query parameter — is a 400
+`validation_error`. The preview is read-only: it creates no execution,
+appends no event, and never moves the schedule's cursor, so repeating the
+query returns the same projection. A paused schedule projects exactly like
+a running one — the missed policy only governs whether a due period
+creates an execution, never the projection. A workflow that never declared
+a schedule returns the definite empty result `{"schedule":null}`, exactly
+like the status query; a missing or cross-tenant workflow returns 404
+`not_found`.
 
 ### Pause and resume a schedule
 
