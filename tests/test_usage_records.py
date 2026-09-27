@@ -160,6 +160,81 @@ class UsageRecordsServiceTests(unittest.TestCase):
         self.assertEqual({2, 3, 1}, {record["sequence"] for record in acme})
         self.assertTrue(all(record["type"] for record in acme))
 
+    def test_type_filter_keeps_only_matching_types(self):
+        self._three_records()
+        records = self.service.usage_records("acme", types=("execution_started",))["records"]
+        self.assertEqual([2, 3], [record["sequence"] for record in records])
+        self.assertEqual(["execution_started", "execution_started"], [record["type"] for record in records])
+        records = self.service.usage_records("acme", types=("workflow_created",))["records"]
+        self.assertEqual([1], [record["sequence"] for record in records])
+        records = self.service.usage_records(
+            "acme", types=("workflow_created", "execution_started")
+        )["records"]
+        self.assertEqual([2, 3, 1], [record["sequence"] for record in records])
+
+    def test_type_filter_with_no_match_is_a_definite_empty_list(self):
+        self._three_records()
+        self.assertEqual(
+            {"records": []},
+            self.service.usage_records("acme", types=("schedule_triggered",)),
+        )
+
+    def test_type_filter_does_not_renumber_sequences(self):
+        self._three_records()
+        records = self.service.usage_records("acme", types=("workflow_created",))["records"]
+        self.assertEqual([1], [record["sequence"] for record in records])
+
+    def test_type_filter_combines_with_window_and_pagination(self):
+        self._three_records()
+        page = self.service.usage_records(
+            "acme", since=_ts(T0), until=_ts(T0), types=("execution_started",), cursor=2, limit=10
+        )["records"]
+        self.assertEqual([3], [record["sequence"] for record in page])
+        page = self.service.usage_records(
+            "acme", types=("execution_started",), limit=1
+        )["records"]
+        self.assertEqual([2], [record["sequence"] for record in page])
+
+    def test_filtered_pages_cover_every_hit_once(self):
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "acme")
+        self.service.create_execution({"id": "r1", "workflow_id": "wf", "input": {}}, "r1", "acme")
+        self.service.create_execution({"id": "r2", "workflow_id": "wf", "input": {}}, "r2", "acme")
+        collected = []
+        cursor = None
+        while True:
+            page = self.service.usage_records(
+                "acme", types=("execution_started",), cursor=cursor, limit=1
+            )["records"]
+            if not page:
+                break
+            collected.extend(page)
+            cursor = page[-1]["sequence"]
+        self.assertEqual([2, 3], [record["sequence"] for record in collected])
+        self.assertEqual(
+            self.service.usage_records("acme", types=("execution_started",))["records"],
+            collected,
+        )
+
+    def test_type_filter_is_read_only(self):
+        self._three_records()
+        before = self.service.usage("acme")
+        self.service.usage_records("acme", types=("execution_started",))
+        self.assertEqual(before, self.service.usage("acme"))
+        rows = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS used FROM usage_records WHERE tenant = 'acme'"
+        ).fetchone()
+        self.assertEqual(3, rows["used"])
+
+    def test_type_filter_keeps_tenant_isolation(self):
+        self._three_records()
+        self.service.create_workflow({"id": "wf-b", "nodes": TASK}, "wf-b", "beta")
+        # Beta sees only its own record under the filter, never acme's.
+        beta = self.service.usage_records("beta", types=("workflow_created", "execution_started"))["records"]
+        self.assertEqual([1], [record["sequence"] for record in beta])
+        self.assertEqual(["workflow_created"], [record["type"] for record in beta])
+        acme = self.service.usage_records("acme", types=("execution_started",))["records"]
+        self.assertEqual([2, 3], [record["sequence"] for record in acme])
+
 
 class UsageRecordsHttpTests(unittest.TestCase):
     @classmethod
@@ -278,6 +353,68 @@ class UsageRecordsHttpTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual({"records": []}, json.loads(data))
 
+    def test_type_filter_over_http(self):
+        headers = {"X-Tenant-Id": "records-typed"}
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        connection.request(
+            "POST",
+            "/workflows",
+            json.dumps({"id": "wf-t", "nodes": TASK}),
+            {"Content-Type": "application/json", "Idempotency-Key": "wf-t", **headers},
+        )
+        self.assertEqual(201, connection.getresponse().status)
+        connection.close()
+        for index in range(2):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port)
+            connection.request(
+                "POST",
+                "/executions",
+                json.dumps({"id": f"r-t{index}", "workflow_id": "wf-t", "input": {}}),
+                {"Content-Type": "application/json", "Idempotency-Key": f"r-t{index}", **headers},
+            )
+            self.assertEqual(201, connection.getresponse().status)
+            connection.close()
+        # A single type keeps only its records, with sequences unrenumbered.
+        status, data = self.call("/usage/records?limit=10&type=execution_started", headers=headers)
+        self.assertEqual(200, status)
+        records = json.loads(data)["records"]
+        self.assertEqual([2, 3], [record["sequence"] for record in records])
+        self.assertEqual(["execution_started", "execution_started"], [record["type"] for record in records])
+        for record in records:
+            self.assertEqual(["sequence", "type", "occurred_at"], list(record))
+        # A comma-separated set keeps the union, still time-ordered.
+        status, data = self.call(
+            "/usage/records?limit=10&type=workflow_created,execution_started", headers=headers
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([1, 2, 3], [record["sequence"] for record in json.loads(data)["records"]])
+        # A type with no records is a definite empty list, not an error.
+        status, data = self.call("/usage/records?limit=10&type=delivery_attempted", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"records": []}, json.loads(data))
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        # The filter intersects with cursor pagination without overlap or gaps.
+        collected = []
+        query = "?limit=1&type=execution_started"
+        while True:
+            status, data = self.call("/usage/records" + query, headers=headers)
+            self.assertEqual(200, status)
+            page = json.loads(data)["records"]
+            if not page:
+                break
+            collected.extend(page)
+            query = f"?limit=1&type=execution_started&cursor={page[-1]['sequence']}"
+        self.assertEqual([2, 3], [record["sequence"] for record in collected])
+
+    def test_type_validation_failure_writes_no_usage(self):
+        headers = {"X-Tenant-Id": "records-type-validation-empty"}
+        status, _ = self.call("/usage/records?limit=1&type=bogus_type", headers=headers)
+        self.assertEqual(400, status)
+        status, data = self.call("/usage/records?limit=5", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"records": []}, json.loads(data))
+
     def test_validation_failures(self):
         headers = {"X-Tenant-Id": "records-validation"}
         bad_paths = (
@@ -297,6 +434,16 @@ class UsageRecordsHttpTests(unittest.TestCase):
             "/usage/records?limit=1&bogus=1",
             "/usage/records?limit=1&limit=2",
             "/usage/records?since=2026-01-01T00:00:00.000Z&since=2026-02-01T00:00:00.000Z&limit=1",
+            "/usage/records?limit=1&type=",
+            "/usage/records?limit=1&type=,",
+            "/usage/records?limit=1&type=execution_started,",
+            "/usage/records?limit=1&type=,execution_started",
+            "/usage/records?limit=1&type=execution_started,,workflow_created",
+            "/usage/records?limit=1&type=execution_started,execution_started",
+            "/usage/records?limit=1&type=bogus_type",
+            "/usage/records?limit=1&type=execution_started,bogus_type",
+            "/usage/records?limit=1&type=node_completed",
+            "/usage/records?limit=1&type=execution_started&type=workflow_created",
         )
         for path in bad_paths:
             status, data = self.call(path, headers=headers)

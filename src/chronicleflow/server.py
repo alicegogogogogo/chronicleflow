@@ -13,6 +13,7 @@ from .service import (
     EVENT_TYPES,
     EXECUTION_STATUSES,
     TERMINATION_REASONS,
+    USAGE_TYPES,
     ChronicleFlow,
     _parse_timestamp,
 )
@@ -28,10 +29,11 @@ WINDOW_QUERY_PARAMETERS = ("since", "until")
 # error exactly like an unknown field.
 EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
 
-# The only query parameters the per-record usage query accepts: a closed time
-# window and cursor pagination, exactly like the events query minus its type
-# set. Anything else is a validation error exactly like an unknown field.
-USAGE_RECORDS_QUERY_PARAMETERS = ("since", "until", "cursor", "limit")
+# The only query parameters the per-record usage query accepts: a metered
+# type set, a closed time window, and cursor pagination, exactly like the
+# events query. Anything else is a validation error exactly like an unknown
+# field.
+USAGE_RECORDS_QUERY_PARAMETERS = ("type", "since", "until", "cursor", "limit")
 
 # The only query parameter the schedule preview accepts: the number of
 # projected trigger times. Anything else is a validation error exactly like
@@ -166,12 +168,13 @@ class Handler(BaseHTTPRequestHandler):
     def _usage_records_query(self) -> dict[str, Any]:
         """Parse the filter and pagination parameters of the usage records query.
 
-        ``since`` and ``until`` are ISO-8601 UTC timestamps ending in Z, and
-        ``cursor`` and ``limit`` are positive integers. Every parameter may
-        appear at most once, and any other parameter is a 400
-        validation_error, as is any malformed value. ``limit`` is required —
-        every page carries an explicit size cap — while ``cursor`` is omitted
-        on the first page.
+        ``type`` is a comma-separated set of known metered action types
+        without empty or duplicate entries; ``since`` and ``until`` are
+        ISO-8601 UTC timestamps ending in Z, and ``cursor`` and ``limit``
+        are positive integers. Every parameter may appear at most once, and
+        any other parameter is a 400 validation_error, as is any malformed
+        value. ``limit`` is required — every page carries an explicit size
+        cap — while ``cursor`` is omitted on the first page.
         """
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         unknown = [name for name in query if name not in USAGE_RECORDS_QUERY_PARAMETERS]
@@ -188,6 +191,16 @@ class Handler(BaseHTTPRequestHandler):
             "cursor": _positive_integer(query["cursor"][0], "cursor") if "cursor" in query else None,
             "limit": _positive_integer(query["limit"][0], "limit"),
         }
+        if "type" in query:
+            entries = query["type"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError("type must be a comma-separated set of usage types without empty entries")
+            if len(set(entries)) != len(entries):
+                raise ValidationError("type must not contain duplicate usage types")
+            unknown_types = [entry for entry in entries if entry not in USAGE_TYPES]
+            if unknown_types:
+                raise ValidationError(f"unknown usage type: {unknown_types[0]}")
+            parsed["types"] = tuple(entries)
         return parsed
 
     def _preview_limit(self) -> int:

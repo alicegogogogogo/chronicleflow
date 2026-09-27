@@ -793,14 +793,16 @@ class ChronicleFlow:
         until: datetime | None = None,
         cursor: int | None = None,
         limit: int | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        """Return the tenant's individual usage records, optionally windowed and paged.
+        """Return the tenant's individual usage records, optionally filtered and paged.
 
         The query is read-only: it appends no records, writes no events, and
         changes no metering or billing conclusion. Records are ordered by
         ascending occurrence time, with records sharing one instant ordered by
-        ascending sequence. ``since`` and ``until`` bound a closed interval on
-        each record's own occurrence time (a window with ``since`` later than
+        ascending sequence. ``types`` keeps only records of the given metered
+        action types; ``since`` and ``until`` bound a closed interval on each
+        record's own occurrence time (a window with ``since`` later than
         ``until`` simply matches nothing); ``cursor`` keeps only records with
         a sequence strictly greater than it; ``limit`` caps the page at that
         many records. Filters combine as an intersection and sequences are
@@ -817,6 +819,8 @@ class ChronicleFlow:
                 ).fetchall()
                 hits = []
                 for row in rows:
+                    if types is not None and row["type"] not in types:
+                        continue
                     occurred_at = _parse_stored_time(row["created_at"])
                     if not self._within_window(occurred_at, since, until):
                         continue

@@ -284,13 +284,19 @@ A tenant with no matching records gets the definite empty result
 `{"records":[]}`, never an error. The response ends with a single newline,
 like every other JSON endpoint.
 
-The endpoint accepts the same optional closed time window the events and
-usage queries accept, plus cursor pagination:
+The endpoint accepts an optional metered-type filter, the same optional
+closed time window the events and usage queries accept, plus cursor
+pagination:
 
 ```http
-GET /usage/records?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+GET /usage/records?type=execution_started,workflow_created&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
 ```
 
+- `type` is an optional comma-separated set of metered action type
+  identifiers — one identifier or several — and keeps only records of those
+  types. An empty entry, a duplicate entry, or an identifier that is not one
+  of the metered action types is a `400 validation_error` that reveals no
+  records;
 - `since` and `until` are ISO-8601 UTC timestamps ending in `Z` and bind a
   **closed** interval on each record's occurrence time: a record whose time
   equals either boundary is included. When either is absent the corresponding
@@ -301,18 +307,20 @@ GET /usage/records?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
 - `cursor` is the `sequence` of the previous page's last record; only records
   whose `sequence` is strictly greater are returned, so pages neither overlap
   nor skip. It is omitted on the first page and must be a positive integer;
-- the time window and pagination apply together as an intersection, and
-  filtering never changes a record's `sequence`.
+- the type filter, the time window, and pagination apply together as an
+  intersection, and filtering never changes a record's `sequence`, so
+  consecutive filtered pages neither overlap nor skip.
 
-A malformed timestamp, a missing or non-positive-integer `limit`, a
-non-positive-integer `cursor`, a repeated parameter, or any unknown query
-parameter is a `400 validation_error`. A missing or empty `X-Tenant-Id` is a
-`400 validation_error` that reveals no records. The query is read-only: it
-appends no usage records, writes no events, and changes no metering, prices,
-quotas, or billing conclusions. Records follow the usual tenant isolation, so
-another tenant's records are never visible under any window or page and never
-affect this tenant's result; replay and recovery leave every recorded
-sequence, time, and billing conclusion unchanged.
+A malformed timestamp, a malformed `type` set, a missing or
+non-positive-integer `limit`, a non-positive-integer `cursor`, a repeated
+parameter, or any unknown query parameter is a `400 validation_error`. A
+missing or empty `X-Tenant-Id` is a `400 validation_error` that reveals no
+records. The query is read-only: it appends no usage records, writes no
+events, and changes no metering, prices, quotas, or billing conclusions.
+Records follow the usual tenant isolation, so another tenant's records are
+never visible under any type filter, window, or page and never affect this
+tenant's result; replay and recovery leave every recorded sequence, time,
+and billing conclusion unchanged.
 
 ### Operational metrics
 
