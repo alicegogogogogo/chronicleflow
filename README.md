@@ -101,8 +101,8 @@ version is the usual `404 not_found`.
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
-modification, queue pulls, acknowledgements, and all history and status
-queries, as well as the usage, bill, and metrics queries. An empty
+modification and re-expansion, queue pulls, acknowledgements, and all
+history and status queries, as well as the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -611,7 +611,8 @@ instances and never repeats an instance output. Per-instance completions and
 failures count toward the existing node metrics under the template node id,
 and webhook and queue subscriptions receive instance events exactly like any
 other node event. Instance deletion and modification add their own
-`instance_deleted` and `instance_modified` events, described under
+`instance_deleted` and `instance_modified` events, and re-expansion adds a
+`map_reexpanded` event, described under
 "Delete and modify expanded instances" below.
 
 ### Maps inside loop bodies
@@ -675,9 +676,9 @@ state fields, event contents, and advancement results are unchanged.
 ### Delete and modify expanded instances
 
 An expanded dynamic node offers, alongside expansion and per-instance
-advancement, two instance-level operations. Both are ordinary idempotent
-HTTP commands over the same entry points the rest of the service uses; they
-introduce no second protocol.
+advancement, two instance-level operations and a node-level re-expansion.
+All three are ordinary idempotent HTTP commands over the same entry points
+the rest of the service uses; they introduce no second protocol.
 
 An instance that has never advanced can be removed, and so can an instance
 that has permanently failed:
@@ -723,6 +724,14 @@ immutable — modifying such an instance returns `409 conflict` and changes no
 state. The rewritten input, including its full float precision and `-0.0`,
 is stored verbatim.
 
+Delete and modify calls on the same instance settle in call order: every
+call applies to the instance list exactly as the earlier calls left it, and
+several calls on one instance each take effect independently, one after
+another. A rewritten instance has still never advanced, so it remains
+deletable; deleting or modifying an instance an earlier call already
+removed is a `404 not_found`; and a second rewrite of the same instance
+records the first rewrite's content as its `before`.
+
 Both commands apply to a map nested in a loop body exactly as to an
 execution-level map: the current running iteration's instances are
 addressed by the same path, and every event they append carries the owning
@@ -759,10 +768,62 @@ unfinished instances, repeats no instance output, and never resurrects a
 deleted instance. The operations change no advancement conclusion or
 termination semantics: cancellation, timeouts, approvals, leases, retries,
 and retry exhaustion keep their existing behavior. Executions that never
-use either operation keep exactly their current state fields, event
-contents, and advancement results. Interleaving a deletion and a
-modification on the same instance, re-expanding a map after a deletion, and
-modifying a node that is not a dynamic map are out of scope.
+use deletion, modification, or re-expansion keep exactly their current
+state fields, event contents, and advancement results.
+
+### Re-expand a dynamic node
+
+A dynamic node that has already expanded can be expanded again on demand —
+above all to regenerate its instance list after deletions:
+
+```http
+POST /executions/run-1/maps/ship/reexpand
+Idempotency-Key: reexpand-1
+
+{}
+```
+
+(The same operation is also accepted at `.../maps/ship/expand`.) The body
+must be an empty object. Re-expansion reads the element list again from the
+source task's recorded output — the same recorded output the first
+expansion read, which never changes once recorded — and regenerates the
+instance list from it: every previous instance record is replaced, and the
+fresh instances queue from element index zero in ascending order. The
+regenerated instances are ordinary instances in every respect: they are
+deleted, modified, advanced, retried, and approved through the same entries
+and with exactly the same behavior as a first expansion, and their retry
+bounds start from zero.
+
+Every successful call appends exactly one `map_reexpanded` event, recording
+the action type, the owning dynamic node under `map_id`, and the number of
+generated instances under `instance_count`; for a map inside a loop body
+the event also carries the owning `loop_id` and `iteration`, and only the
+current running iteration's expansion is replaced. A node that had
+completed returns to `running`: it leaves `completed_nodes`, its recorded
+output entry is discarded, and when the regenerated instances have all
+completed the node completes again under the existing rules, its result
+list holding only the finally retained instances' outputs in ascending
+element-index order. An empty element list completes the node again at
+once with an empty output list, exactly like a zero-element first
+expansion.
+
+Re-expansion is rejected with `409 conflict` and writes nothing when the
+node has not expanded yet, when it has permanently failed, when one of its
+instances is waiting on an approval decision, when the execution has
+already completed, or when a nested map's loop is not currently running.
+A terminated execution's unfinished node may still be re-expanded; doing so
+never revives the execution or alters its termination reason. A missing
+execution, a reference to a node that is not a dynamic `map`, or a
+cross-tenant reference is a `404 not_found` and writes nothing. A
+non-empty or non-object body, an unknown field, or a non-finite number is a
+`400 validation_error` with no partial write. Reusing an idempotency key
+from another operation is a `409 conflict`; repeating the same call with
+the same key returns the first result and appends no second event. Replay
+rebuilds the regenerated instance list, statuses, and ownership solely
+from the event stream, a checkpoint is written at the re-expansion
+boundary, and recovery after a restart continues the unfinished
+regenerated instances — repeating no instance output and never resurrecting
+an instance that stayed deleted.
 
 ### Workflow versions
 
@@ -1500,6 +1561,12 @@ waiting on an approval or already completed, or modifying any instance that
 has already advanced, is a conflict; a delete body that is not empty, a
 modify body without exactly an `input` object, and any unknown field or
 non-finite number are validation errors that write nothing.
+Re-expanding a node that is not a dynamic `map`, a missing execution, or a
+cross-tenant reference is likewise a missing resource; re-expanding a node
+that has not expanded yet, has permanently failed, has an instance waiting
+on an approval, belongs to a completed execution, or sits in a loop that is
+not currently running is a conflict; a re-expansion body that is not an
+empty object is a validation error that writes nothing.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that

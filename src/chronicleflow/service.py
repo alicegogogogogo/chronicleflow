@@ -2211,21 +2211,29 @@ class ChronicleFlow:
         source) rather than kept as extra state. The next failure is attempt
         ``count + 1``. A nested instance recurs with the same map id and
         index every iteration, so the loop context scopes the count to the
-        iteration the instance belongs to.
+        iteration the instance belongs to. A re-expansion replaces the whole
+        instance lineage, so only failures recorded after the latest
+        ``map_reexpanded`` event of the same expansion count: the regenerated
+        instances start their retry bounds from zero, exactly like a first
+        expansion.
         """
         rows = self.store.connection.execute(
-            "SELECT payload FROM events WHERE tenant = ? AND execution_id = ? AND type = 'node_failed'",
+            "SELECT type, payload FROM events WHERE tenant = ? AND execution_id = ? "
+            "AND type IN ('node_failed', 'map_reexpanded') ORDER BY sequence",
             (tenant, execution_id),
         ).fetchall()
         failures = 0
         for row in rows:
             payload = self.store.decode(row["payload"])
             if (
-                payload.get("map_id") == map_id
-                and payload.get("index") == index
-                and payload.get("loop_id") == loop_id
-                and payload.get("iteration") == iteration
+                payload.get("map_id") != map_id
+                or payload.get("loop_id") != loop_id
+                or payload.get("iteration") != iteration
             ):
+                continue
+            if row["type"] == "map_reexpanded":
+                failures = 0
+            elif payload.get("index") == index:
                 failures += 1
         return failures + 1
 
@@ -2477,7 +2485,7 @@ class ChronicleFlow:
                 return loop_id
         return None
 
-    # --- dynamic instance deletion and modification ----------------------
+    # --- dynamic instance deletion, modification, and re-expansion ------
 
     def _locate_map_state(
         self, workflow: Workflow, state: dict[str, Any], map_id: str, index: int
@@ -2666,6 +2674,118 @@ class ChronicleFlow:
 
         with self._operation():
             return self._idempotent(key, f"modify-instance:{execution_id}:{map_id}:{index}", apply, tenant)
+
+    def _locate_reexpand_target(
+        self, workflow: Workflow, state: dict[str, Any], map_id: str
+    ) -> tuple[Node, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Resolve a dynamic node for re-expansion: node, container, state, context.
+
+        An execution-level map lives in the execution's map records. A map
+        nested in a loop body can only be re-expanded inside its loop's
+        current running iteration: a loop that has not started holds no
+        expansion to replace, and a finished loop's recorded expansions are
+        concluded history, so both conflict rather than pretend the dynamic
+        node is missing. A node that is not a declared ``map`` is a missing
+        resource, exactly as for the instance-level operations.
+        """
+        node = next((item for item in workflow.nodes if item.id == map_id and item.kind == "map"), None)
+        if node is None:
+            raise NotFoundError(f"map node {map_id} was not found")
+        owner_loop = next(
+            (owner for owner, body in workflow.loop_bodies().items() if map_id in body), None
+        )
+        if owner_loop is None:
+            maps = state.get("maps") or {}
+            if map_id not in maps:
+                raise NotFoundError(f"map node {map_id} was not found")
+            return node, state, maps[map_id], {}
+        loop_state = state.get("loops", {}).get(owner_loop)
+        if loop_state is None:
+            raise NotFoundError(f"map node {map_id} was not found")
+        if loop_state["status"] != "running":
+            raise ConflictError(f"map {map_id} has no current expansion to re-expand")
+        iteration = loop_state["iterations"][-1]
+        map_state = (iteration.get("maps") or {}).get(map_id)
+        if map_state is None:
+            raise ConflictError(f"map {map_id} has no current expansion to re-expand")
+        return node, iteration, map_state, {"loop_id": owner_loop, "iteration": loop_state["current_iteration"]}
+
+    def reexpand_map(
+        self,
+        execution_id: str,
+        map_id: str,
+        raw: Any,
+        key: str | None,
+        tenant: str = DEFAULT_TENANT,
+    ) -> dict[str, Any]:
+        self._empty_body(raw, "reexpand map")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            map_node, container, map_state, context = self._locate_reexpand_target(workflow, state, map_id)
+            if state["status"] == "completed":
+                # A completed execution never reopens a finished node.
+                raise ConflictError(f"execution {execution_id} has already completed")
+            if map_state["status"] == "pending":
+                # Re-expansion replaces an existing expansion; a node that has
+                # never expanded expands on its own when its dependencies settle.
+                raise ConflictError(f"map {map_id} has not expanded yet")
+            if map_state["status"] == "failed":
+                # A permanently failed conclusion (and the execution's
+                # termination) is never reopened by a re-expansion.
+                raise ConflictError(f"map {map_id} has permanently failed")
+            if any(item["status"] == "waiting" for item in map_state["instances"]):
+                # An instance parked at an approval point may only be moved by
+                # a decision, so its expansion cannot be replaced.
+                raise ConflictError(f"map {map_id} has an instance waiting on an approval")
+            # The element list comes from the same recorded source output the
+            # first expansion read; that output is immutable once recorded, so
+            # the regenerated list matches the declared bound exactly as then.
+            source_output = container["outputs"].get(map_node.source)
+            if map_node.source in container["skipped_nodes"]:
+                elements: Any = None
+            else:
+                elements = _resolve_path(source_output, map_node.path) if source_output is not None else None
+            if not isinstance(elements, list):
+                elements = []
+            # Every previous instance record is replaced and the fresh
+            # instances queue from element index zero. A node that had
+            # completed returns to running: it leaves the completed list and
+            # its recorded output list is discarded, to be recorded again when
+            # the regenerated instances finish.
+            if map_id in container["completed_nodes"]:
+                container["completed_nodes"].remove(map_id)
+            container["outputs"].pop(map_id, None)
+            map_state["instances"] = [_new_map_instance(index) for index in range(len(elements))]
+            map_state["outputs"] = []
+            map_state["failure_reason"] = None
+            map_state["status"] = "running"
+            # The event records the action (its type), the owning dynamic
+            # node, and the generated instance count, plus the loop context
+            # for a map inside a loop body.
+            payload = {"map_id": map_id, "instance_count": len(elements)}
+            payload.update(context)
+            self._append(execution_id, "map_reexpanded", payload, tenant)
+            if not elements:
+                # An empty regeneration completes at once, exactly like a
+                # zero-element first expansion.
+                self._finish_map(execution_id, container, map_id, map_state, context, tenant)
+            if state["status"] == "running" and map_state["status"] == "completed":
+                # The immediate completion settles a node boundary: run the
+                # cascade so successors unlock as usual.
+                self._auto_process(execution_id, workflow, state, tenant)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            # The re-expansion settles an instance boundary: checkpoint it in
+            # the same transaction, exactly like an advance does.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(key, f"reexpand-map:{execution_id}:{map_id}", apply, tenant)
 
     def _launch_iteration(
         self,
@@ -3025,6 +3145,25 @@ class ChronicleFlow:
                 else:
                     rebuilt["outputs"][payload["map_id"]] = map_state["outputs"]
                     rebuilt["completed_nodes"].append(payload["map_id"])
+            elif event_type == "map_reexpanded" and rebuilt is not None:
+                # A re-expansion replaces the whole instance lineage: the
+                # regenerated instances queue from zero, earlier records are
+                # discarded, and a node that had completed leaves the
+                # completed list until the regenerated instances finish. The
+                # following map_completed event (for an empty regeneration)
+                # completes it again exactly as usual.
+                map_state = self._replay_map_state(rebuilt, payload)
+                map_state["instances"] = [_new_map_instance(index) for index in range(payload["instance_count"])]
+                map_state["outputs"] = []
+                map_state["failure_reason"] = None
+                map_state["status"] = "running"
+                if "loop_id" in payload:
+                    container = rebuilt["loops"][payload["loop_id"]]["iterations"][payload["iteration"] - 1]
+                else:
+                    container = rebuilt
+                if payload["map_id"] in container["completed_nodes"]:
+                    container["completed_nodes"].remove(payload["map_id"])
+                container["outputs"].pop(payload["map_id"], None)
             elif event_type == "instance_deleted" and rebuilt is not None:
                 # A removal drops the instance record while every retained
                 # instance keeps its index and order. When the removal empties
