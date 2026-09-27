@@ -1285,6 +1285,9 @@ class ChronicleFlow:
         maps = _declared_map_states(workflow)
         has_approvals = _has_approval_points(workflow)
         deadline = time.time() + timeout if timeout is not None else None
+        # The creation time is stamped once so the executions row and the
+        # execution_started event always carry the identical instant.
+        created_at = self.store.now()
         state = {
             "id": execution_id,
             "workflow_id": workflow_id,
@@ -1316,8 +1319,9 @@ class ChronicleFlow:
             state["version"] = bound_version
         try:
             self.store.connection.execute(
-                "INSERT INTO executions(tenant, id, workflow_id, state, workflow_version) VALUES (?, ?, ?, ?, ?)",
-                (tenant, execution_id, workflow_id, self.store.encode(state), bound_version),
+                "INSERT INTO executions(tenant, id, workflow_id, state, workflow_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (tenant, execution_id, workflow_id, self.store.encode(state), bound_version, created_at),
             )
         except Exception as error:
             if "UNIQUE constraint" in str(error):
@@ -1352,6 +1356,7 @@ class ChronicleFlow:
             "execution_started",
             started_payload,
             tenant,
+            occurred_at=created_at,
         )
         # An execution is metered once at creation; the same insert path backs
         # scheduled runs, which additionally record a schedule_triggered usage.
@@ -1376,6 +1381,8 @@ class ChronicleFlow:
         workflow_id: str | None = None,
         status: str | None = None,
         termination_reason: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
         cursor: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
@@ -1385,13 +1392,17 @@ class ChronicleFlow:
         records, and never settles a due timeout, so a repeated query returns
         the same answer and stored state is unchanged. Filters combine as an
         intersection: ``workflow_id`` keeps one workflow's executions,
-        ``status`` keeps one lifecycle status, and ``termination_reason``
-        keeps executions that terminated for exactly that reason. The reason
-        filter only matches terminated executions, so running and completed
-        executions never appear under it even combined with other filters.
-        ``cursor`` is the previous page's last execution identifier: the page
-        holds only strictly greater identifiers, and ``limit`` caps its size,
-        so consecutive pages neither overlap nor skip.
+        ``status`` keeps one lifecycle status, ``termination_reason`` keeps
+        executions that terminated for exactly that reason, and ``since`` and
+        ``until`` bound a closed interval on each execution's creation time (an
+        execution created exactly at either boundary is kept; an absent bound
+        is open, and a window with ``since`` later than ``until`` simply
+        matches nothing). The reason filter only matches terminated
+        executions, so running and completed executions never appear under it
+        even combined with other filters. ``cursor`` is the previous page's
+        last execution identifier: the page holds only strictly greater
+        identifiers, and ``limit`` caps its size, so consecutive pages neither
+        overlap nor skip.
         """
         with self._operation():
             with self.store.transaction():
@@ -1400,18 +1411,28 @@ class ChronicleFlow:
                 # tenants' workflows.
                 if workflow_id is not None:
                     self._assert_workflow_exists(workflow_id, tenant)
-                conditions = ["tenant = ?"]
+                # A window with since later than until contains no executions,
+                # so its result is the same definite empty list as a namespace
+                # with no executions.
+                if since is not None and until is not None and since > until:
+                    return {"executions": []}
+                conditions = ["e.tenant = ?"]
                 parameters: list[Any] = [tenant]
                 if workflow_id is not None:
-                    conditions.append("workflow_id = ?")
+                    conditions.append("e.workflow_id = ?")
                     parameters.append(workflow_id)
                 if cursor is not None:
-                    conditions.append("id > ?")
+                    conditions.append("e.id > ?")
                     parameters.append(cursor)
                 query = (
-                    "SELECT id, state FROM executions WHERE "
+                    "SELECT e.id AS id, e.state AS state, "
+                    "COALESCE(e.created_at, s.occurred_at) AS created_at "
+                    "FROM executions e "
+                    "LEFT JOIN events s ON s.tenant = e.tenant AND s.execution_id = e.id "
+                    "AND s.type = 'execution_started' "
+                    "WHERE "
                     + " AND ".join(conditions)
-                    + " ORDER BY id ASC"
+                    + " ORDER BY e.id ASC"
                 )
                 rows = self.store.connection.execute(query, parameters).fetchall()
                 executions: list[dict[str, Any]] = []
@@ -1427,12 +1448,24 @@ class ChronicleFlow:
                             continue
                         if state.get("termination_reason") != termination_reason:
                             continue
+                    # The creation time is only needed when a window is
+                    # bounded. A row without one (an old-build execution whose
+                    # start event is absent) cannot be placed in a window, so
+                    # it is excluded under a filter but an unfiltered list
+                    # still returns it exactly as the baseline did.
+                    if since is not None or until is not None:
+                        created_at = row["created_at"]
+                        if not isinstance(created_at, str) or not self._within_window(
+                            _parse_stored_time(created_at), since, until
+                        ):
+                            continue
                     executions.append(
                         {
                             "id": state["id"],
                             "workflow_id": state["workflow_id"],
                             "status": state["status"],
                             "termination_reason": state.get("termination_reason"),
+                            "created_at": row["created_at"],
                         }
                     )
                     if limit is not None and len(executions) >= limit:
@@ -3508,8 +3541,15 @@ class ChronicleFlow:
         return {"consistent": rebuilt == stored, "execution": rebuilt}
 
     def _append(
-        self, execution_id: str, event_type: str, payload: dict[str, Any], tenant: str = DEFAULT_TENANT
+        self,
+        execution_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        tenant: str = DEFAULT_TENANT,
+        occurred_at: str | None = None,
     ) -> None:
+        if occurred_at is None:
+            occurred_at = self.store.now()
         row = self.store.connection.execute(
             "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events "
             "WHERE tenant = ? AND execution_id = ?",
@@ -3517,7 +3557,7 @@ class ChronicleFlow:
         ).fetchone()
         self.store.connection.execute(
             "INSERT INTO events(tenant, execution_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (tenant, execution_id, row["sequence"], event_type, self.store.encode(payload), self.store.now()),
+            (tenant, execution_id, row["sequence"], event_type, self.store.encode(payload), occurred_at),
         )
         if event_type in NOTIFY_EVENT_TYPES:
             # Queue targets are fed in the same transaction as the event, so a

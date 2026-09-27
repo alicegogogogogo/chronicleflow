@@ -1032,23 +1032,24 @@ The list is paged with a keyset cursor:
 ### List executions
 
 ```http
-GET /executions?workflow_id=order-flow&status=terminated&termination_reason=timeout&cursor=run-41&limit=50
+GET /executions?workflow_id=order-flow&status=terminated&termination_reason=timeout&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=run-41&limit=50
 X-Tenant-Id: acme
 ```
 
 Enumerates the executions in the request's namespace in ascending execution
 identifier order. The response is `{"executions":[...]}`; each entry carries
 the execution `id`, its `workflow_id`, its `status` (`running`, `completed`,
-or `terminated`, always a string), and its `termination_reason` (one of the
-four termination reasons for a terminated execution, otherwise `null`). A
-namespace with no executions gets the definite empty result
-`{"executions":[]}`. Like the workflows list this query is read-only and
-never settles a due timeout, appends an event, writes a checkpoint, or
-records usage, so repeated calls return the same answer and change no state
-or metering conclusion.
+or `terminated`, always a string), its `termination_reason` (one of the
+four termination reasons for a terminated execution, otherwise `null`), and
+its `created_at` (the ISO-8601 UTC creation timestamp ending in `Z`), in
+that stable key order. A namespace with no executions gets the definite
+empty result `{"executions":[]}`. Like the workflows list this query is
+read-only and never settles a due timeout, appends an event, writes a
+checkpoint, or records usage, so repeated calls return the same answer and
+change no state or metering conclusion.
 
 The same `limit` and `cursor` pagination applies, with the cursor taken
-from the previous page's last execution identifier. In addition, three
+from the previous page's last execution identifier. In addition, five
 filters may be combined, and every given filter must match:
 
 - `workflow_id` — only executions of that workflow. Referencing a workflow
@@ -1060,7 +1061,15 @@ filters may be combined, and every given filter must match:
   reason. The filter is meaningful solely for terminated executions:
   running and completed executions never appear under it, even when other
   filters are given alongside it. An unknown reason is a
-  `400 validation_error`.
+  `400 validation_error`;
+- `since` and `until` — the same closed creation-time bounds the events and
+  metrics queries accept: each is an ISO-8601 UTC timestamp ending in `Z`,
+  and an execution whose `created_at` equals `since` or `until` is
+  returned. When either parameter is absent the corresponding bound is
+  open, so omitting both returns exactly the unfiltered list; a malformed
+  timestamp is a `400 validation_error`. When `since` is later than
+  `until` the window matches nothing and the result is the definite empty
+  list, not an error.
 
 Both list endpoints follow the usual tenant scope: omitting
 `X-Tenant-Id` keeps the single legacy namespace, and a tenant sees only its

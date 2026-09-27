@@ -117,17 +117,31 @@ class ExecutionListServiceTests(unittest.TestCase):
         result = self.service.list_executions(limit=100)
         self.assertEqual({"executions": []}, result)
 
-    def test_entries_carry_identifiers_status_and_reason_in_state_key_order(self):
+    def test_entries_carry_identifiers_status_reason_and_created_at_in_key_order(self):
         self.start("run-1")
         self.start("run-2", workflow_id="wf2")
         self.exhaust("run-2")
         result = {e["id"]: e for e in self.service.list_executions(limit=100)["executions"]}
-        self.assertEqual(["id", "workflow_id", "status", "termination_reason"], list(result["run-1"]))
+        self.assertEqual(
+            ["id", "workflow_id", "status", "termination_reason", "created_at"], list(result["run-1"])
+        )
+        self.assertEqual(list(result["run-1"]), list(result["run-2"]))
         self.assertEqual("running", result["run-1"]["status"])
         self.assertIsNone(result["run-1"]["termination_reason"])
         self.assertEqual("wf2", result["run-2"]["workflow_id"])
         self.assertEqual("terminated", result["run-2"]["status"])
         self.assertEqual("retries_exhausted", result["run-2"]["termination_reason"])
+        # The creation time is the occurrence time of the start event.
+        for execution_id in ("run-1", "run-2"):
+            created_at = result[execution_id]["created_at"]
+            self.assertIsInstance(created_at, str)
+            self.assertTrue(created_at.endswith("Z"))
+            started = next(
+                event
+                for event in self.service.events(execution_id)
+                if event["type"] == "execution_started"
+            )
+            self.assertEqual(started["occurred_at"], created_at)
 
     def test_ascending_identifier_order_and_keyset_paging(self):
         for execution_id in ("run-c", "run-a", "run-b"):
@@ -197,6 +211,133 @@ class ExecutionListServiceTests(unittest.TestCase):
             workflow_id="wf1", status="running", termination_reason="cancelled", limit=100
         )["executions"]
         self.assertEqual([], result)
+
+    def _created_at(self, execution_id):
+        from chronicleflow.service import _parse_stored_time
+
+        entry = next(
+            e
+            for e in self.service.list_executions(limit=100)["executions"]
+            if e["id"] == execution_id
+        )
+        return entry["created_at"], _parse_stored_time(entry["created_at"])
+
+    def test_time_window_is_closed_at_both_endpoints(self):
+        import time as time_module
+
+        self.start("run-a")
+        time_module.sleep(0.002)
+        self.start("run-b")
+        time_module.sleep(0.002)
+        self.start("run-c")
+        first_text, first = self._created_at("run-a")
+        last_text, last = self._created_at("run-c")
+        ids = [
+            e["id"]
+            for e in self.service.list_executions(since=first, until=last, limit=100)["executions"]
+        ]
+        self.assertEqual(["run-a", "run-b", "run-c"], ids)
+        # The boundary values come straight from the entries, so an execution
+        # created exactly at since or until is matched; the response echoes
+        # the identical timestamp string.
+        entries = {
+            e["id"]: e
+            for e in self.service.list_executions(since=first, until=first, limit=100)["executions"]
+        }
+        self.assertEqual(["run-a"], list(entries))
+        self.assertEqual(first_text, entries["run-a"]["created_at"])
+
+    def test_open_bounds_filter_only_one_side(self):
+        import time as time_module
+
+        self.start("run-a")
+        time_module.sleep(0.002)
+        self.start("run-b")
+        middle_text, middle = self._created_at("run-b")
+        time_module.sleep(0.002)
+        self.start("run-c")
+        since_ids = [
+            e["id"]
+            for e in self.service.list_executions(since=middle, limit=100)["executions"]
+        ]
+        self.assertEqual(["run-b", "run-c"], since_ids)
+        until_ids = [
+            e["id"]
+            for e in self.service.list_executions(until=middle, limit=100)["executions"]
+        ]
+        self.assertEqual(["run-a", "run-b"], until_ids)
+        # No window means every execution, including one later observed.
+        self.assertEqual(
+            ["run-a", "run-b", "run-c"],
+            [e["id"] for e in self.service.list_executions(limit=100)["executions"]],
+        )
+        self.assertTrue(middle_text.endswith("Z"))
+
+    def test_reversed_window_returns_definite_empty_list(self):
+        self.start("run-a")
+        self.start("run-b")
+        _, first = self._created_at("run-a")
+        _, last = self._created_at("run-b")
+        result = self.service.list_executions(since=last, until=first, limit=100)
+        self.assertEqual({"executions": []}, result)
+        # A reversed window stays empty even when other filters would match,
+        # and the value is a stable empty list rather than an error.
+        self.assertEqual(
+            [],
+            self.service.list_executions(
+                workflow_id="wf1", status="running", since=last, until=first, limit=100
+            )["executions"],
+        )
+
+    def test_time_window_paging_neither_overlaps_nor_skips(self):
+        import time as time_module
+
+        for execution_id in ("run-a", "run-b", "run-c", "run-d"):
+            self.start(execution_id)
+            time_module.sleep(0.001)
+        entries = self.service.list_executions(limit=100)["executions"]
+        since = self._created_at("run-a")[1]
+        until = self._created_at("run-d")[1]
+        collected = []
+        cursor = None
+        while True:
+            page = self.service.list_executions(
+                since=since, until=until, cursor=cursor, limit=2
+            )["executions"]
+            if not page:
+                break
+            collected.extend(e["id"] for e in page)
+            cursor = page[-1]["id"]
+        self.assertEqual([e["id"] for e in entries], collected)
+
+    def test_time_window_combines_with_status_filter(self):
+        import time as time_module
+
+        self.start("run-running")
+        time_module.sleep(0.002)
+        self.start("run-completed")
+        self.complete("run-completed")
+        time_module.sleep(0.002)
+        self.start("run-running-2")
+        first = self._created_at("run-running")[1]
+        until_completed = self._created_at("run-completed")[1]
+        ids = [
+            e["id"]
+            for e in self.service.list_executions(
+                status="running", since=first, until=until_completed, limit=100
+            )["executions"]
+        ]
+        self.assertEqual(["run-running"], ids)
+
+    def test_window_query_is_read_only(self):
+        self.start("run-1")
+        _, created = self._created_at("run-1")
+        before = self.service.events("run-1")
+        for _ in range(3):
+            self.service.list_executions(since=created, until=created, limit=100)
+        self.assertEqual(before, self.service.events("run-1"))
+        entry = self.service.list_executions(since=created, until=created, limit=100)["executions"][0]
+        self.assertEqual("running", entry["status"])
 
     def test_filter_by_missing_workflow_is_not_found(self):
         from chronicleflow.errors import NotFoundError
@@ -314,6 +455,20 @@ class ListHttpTests(unittest.TestCase):
                 self.assertEqual(400, status)
                 self.assertEqual("validation_error", json.loads(data)["error"]["code"])
 
+    def test_malformed_window_is_rejected(self):
+        for query in ("since=bogus", "until=2026-09-26%2008:00:00", "since=2026-09-26T08:00:00%2B00:00"):
+            with self.subTest(query=query):
+                status, data = self.request(f"/executions?limit=10&{query}")
+                self.assertEqual(400, status)
+                self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_repeated_window_parameter_is_rejected(self):
+        stamp = "2026-09-26T08:00:00.000Z"
+        status, _ = self.request(f"/executions?limit=10&since={stamp}&since={stamp}")
+        self.assertEqual(400, status)
+        status, _ = self.request(f"/executions?limit=10&until={stamp}&until={stamp}")
+        self.assertEqual(400, status)
+
     def test_workflow_filter_parameter_is_rejected_on_workflow_list(self):
         status, _ = self.request("/workflows?limit=10&status=running")
         self.assertEqual(400, status)
@@ -368,6 +523,44 @@ class ListHttpTests(unittest.TestCase):
             collected.extend(e["id"] for e in page)
             cursor = page[-1]["id"]
         self.assertEqual([f"run-{index}" for index in range(5)], collected)
+
+    def test_time_window_over_http(self):
+        import time as time_module
+
+        tenant = f"window-{id(self)}"
+        self.create_workflow_http(tenant, "page-wf")
+        self.create_execution_http(tenant, "run-a")
+        time_module.sleep(0.002)
+        self.create_execution_http(tenant, "run-b")
+        status, data = self.request("/executions?limit=10", {"X-Tenant-Id": tenant})
+        self.assertEqual(200, status)
+        entries = json.loads(data)["executions"]
+        self.assertEqual(["run-a", "run-b"], [e["id"] for e in entries])
+        for entry in entries:
+            self.assertEqual(
+                ["id", "workflow_id", "status", "termination_reason", "created_at"], list(entry)
+            )
+            self.assertTrue(entry["created_at"].endswith("Z"))
+        first, last = entries[0]["created_at"], entries[-1]["created_at"]
+        # Closed interval between the two creation times returns both.
+        status, data = self.request(
+            f"/executions?limit=10&since={first}&until={last}", {"X-Tenant-Id": tenant}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["run-a", "run-b"], [e["id"] for e in json.loads(data)["executions"]])
+        # A boundary equal to one creation time matches just that one.
+        status, data = self.request(
+            f"/executions?limit=10&until={first}", {"X-Tenant-Id": tenant}
+        )
+        self.assertEqual(["run-a"], [e["id"] for e in json.loads(data)["executions"]])
+        # Reversed window is a definite empty list, not an error.
+        status, data = self.request(
+            f"/executions?limit=10&since={last}&until={first}", {"X-Tenant-Id": tenant}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"executions": []}, json.loads(data))
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
 
     def create_workflow_http(self, tenant, workflow_id):
         connection = http.client.HTTPConnection("127.0.0.1", self.port)
