@@ -192,20 +192,23 @@ queries never meter and never alter recorded usage or billing conclusions.
 
 ```http
 GET /usage
+GET /usage?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
 X-Tenant-Id: acme
 ```
 
 Returns `{"usage":[{"type":"execution_started","count":1}, ...]}`: the
-cumulative count of recorded actions per type, sorted by ascending type
-identifier. Types with no records are omitted, so a tenant with no usage gets
-the definite empty result `{"usage":[]}`.
+count of recorded actions per type within the window, sorted by ascending
+type identifier. Types with no matching record are omitted, so a window with
+no matches — including a window whose `since` is later than its `until` —
+gets the definite empty result `{"usage":[]}`, never an error.
 
 ```http
 GET /bill
+GET /bill?since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
 X-Tenant-Id: acme
 ```
 
-Returns the per-type bill:
+Returns the per-type bill over the same window:
 
 ```json
 {"bill":{"items":[
@@ -214,14 +217,37 @@ Returns the per-type bill:
 ],"total":2100}}
 ```
 
-Each item gives the metered `count`, a positive-integer `unit_price` in cents
-that is also returned in the response, and a `subtotal` equal to
-`count * unit_price`; `total` is the integer-cent sum of every subtotal. With
-no records, `items` is empty and `total` is `0`.
+Each item gives the metered `count` over the window, a positive-integer
+`unit_price` in cents that is also returned in the response, and a
+`subtotal` equal to `count * unit_price`; `total` is the integer-cent sum of
+every subtotal. With no matching record — including a reversed window —
+`items` is empty and `total` is `0`.
+
+Both queries accept the same two optional query parameters the events and
+metrics queries accept, each an ISO-8601 UTC timestamp ending in `Z`:
+
+- `since` and `until` bound a **closed** interval on each usage record's
+  occurrence time: a record whose time equals `since` or `until` is counted.
+  When either parameter is absent the corresponding bound is open, so
+  omitting both counts every recorded action and the answer is the
+  cumulative result, byte for byte;
+- a malformed `since` or `until`, a repeated parameter, or any unknown query
+  parameter is a `400 validation_error` that writes nothing;
+- when `since` is later than `until` the request is not an error: the window
+  simply contains no records, so usage reports the definite empty list and
+  the bill reports empty items and a zero total.
+
+Only records whose occurrence time falls in the window are counted; the
+window never changes the recorded actions themselves, the unit prices, or
+the cumulative totals an unfiltered query reports, and a replay, recovery,
+or later query never alters a recorded usage or billing conclusion.
 
 Both endpoints are tenant-scoped `GET` requests: a missing or empty
-`X-Tenant-Id` is a `400 validation_error`. Usage and bill data follow the
-usual tenant isolation, so one tenant can never see another's records.
+`X-Tenant-Id` is a `400 validation_error` that leaks no usage. Usage and
+bill data follow the usual tenant isolation, so one tenant can never see
+another's records in any window, and another tenant's records never affect
+this tenant's counts or totals. Both queries remain read-only: they append
+no usage records and change no metering conclusion.
 
 ### Operational metrics
 

@@ -706,36 +706,67 @@ class ChronicleFlow:
                     return {"quota": None}
                 return {"quota": {"workflows": row["workflows"], "executions": row["executions"]}}
 
-    def _usage_counts(self, tenant: str) -> dict[str, int]:
-        rows = self.store.connection.execute(
-            "SELECT type, COUNT(*) AS count FROM usage_records WHERE tenant = ? GROUP BY type",
-            (tenant,),
-        ).fetchall()
-        counts = {row["type"]: row["count"] for row in rows}
+    def _usage_counts(
+        self,
+        tenant: str,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> dict[str, int]:
+        """Count the tenant's usage records per type, optionally within a window.
+
+        Records are bucketed by their own occurrence time and the window is a
+        closed interval, so a record equal to either endpoint counts; an
+        absent bound is open. A window with ``since`` later than ``until``
+        contains nothing. With neither bound given every record counts,
+        exactly as the cumulative baseline.
+        """
+        counts: dict[str, int] = {}
+        empty_window = since is not None and until is not None and since > until
+        if not empty_window:
+            rows = self.store.connection.execute(
+                "SELECT type, created_at FROM usage_records WHERE tenant = ?",
+                (tenant,),
+            ).fetchall()
+            for row in rows:
+                if self._within_window(_parse_stored_time(row["created_at"]), since, until):
+                    counts[row["type"]] = counts.get(row["type"], 0) + 1
         return {usage_type: counts[usage_type] for usage_type in USAGE_TYPES if counts.get(usage_type)}
 
-    def usage(self, tenant: str) -> dict[str, Any]:
+    def usage(
+        self,
+        tenant: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
         with self._operation():
             with self.store.transaction():
                 # Types are reported in ascending identifier order; a type
-                # with no records is omitted, so a tenant with no usage gets a
-                # definite empty list.
+                # with no records in the window is omitted, so a matching-less
+                # window gets a definite empty list.
                 entries = [
                     {"type": usage_type, "count": count}
-                    for usage_type, count in sorted(self._usage_counts(tenant).items())
+                    for usage_type, count in sorted(self._usage_counts(tenant, since, until).items())
                 ]
                 return {"usage": entries}
 
-    def bill(self, tenant: str) -> dict[str, Any]:
+    def bill(
+        self,
+        tenant: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
         with self._operation():
             with self.store.transaction():
                 items = []
                 total = 0
-                for usage_type, count in sorted(self._usage_counts(tenant).items()):
+                # Only records the window contains are billed; a type with no
+                # matching record is omitted, so an empty (including reversed)
+                # window bills empty items and a zero total.
+                for usage_type, count in sorted(self._usage_counts(tenant, since, until).items()):
                     unit_price = USAGE_UNIT_PRICES[usage_type]
                     subtotal = count * unit_price
                     total += subtotal

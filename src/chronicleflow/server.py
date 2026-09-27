@@ -19,9 +19,10 @@ from .service import (
 
 TENANT_HEADER = "X-Tenant-Id"
 
-# The only query parameters the metrics query and the Prometheus export
-# accept; anything else is a validation error exactly like an unknown field.
-METRICS_QUERY_PARAMETERS = ("since", "until")
+# The only query parameters the metrics query, the Prometheus export, the
+# usage query, and the bill query accept; anything else is a validation error
+# exactly like an unknown field.
+WINDOW_QUERY_PARAMETERS = ("since", "until")
 
 # The only query parameters the execution events query accepts: a type set, a
 # closed time window, and cursor pagination. Anything else is a validation
@@ -102,18 +103,19 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(status, response)
 
-    def _metrics_window(self) -> tuple[Any, Any]:
-        """Parse the optional since/until query parameters of the metrics routes.
+    def _window(self) -> tuple[Any, Any]:
+        """Parse the optional since/until query parameters of the windowed routes.
 
         Both parameters are ISO-8601 UTC timestamps ending in Z, may appear at
         most once, and are the only accepted parameters. Repeating either or
-        sending any other parameter is a 400 validation_error.
+        sending any other parameter is a 400 validation_error. Shared by the
+        metrics query, the Prometheus export, and the usage and bill queries.
         """
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-        unknown = [name for name in query if name not in METRICS_QUERY_PARAMETERS]
+        unknown = [name for name in query if name not in WINDOW_QUERY_PARAMETERS]
         if unknown:
             raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
-        for name in METRICS_QUERY_PARAMETERS:
+        for name in WINDOW_QUERY_PARAMETERS:
             if len(query.get(name, [])) > 1:
                 raise ValidationError(f"query parameter {name} must appear at most once")
         return (
@@ -274,14 +276,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
         if self.command == "GET" and parts == ["usage"]:
-            return 200, self.service.usage(self._tenant())
+            since, until = self._window()
+            return 200, self.service.usage(self._tenant(), since, until)
         if self.command == "GET" and parts == ["bill"]:
-            return 200, self.service.bill(self._tenant())
+            since, until = self._window()
+            return 200, self.service.bill(self._tenant(), since, until)
         if self.command == "GET" and parts == ["metrics"]:
-            since, until = self._metrics_window()
+            since, until = self._window()
             return 200, self.service.metrics(self._tenant(), since, until)
         if self.command == "GET" and parts == ["metrics", "export"]:
-            since, until = self._metrics_window()
+            since, until = self._window()
             return 200, TextResponse(
                 "text/plain; version=0.0.4; charset=utf-8",
                 self.service.metrics_export(self._tenant(), since, until),

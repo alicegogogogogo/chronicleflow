@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -16,6 +17,14 @@ from chronicleflow.service import (
 )
 
 TASK = [{"id": "a", "kind": "task", "depends_on": []}]
+
+T1 = "2026-09-26T08:00:00.000Z"
+T2 = "2026-09-26T09:00:00.000Z"
+T3 = "2026-09-26T10:00:00.000Z"
+
+
+def _ts(value: str) -> datetime:
+    return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
 class _Receiver(BaseHTTPRequestHandler):
@@ -246,6 +255,124 @@ class UsageServiceTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(0, rows["used"])
 
+    def _insert_usage(self, tenant, usage_type, created_at, sequence=None):
+        """Append a usage record at a fixed occurrence time, bypassing the clock."""
+        connection = self.service.store.connection
+        if sequence is None:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM usage_records WHERE tenant = ?",
+                (tenant,),
+            ).fetchone()
+            sequence = row["sequence"]
+        connection.execute(
+            "INSERT INTO usage_records(tenant, sequence, type, created_at) VALUES (?, ?, ?, ?)",
+            (tenant, sequence, usage_type, created_at),
+        )
+
+    def test_unfiltered_window_is_byte_equivalent_to_cumulative_result(self):
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "acme")
+        self.service.create_execution({"id": "r", "workflow_id": "wf", "input": {}}, "r", "acme")
+        self.assertEqual(self.service.usage("acme"), self.service.usage("acme", None, None))
+        self.assertEqual(self.service.bill("acme"), self.service.bill("acme", None, None))
+
+    def test_window_counts_only_records_in_the_closed_interval(self):
+        with self.service.store.transaction():
+            self._insert_usage("acme", "workflow_created", T1)
+            self._insert_usage("acme", "execution_started", T2)
+            self._insert_usage("acme", "workflow_created", T3)
+        # A record whose time equals either endpoint is counted.
+        usage = self.service.usage("acme", _ts(T1), _ts(T2))["usage"]
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 1},
+                {"type": "workflow_created", "count": 1},
+            ],
+            usage,
+        )
+        # A single-point window matches only the record at that time.
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("acme", _ts(T3), _ts(T3))["usage"],
+        )
+
+    def test_open_bounds_match_everything_on_each_side(self):
+        with self.service.store.transaction():
+            self._insert_usage("acme", "workflow_created", T1)
+            self._insert_usage("acme", "workflow_created", T3)
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("acme", None, _ts(T1))["usage"],
+        )
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("acme", _ts(T3), None)["usage"],
+        )
+
+    def test_reversed_window_is_a_definite_empty_result_not_an_error(self):
+        with self.service.store.transaction():
+            self._insert_usage("acme", "workflow_created", T2)
+        self.assertEqual({"usage": []}, self.service.usage("acme", _ts(T3), _ts(T1)))
+        self.assertEqual(
+            {"bill": {"items": [], "total": 0}},
+            self.service.bill("acme", _ts(T3), _ts(T1)),
+        )
+
+    def test_bill_window_uses_windowed_counts_with_same_prices_and_totals(self):
+        with self.service.store.transaction():
+            self._insert_usage("acme", "workflow_created", T1)
+            self._insert_usage("acme", "workflow_created", T2)
+            self._insert_usage("acme", "execution_started", T2)
+            self._insert_usage("acme", "workflow_created", T3)
+        bill = self.service.bill("acme", _ts(T2), _ts(T2))["bill"]
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 1, "unit_price": USAGE_UNIT_PRICES["execution_started"],
+                 "subtotal": USAGE_UNIT_PRICES["execution_started"]},
+                {"type": "workflow_created", "count": 1, "unit_price": USAGE_UNIT_PRICES["workflow_created"],
+                 "subtotal": USAGE_UNIT_PRICES["workflow_created"]},
+            ],
+            bill["items"],
+        )
+        self.assertEqual(
+            USAGE_UNIT_PRICES["execution_started"] + USAGE_UNIT_PRICES["workflow_created"],
+            bill["total"],
+        )
+        self.assertIsInstance(bill["total"], int)
+        # A type with no record in the window is omitted.
+        self.assertNotIn("delivery_attempted", {item["type"] for item in bill["items"]})
+
+    def test_windowed_usage_stays_isolated_per_tenant(self):
+        with self.service.store.transaction():
+            self._insert_usage("alpha", "workflow_created", T2)
+            self._insert_usage("beta", "workflow_created", T2)
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("alpha", _ts(T1), _ts(T3))["usage"],
+        )
+        self.assertEqual(
+            [{"type": "workflow_created", "count": 1}],
+            self.service.usage("beta", _ts(T1), _ts(T3))["usage"],
+        )
+        self.assertEqual([], self.service.usage("gamma", _ts(T1), _ts(T3))["usage"])
+
+    def test_windowed_usage_and_bill_require_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.usage("", _ts(T1), _ts(T2))
+        with self.assertRaises(ValidationError):
+            self.service.bill("", _ts(T1), _ts(T2))
+
+    def test_filtering_changes_no_recorded_usage(self):
+        with self.service.store.transaction():
+            self._insert_usage("acme", "workflow_created", T2)
+        before_usage = self.service.usage("acme")
+        before_bill = self.service.bill("acme")
+        self.service.usage("acme", _ts(T1), _ts(T2))
+        self.service.bill("acme", _ts(T2), _ts(T3))
+        self.service.usage("acme", _ts(T3), _ts(T1))
+        self.service.bill("acme", _ts(T3), _ts(T1))
+        self.assertEqual(before_usage, self.service.usage("acme"))
+        self.assertEqual(before_bill, self.service.bill("acme"))
+
 
 class UsageHttpTests(unittest.TestCase):
     @classmethod
@@ -336,6 +463,76 @@ class UsageHttpTests(unittest.TestCase):
         self.assertEqual({"usage": []}, json.loads(data))
         status, data = self.call("GET", "/bill", headers=headers)
         self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+
+    def test_window_parameters_are_rejected_as_validation_errors(self):
+        headers = {"X-Tenant-Id": "http-acme"}
+        bad_paths = (
+            "/usage?since=not-a-time",
+            "/usage?until=2026-01-01",
+            "/usage?since=2026-01-01T00:00:00Z&bogus=1",
+            "/usage?since=",
+            "/usage?since=2026-01-01T00:00:00Z&since=2026-02-01T00:00:00Z",
+            "/bill?until=not-a-time",
+            "/bill?since=2026-01-01T00:00:00Z&bogus=1",
+            "/bill?until=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z",
+        )
+        for path in bad_paths:
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_window_validation_still_requires_a_tenant_and_leaks_nothing(self):
+        for path in ("/usage?since=2000-01-01T00:00:00.000Z", "/bill?until=2099-01-01T00:00:00.000Z"):
+            status, data = self.call("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_windowed_queries_over_http(self):
+        headers = {"X-Tenant-Id": "http-window"}
+        connection = Handler.service.store.connection
+        with Handler.service.store.transaction():
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM usage_records WHERE tenant = ?",
+                ("http-window",),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO usage_records(tenant, sequence, type, created_at) VALUES (?, ?, ?, ?)",
+                ("http-window", row["sequence"], "workflow_created", T2),
+            )
+        # The record is counted at both closed endpoints.
+        status, data = self.call("GET", f"/usage?since={T2}", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual([{"type": "workflow_created", "count": 1}], json.loads(data)["usage"])
+        status, data = self.call("GET", f"/bill?until={T2}", headers=headers)
+        self.assertEqual(200, status)
+        bill = json.loads(data)["bill"]
+        self.assertEqual(1, len(bill["items"]))
+        self.assertEqual(USAGE_UNIT_PRICES["workflow_created"], bill["total"])
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        # A window ending before the record matches nothing.
+        status, data = self.call("GET", f"/usage?until={T1}", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        # A reversed window is the definite empty result, not an error.
+        status, data = self.call(
+            "GET",
+            f"/usage?since={T3}&until={T1}",
+            headers=headers,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"usage": []}, json.loads(data))
+        status, data = self.call(
+            "GET",
+            f"/bill?since={T3}&until={T1}",
+            headers=headers,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
+        # No parameters still returns the cumulative answer.
+        status, data = self.call("GET", "/usage", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual([{"type": "workflow_created", "count": 1}], json.loads(data)["usage"])
 
 
 if __name__ == "__main__":
