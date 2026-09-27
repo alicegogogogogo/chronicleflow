@@ -20,9 +20,14 @@ from .service import (
 
 TENANT_HEADER = "X-Tenant-Id"
 
-# The only query parameters the usage, bill, and metrics queries accept;
-# anything else is a validation error exactly like an unknown field.
+# The only query parameters the metrics queries accept; anything else is a
+# validation error exactly like an unknown field.
 WINDOW_QUERY_PARAMETERS = ("since", "until")
+
+# The only query parameters the usage and bill queries accept: an optional
+# metered-type set on top of the closed time window. Anything else is a
+# validation error exactly like an unknown field.
+USAGE_QUERY_PARAMETERS = ("type", "since", "until")
 
 # The only query parameters the execution events query accepts: a type set, a
 # closed time window, and cursor pagination. Anything else is a validation
@@ -114,8 +119,8 @@ class Handler(BaseHTTPRequestHandler):
 
         Both parameters are ISO-8601 UTC timestamps ending in Z, may appear at
         most once, and are the only accepted parameters. Repeating either or
-        sending any other parameter is a 400 validation_error. The usage, bill,
-        and metrics routes all share this closed-interval window.
+        sending any other parameter is a 400 validation_error. The metrics
+        routes share this closed-interval window.
         """
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         unknown = [name for name in query if name not in WINDOW_QUERY_PARAMETERS]
@@ -128,6 +133,40 @@ class Handler(BaseHTTPRequestHandler):
             _parse_timestamp(query.get("since", [None])[0], "since"),
             _parse_timestamp(query.get("until", [None])[0], "until"),
         )
+
+    def _usage_query(self) -> dict[str, Any]:
+        """Parse the optional type filter and time window of the usage and bill queries.
+
+        ``type`` is a single metered type or a comma-separated set of them,
+        without empty or duplicate entries and naming only known types;
+        ``since`` and ``until`` are ISO-8601 UTC timestamps ending in Z.
+        Every parameter may appear at most once, and any other parameter is a
+        400 validation_error, as is any malformed value. When ``type`` is
+        absent every type is counted, exactly as before.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in USAGE_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in USAGE_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        types = None
+        if "type" in query:
+            entries = query["type"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError("type must be a comma-separated set of metered types without empty entries")
+            if len(set(entries)) != len(entries):
+                raise ValidationError("type must not contain duplicate metered types")
+            unknown_types = [entry for entry in entries if entry not in USAGE_TYPES]
+            if unknown_types:
+                raise ValidationError(f"unknown metered type: {unknown_types[0]}")
+            types = tuple(entries)
+        return {
+            "types": types,
+            "since": _parse_timestamp(query["since"][0], "since") if "since" in query else None,
+            "until": _parse_timestamp(query["until"][0], "until") if "until" in query else None,
+        }
 
     def _events_query(self) -> dict[str, Any]:
         """Parse the optional filter and pagination parameters of the events query.
@@ -323,14 +362,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
         if self.command == "GET" and parts == ["usage"]:
-            since, until = self._window()
-            return 200, self.service.usage(self._tenant(), since, until)
+            parameters = self._usage_query()
+            return 200, self.service.usage(self._tenant(), **parameters)
         if self.command == "GET" and parts == ["usage", "records"]:
             parameters = self._usage_records_query()
             return 200, self.service.usage_records(self._tenant(), **parameters)
         if self.command == "GET" and parts == ["bill"]:
-            since, until = self._window()
-            return 200, self.service.bill(self._tenant(), since, until)
+            parameters = self._usage_query()
+            return 200, self.service.bill(self._tenant(), **parameters)
         if self.command == "GET" and parts == ["metrics"]:
             since, until = self._window()
             return 200, self.service.metrics(self._tenant(), since, until)

@@ -711,21 +711,30 @@ class ChronicleFlow:
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, int]:
         """Cumulative per-type counts of the tenant's usage records.
 
         With no bounds every recorded record is counted, exactly as the
-        cumulative baseline. ``since`` and ``until`` bound a closed interval on
+        cumulative baseline. ``types`` keeps only records whose metered type
+        is in the set; a type with no matching record is omitted rather than
+        reported at zero. ``since`` and ``until`` bound a closed interval on
         each record's own occurrence time (``created_at``): a record equal to
-        either boundary counts. A window with ``since`` later than ``until``
+        either boundary counts. The type filter and the window apply together
+        as an intersection. A window with ``since`` later than ``until``
         contains no records, so every type is omitted.
         """
+        wanted = set(types) if types is not None else None
         if since is None and until is None:
             rows = self.store.connection.execute(
                 "SELECT type, COUNT(*) AS count FROM usage_records WHERE tenant = ? GROUP BY type",
                 (tenant,),
             ).fetchall()
-            counts = {row["type"]: row["count"] for row in rows}
+            counts = {
+                row["type"]: row["count"]
+                for row in rows
+                if wanted is None or row["type"] in wanted
+            }
         else:
             rows = self.store.connection.execute(
                 "SELECT type, created_at FROM usage_records WHERE tenant = ?",
@@ -733,6 +742,8 @@ class ChronicleFlow:
             ).fetchall()
             counts = {}
             for row in rows:
+                if wanted is not None and row["type"] not in wanted:
+                    continue
                 if not self._within_window(_parse_stored_time(row["created_at"]), since, until):
                     continue
                 counts[row["type"]] = counts.get(row["type"], 0) + 1
@@ -743,17 +754,18 @@ class ChronicleFlow:
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
         with self._operation():
             with self.store.transaction():
                 # Types are reported in ascending identifier order; a type
-                # with no records in the window is omitted, so a window that
-                # matches nothing gets a definite empty list.
+                # with no matching record is omitted, so a filter that matches
+                # nothing gets a definite empty list.
                 entries = [
                     {"type": usage_type, "count": count}
-                    for usage_type, count in sorted(self._usage_counts(tenant, since, until).items())
+                    for usage_type, count in sorted(self._usage_counts(tenant, since, until, types).items())
                 ]
                 return {"usage": entries}
 
@@ -762,6 +774,7 @@ class ChronicleFlow:
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
@@ -769,10 +782,11 @@ class ChronicleFlow:
             with self.store.transaction():
                 items = []
                 total = 0
-                # Only types with a record in the window appear, each with its
+                # Only types with a matching record appear, each with its
                 # usual unit price and a subtotal of count times that price; a
-                # window that matches nothing yields an empty bill totaling 0.
-                for usage_type, count in sorted(self._usage_counts(tenant, since, until).items()):
+                # filter that matches nothing yields an empty bill totaling 0,
+                # and the total is exactly the sum of the listed subtotals.
+                for usage_type, count in sorted(self._usage_counts(tenant, since, until, types).items()):
                     unit_price = USAGE_UNIT_PRICES[usage_type]
                     subtotal = count * unit_price
                     total += subtotal
