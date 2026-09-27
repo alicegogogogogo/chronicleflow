@@ -161,6 +161,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.pull_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 5 and parts[0] == "executions" and parts[2] == "queues" and parts[4] == "ack" and self.command == "POST":
             return 200, self.service.ack_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if len(parts) == 5 and parts[0] == "executions" and parts[2] == "maps" and parts[4] in ("expand", "reexpand") and self.command == "POST":
+            return 200, self.service.expand_map(
+                parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant()
+            )
         if len(parts) == 7 and parts[0] == "executions" and parts[2] == "maps" and parts[4] == "instances" and parts[6] == "delete" and self.command == "POST":
             return 200, self.service.delete_map_instance(
                 parts[1], parts[3], self._instance_index(parts[5]), self._body(), self.headers.get("Idempotency-Key"), self._tenant()

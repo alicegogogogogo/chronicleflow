@@ -100,8 +100,8 @@ version is the usual `404 not_found`.
 
 The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
-operations, cancellation, recovery, replay, instance deletion and
-modification, queue pulls, acknowledgements, and all history and status
+operations, cancellation, recovery, replay, instance deletion, modification,
+and re-expansion, queue pulls, acknowledgements, and all history and status
 queries, as well as the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
@@ -612,7 +612,7 @@ failures count toward the existing node metrics under the template node id,
 and webhook and queue subscriptions receive instance events exactly like any
 other node event. Instance deletion and modification add their own
 `instance_deleted` and `instance_modified` events, described under
-"Delete and modify expanded instances" below.
+"Delete, modify, and re-expand expanded instances" below.
 
 ### Maps inside loop bodies
 
@@ -672,12 +672,12 @@ map never changes an execution's termination reason.
 Executions whose workflows declare no nested map behave exactly as before:
 state fields, event contents, and advancement results are unchanged.
 
-### Delete and modify expanded instances
+### Delete, modify, and re-expand expanded instances
 
 An expanded dynamic node offers, alongside expansion and per-instance
-advancement, two instance-level operations. Both are ordinary idempotent
-HTTP commands over the same entry points the rest of the service uses; they
-introduce no second protocol.
+advancement, two instance-level operations and one node-level re-expansion.
+All are ordinary idempotent HTTP commands over the same entry points the
+rest of the service uses; they introduce no second protocol.
 
 An instance that has never advanced can be removed, and so can an instance
 that has permanently failed:
@@ -723,11 +723,42 @@ immutable — modifying such an instance returns `409 conflict` and changes no
 state. The rewritten input, including its full float precision and `-0.0`,
 is stored verbatim.
 
+A dynamic node whose instance list is still running can be expanded again,
+for example after one or more deletions:
+
+```http
+POST /executions/run-1/maps/ship/expand
+Idempotency-Key: expand-ship
+
+{}
+```
+
+The body must be an empty object. Re-expansion reads the element list from
+the source task's recorded output exactly like the first expansion, replaces
+every previous instance record — retained, rewritten, completed, or failed —
+with a fresh list that queues from element index zero, and records the same
+`map_expanded` event the first expansion records (the map id, the generated
+instance count, and, for a map inside a loop body, the owning `loop_id` and
+`iteration`). The new instances are ordinary instances in every respect:
+they settle one per `advance`, retry and park for approval under the
+template's declarations with a fresh per-instance retry bound, and accept
+the same delete and modify operations as a first expansion. A node that has
+not expanded yet, or whose instance list has already completed or failed,
+cannot be re-expanded: the call is a `409 conflict` and changes no state.
+
+Delete and modify calls on the same instance interleave freely and settle
+in call order: each call applies to the record the earlier calls left. A
+rewrite keeps the instance removable — a rewritten record is still a
+never-advanced one — and removing an instance ends its history, so a later
+delete or modify naming the same index is a missing resource, exactly like
+an out-of-bounds index.
+
 Both commands apply to a map nested in a loop body exactly as to an
 execution-level map: the current running iteration's instances are
 addressed by the same path, and every event they append carries the owning
 `loop_id` and `iteration` alongside the map id; an execution-level instance
-carries no loop context.
+carries no loop context. Re-expansion likewise regenerates the current
+running iteration's instance list for a nested map.
 
 An out-of-bounds element index, a reference to a node that is not a dynamic
 `map`, a missing execution, or a cross-tenant reference is a `404 not_found`
@@ -746,23 +777,27 @@ Every successful call appends exactly one event to the execution stream:
 - an `instance_modified` event records the action type, the owning
   `map_id`, the instance `index`, the content `before` the rewrite (`null`
   for an instance that had never been rewritten) and `after` it, and the
-  same loop context when the instance belongs to an iteration.
+  same loop context when the instance belongs to an iteration;
+- a re-expansion records the same `map_expanded` event as the first
+  expansion: the action type, the owning dynamic node under `map_id`, the
+  generated instance count, and the loop context for a map inside a loop
+  body.
 
 Replay rebuilds the instance list, every instance's status and ownership,
 and each rewrite solely from the event stream: a delete drops the recorded
 instance (and the subsequent `map_completed`, when the deletion finished the
-node, completes it with the retained outputs), and a modify applies the
-rewritten input to that one instance, so the rebuilt state is exactly the
-materialized state. A checkpoint is written at the instance boundary of
-every successful delete or modify; after a restart recovery continues the
-unfinished instances, repeats no instance output, and never resurrects a
-deleted instance. The operations change no advancement conclusion or
-termination semantics: cancellation, timeouts, approvals, leases, retries,
-and retry exhaustion keep their existing behavior. Executions that never
-use either operation keep exactly their current state fields, event
-contents, and advancement results. Interleaving a deletion and a
-modification on the same instance, re-expanding a map after a deletion, and
-modifying a node that is not a dynamic map are out of scope.
+node, completes it with the retained outputs), a modify applies the
+rewritten input to that one instance, and a later `map_expanded` replaces
+the instance list again exactly as the first expansion built it, so the
+rebuilt state is exactly the materialized state. A checkpoint is written at
+the instance boundary of every successful delete, modify, or re-expansion;
+after a restart recovery continues the unfinished instances, repeats no
+instance output, and never resurrects a deleted instance. The operations
+change no advancement conclusion or termination semantics: cancellation,
+timeouts, approvals, leases, retries, and retry exhaustion keep their
+existing behavior. Executions that never use any of these operations keep
+exactly their current state fields, event contents, and advancement
+results. Modifying a node that is not a dynamic map is a missing resource.
 
 ### Workflow versions
 
@@ -1499,7 +1534,10 @@ to another tenant is a missing resource; deleting an instance that is
 waiting on an approval or already completed, or modifying any instance that
 has already advanced, is a conflict; a delete body that is not empty, a
 modify body without exactly an `input` object, and any unknown field or
-non-finite number are validation errors that write nothing.
+non-finite number are validation errors that write nothing. Re-expanding a
+dynamic node that has not expanded yet, or whose instance list has already
+completed or failed, is a conflict; a re-expansion body that is not an
+empty object is a validation error.
 A decision by an approver who is
 not listed for the pending point, or any decision against an execution that
 has no pending approval point (other than a repeat of the decision that

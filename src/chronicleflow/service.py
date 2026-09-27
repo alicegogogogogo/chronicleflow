@@ -2211,21 +2211,26 @@ class ChronicleFlow:
         source) rather than kept as extra state. The next failure is attempt
         ``count + 1``. A nested instance recurs with the same map id and
         index every iteration, so the loop context scopes the count to the
-        iteration the instance belongs to.
+        iteration the instance belongs to. A re-expansion replaces the
+        instance list, so only failures recorded after the latest expansion
+        of the same map and context count toward a new instance's bound.
         """
         rows = self.store.connection.execute(
-            "SELECT payload FROM events WHERE tenant = ? AND execution_id = ? AND type = 'node_failed'",
+            "SELECT type, payload FROM events WHERE tenant = ? AND execution_id = ? "
+            "AND type IN ('node_failed', 'map_expanded') ORDER BY sequence",
             (tenant, execution_id),
         ).fetchall()
         failures = 0
         for row in rows:
             payload = self.store.decode(row["payload"])
-            if (
-                payload.get("map_id") == map_id
-                and payload.get("index") == index
-                and payload.get("loop_id") == loop_id
-                and payload.get("iteration") == iteration
-            ):
+            if payload.get("loop_id") != loop_id or payload.get("iteration") != iteration:
+                continue
+            if row["type"] == "map_expanded":
+                # A (re-)expansion starts a fresh instance list: failures of
+                # the replaced instances belong to the previous list.
+                if payload.get("map_id") == map_id:
+                    failures = 0
+            elif payload.get("map_id") == map_id and payload.get("index") == index:
                 failures += 1
         return failures + 1
 
@@ -2477,7 +2482,7 @@ class ChronicleFlow:
                 return loop_id
         return None
 
-    # --- dynamic instance deletion and modification ----------------------
+    # --- dynamic instance deletion, modification, and re-expansion --------
 
     def _locate_map_state(
         self, workflow: Workflow, state: dict[str, Any], map_id: str, index: int
@@ -2666,6 +2671,86 @@ class ChronicleFlow:
 
         with self._operation():
             return self._idempotent(key, f"modify-instance:{execution_id}:{map_id}:{index}", apply, tenant)
+
+    def _locate_map_container(
+        self, workflow: Workflow, state: dict[str, Any], map_id: str
+    ) -> tuple[dict[str, Any], Node, dict[str, Any], dict[str, Any]]:
+        """Resolve a dynamic node to its container, declaration, state, and context.
+
+        The execution-level reference mirrors ``_locate_map_state`` without an
+        element index. A map nested in a loop body re-expands in the loop's
+        current iteration only, so a loop that is not running offers no
+        instance list to regenerate; neither does an iteration whose skeleton
+        never gained the map.
+        """
+        node = next((item for item in workflow.nodes if item.id == map_id and item.kind == "map"), None)
+        if node is None:
+            raise NotFoundError(f"map node {map_id} was not found")
+        owner_loop = next(
+            (owner for owner, body in workflow.loop_bodies().items() if map_id in body), None
+        )
+        if owner_loop is None:
+            maps = state.get("maps") or {}
+            if map_id not in maps:
+                raise NotFoundError(f"map node {map_id} was not found")
+            return state, node, maps[map_id], {}
+        loop_state = state.get("loops", {}).get(owner_loop)
+        if loop_state is None or loop_state["status"] != "running":
+            raise ConflictError(f"map node {map_id} has no running iteration to expand")
+        number = loop_state["current_iteration"]
+        iteration_record = loop_state["iterations"][number - 1]
+        map_state = (iteration_record.get("maps") or {}).get(map_id)
+        if map_state is None:
+            raise ConflictError(f"map node {map_id} has not expanded in iteration {number}")
+        return iteration_record, node, map_state, {"loop_id": owner_loop, "iteration": number}
+
+    def expand_map(
+        self,
+        execution_id: str,
+        map_id: str,
+        raw: Any,
+        key: str | None,
+        tenant: str = DEFAULT_TENANT,
+    ) -> dict[str, Any]:
+        """Regenerate a running dynamic node's instance list from its source output.
+
+        Re-expansion reads the element list from the source task's recorded
+        output exactly like the first expansion, replaces every previous
+        instance record with a fresh list queuing from element index zero,
+        and records the same ``map_expanded`` event. The new instances are
+        ordinary instances: they advance, retry, park for approval, and
+        accept deletion and modification exactly like a first expansion.
+        """
+        self._empty_body(raw, "expand map")
+
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            workflow = self._bound_workflow(execution_id, tenant)
+            container, map_node, map_state, context = self._locate_map_container(workflow, state, map_id)
+            if map_state["status"] != "running":
+                # Only an expanded, still-unfinished map re-expands: a pending
+                # node has no instance list yet, and a completed or failed
+                # node's conclusion is final.
+                raise ConflictError(f"map {map_id} cannot be re-expanded in its current state")
+            self._expand_map(execution_id, state, container, map_node, map_state, context, tenant)
+            if state["status"] == "running" and map_state["status"] == "completed":
+                # A re-expansion that produces no instance completes the node
+                # at once; run the boundary cascade so successors unlock.
+                self._auto_process(execution_id, workflow, state, tenant)
+            self.store.connection.execute(
+                "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                (self.store.encode(state), tenant, execution_id),
+            )
+            # The re-expansion settles an instance boundary: checkpoint it in
+            # the same transaction, exactly like an advance does.
+            self._write_checkpoint(execution_id, state, tenant)
+            return state
+
+        with self._operation():
+            return self._idempotent(key, f"expand-map:{execution_id}:{map_id}", apply, tenant)
+
+    # Re-expansion is the same operation under either name.
+    reexpand_map = expand_map
 
     def _launch_iteration(
         self,
