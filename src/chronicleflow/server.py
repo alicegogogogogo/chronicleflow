@@ -22,6 +22,11 @@ METRICS_QUERY_PARAMETERS = ("since", "until")
 # error exactly like an unknown field.
 EVENTS_QUERY_PARAMETERS = ("types", "since", "until", "cursor", "limit")
 
+# The only query parameter the schedule preview accepts: the number of
+# projected trigger times. Anything else is a validation error exactly like
+# an unknown field.
+PREVIEW_QUERY_PARAMETERS = ("limit",)
+
 # A response rendered as a non-JSON text body (the Prometheus export).
 TextResponse = namedtuple("TextResponse", ("content_type", "body"))
 
@@ -131,6 +136,23 @@ class Handler(BaseHTTPRequestHandler):
                 parsed[name] = _positive_integer(query[name][0], name)
         return parsed
 
+    def _preview_limit(self) -> int:
+        """Parse the required limit parameter of the schedule preview query.
+
+        ``limit`` is a positive integer and the only accepted parameter, and
+        it must appear exactly once. A missing, repeated, or malformed value
+        — or any other parameter — is a 400 validation_error.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in PREVIEW_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        if len(query.get("limit", [])) > 1:
+            raise ValidationError("query parameter limit must appear at most once")
+        if "limit" not in query:
+            raise ValidationError("query parameter limit is required")
+        return _positive_integer(query["limit"][0], "limit")
+
     def _body(self) -> Any:
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -190,6 +212,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_workflow(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
             return 200, self.service.schedule_status(parts[1], self._tenant())
+        if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "preview" and self.command == "GET":
+            return 200, self.service.schedule_preview(parts[1], self._preview_limit(), self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command in ("POST", "PUT"):
             return 200, self.service.update_schedule(parts[1], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "pause" and self.command == "POST":
@@ -212,7 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.pull_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if len(parts) == 5 and parts[0] == "executions" and parts[2] == "queues" and parts[4] == "ack" and self.command == "POST":
             return 200, self.service.ack_queue(parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant())
-        if len(parts) == 5 and parts[0] == "executions" and parts[2] == "maps" and parts[4] in ("expand", "reexpand") and self.command == "POST":
+        # "reexpand" is the public name of the re-expansion operation;
+        # "expand" is kept as a documented alias. Both call the same
+        # operation with identical behavior, events, and results.
+        if len(parts) == 5 and parts[0] == "executions" and parts[2] == "maps" and parts[4] in ("reexpand", "expand") and self.command == "POST":
             return 200, self.service.reexpand_map(
                 parts[1], parts[3], self._body(), self.headers.get("Idempotency-Key"), self._tenant()
             )
