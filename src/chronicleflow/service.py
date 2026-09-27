@@ -19,6 +19,30 @@ from .store import Store
 
 logger = logging.getLogger("chronicleflow")
 
+# Every event type the service can append to an execution event stream; the
+# events query validates its type filter against this set.
+EVENT_TYPES = (
+    "approval_decided",
+    "approval_requested",
+    "condition_evaluated",
+    "execution_completed",
+    "execution_started",
+    "execution_terminated",
+    "instance_deleted",
+    "instance_modified",
+    "iteration_started",
+    "loop_completed",
+    "loop_condition_evaluated",
+    "map_completed",
+    "map_expanded",
+    "map_reexpanded",
+    "node_completed",
+    "node_failed",
+    "node_retried",
+    "node_skipped",
+    "version_migrated",
+)
+
 
 def _parse_timestamp(value: str | None, field: str) -> datetime | None:
     """Parse an ISO-8601 UTC timestamp ending in Z; absent means no boundary."""
@@ -1330,17 +1354,46 @@ class ChronicleFlow:
             payload.update(extra)
         self._append(execution_id, "execution_terminated", payload, tenant)
 
-    def events(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> list[dict[str, Any]]:
+    def events(
+        self,
+        execution_id: str,
+        tenant: str = DEFAULT_TENANT,
+        *,
+        types: frozenset[str] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the ordered event stream, optionally filtered and paginated.
+
+        With no argument the full stream is returned exactly as stored. The
+        type set, the closed since/until window on each event's occurrence
+        time, and the cursor (only events with a sequence strictly greater
+        than it) all apply together; at most ``limit`` events are returned,
+        in ascending sequence order. Filtering never renumbers the events,
+        so consecutive pages neither overlap nor skip an event.
+        """
         self.get_execution(execution_id, tenant)
         rows = self.store.connection.execute(
             "SELECT sequence, type, payload, occurred_at FROM events "
             "WHERE tenant = ? AND execution_id = ? ORDER BY sequence",
             (tenant, execution_id),
         ).fetchall()
-        return [
-            {"sequence": row["sequence"], "type": row["type"], "payload": self.store.decode(row["payload"]), "occurred_at": row["occurred_at"]}
-            for row in rows
-        ]
+        selected = []
+        for row in rows:
+            if types is not None and row["type"] not in types:
+                continue
+            if not self._within_window(_parse_stored_time(row["occurred_at"]), since, until):
+                continue
+            if cursor is not None and row["sequence"] <= cursor:
+                continue
+            selected.append(
+                {"sequence": row["sequence"], "type": row["type"], "payload": self.store.decode(row["payload"]), "occurred_at": row["occurred_at"]}
+            )
+            if limit is not None and len(selected) >= limit:
+                break
+        return selected
 
     def advance(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT

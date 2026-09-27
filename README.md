@@ -1016,6 +1016,40 @@ ordered event stream. The third returns the ordered checkpoints; each entry
 gives its `sequence`, the `event_sequence` position it was taken at, the full
 `state` summary, and `created_at`.
 
+The events query accepts optional query parameters that filter and page the
+stream; every event carries a stable `sequence` and its `occurred_at` time,
+and both filtering and pagination build on those two properties:
+
+```http
+GET /executions/run-1/events?types=node_completed,node_failed&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `types` is a comma-separated set of event types; only events whose type is
+  in the set are returned. An empty item, a duplicate, or an unknown event
+  type is a `400 validation_error`;
+- `since` and `until` are ISO-8601 UTC timestamps ending in `Z`, exactly like
+  the metrics query, and bound a **closed** interval on `occurred_at`: an
+  event whose time equals either boundary is returned. When `since` is later
+  than `until` the request is not an error — the result is the definite empty
+  list;
+- `cursor` is the `sequence` of the last event of the previous page: only
+  events with a strictly greater sequence are returned. `limit` bounds how
+  many events the page holds. Both must be positive integers. Events are
+  always returned in ascending sequence order, and filtering never renumbers
+  them, so consecutive pages neither overlap nor skip an event.
+
+The filters and the pagination combine: all given parameters apply together.
+With no parameter the response is the complete ordered event stream, byte for
+byte as before; with parameters it is the same `{"events": [...]}` shape, and
+a filter that matches nothing is the definite empty result `{"events": []}`,
+not an error. A repeated parameter, an unknown parameter, a malformed
+timestamp, or a cursor or limit that is not a positive integer is a `400
+validation_error`; a missing or cross-tenant execution is the usual `404
+not_found`. The query is read-only: it appends no events, writes no usage
+records, and changes no state, so advancement, approvals, recovery, and
+replay never change what a repeated query observes beyond the facts they
+themselves recorded.
+
 ### Webhook notifications
 
 Subscriptions declared on a workflow or an execution deliver outbound webhook
@@ -1586,7 +1620,11 @@ of a missing workflow, or pausing and resuming a workflow that has no
 schedule, is a missing resource, and a malformed pause or resume body is a
 validation error. Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
-they are rejected with 400. Finite floats keep their full precision, including negative zero
+they are rejected with 400. The events query rejects a repeated or unknown
+query parameter, a type filter with an empty, duplicated, or unknown event
+type, a malformed `since` or `until`, and a `cursor` or `limit` that is not a
+positive integer with the same 400 `validation_error`, and a `since` later
+than `until` is the definite empty result rather than an error. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.
 
 ## Tests
