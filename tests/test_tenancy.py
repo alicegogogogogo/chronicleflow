@@ -248,6 +248,80 @@ class QuotaServiceTests(unittest.TestCase):
         with self.assertRaises(ConflictError):
             self.service.create_execution({"id": "run-3", "workflow_id": "wf", "input": {}}, "run-3", "alpha")
 
+    def test_quota_status_requires_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.quota_status("")
+
+    def test_quota_status_without_declaration_is_definite_empty_result(self):
+        self.assertEqual({"status": None}, self.service.quota_status("alpha"))
+        # Creating resources without ever declaring a quota still lists
+        # neither resource.
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "alpha")
+        self.assertEqual({"status": None}, self.service.quota_status("alpha"))
+
+    def test_quota_status_reports_limit_held_and_remaining_in_order(self):
+        self.service.declare_quota({"workflows": 10, "executions": 4}, "q", "alpha")
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "alpha")
+        for index in range(3):
+            self.service.create_execution(
+                {"id": f"run-{index}", "workflow_id": "wf", "input": {}}, f"run-{index}", "alpha"
+            )
+        result = self.service.quota_status("alpha")
+        self.assertEqual(
+            {
+                "status": {
+                    "workflows": {"limit": 10, "held": 1, "remaining": 9},
+                    "executions": {"limit": 4, "held": 3, "remaining": 1},
+                }
+            },
+            result,
+        )
+        # Workflows precede executions, and the three numbers stay in the
+        # declared order, on every repetition.
+        for _ in range(2):
+            self.assertEqual(["workflows", "executions"], list(result["status"]))
+            for entry in result["status"].values():
+                self.assertEqual(["limit", "held", "remaining"], list(entry))
+
+    def test_quota_status_negative_remaining_is_reported_not_clamped(self):
+        self.service.declare_quota({"workflows": 10, "executions": 10}, "q1", "alpha")
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "alpha")
+        self.service.create_execution({"id": "run-0", "workflow_id": "wf", "input": {}}, "run-0", "alpha")
+        self.service.create_execution({"id": "run-1", "workflow_id": "wf", "input": {}}, "run-1", "alpha")
+        self.service.declare_quota({"workflows": 1, "executions": 1}, "q2", "alpha")
+        self.assertEqual(
+            {
+                "status": {
+                    "workflows": {"limit": 1, "held": 1, "remaining": 0},
+                    "executions": {"limit": 1, "held": 2, "remaining": -1},
+                }
+            },
+            self.service.quota_status("alpha"),
+        )
+
+    def test_quota_status_is_scoped_per_tenant_and_read_only(self):
+        self.service.declare_quota({"workflows": 2, "executions": 2}, "q", "alpha")
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf-a", "alpha")
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf-b", "beta")
+        self.assertEqual(
+            {
+                "status": {
+                    "workflows": {"limit": 2, "held": 1, "remaining": 1},
+                    "executions": {"limit": 2, "held": 0, "remaining": 2},
+                }
+            },
+            self.service.quota_status("alpha"),
+        )
+        # Beta never declared a quota, so alpha's numbers never leak.
+        self.assertEqual({"status": None}, self.service.quota_status("beta"))
+        # The status query writes no metering and changes no declaration:
+        # usage totals and the declared quota read the same on both sides.
+        usage_before = self.service.usage("alpha", None, None, None, None)
+        self.service.quota_status("alpha")
+        self.service.quota_status("alpha")
+        self.assertEqual(usage_before, self.service.usage("alpha", None, None, None, None))
+        self.assertEqual({"quota": {"workflows": 2, "executions": 2}}, self.service.get_quota("alpha"))
+
     def test_scheduled_execution_counts_against_execution_quota(self):
         self.service.declare_quota({"workflows": 10, "executions": 1}, "q", "alpha")
         self.service.create_workflow(
@@ -429,6 +503,84 @@ class TenantHttpTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_quota_status_routes_over_http(self):
+        status, data = self.call("GET", "/quotas/status", headers={"X-Tenant-Id": "http-status"})
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"status":null}\n', data)
+        self.call(
+            "PUT",
+            "/quotas",
+            {"workflows": 5, "executions": 9},
+            key="quota-status",
+            headers={"X-Tenant-Id": "http-status"},
+        )
+        self.call(
+            "POST",
+            "/workflows",
+            {"id": "wf-status", "nodes": TASK},
+            key="wf-status",
+            headers={"X-Tenant-Id": "http-status"},
+        )
+        status, data = self.call("GET", "/quotas/status", headers={"X-Tenant-Id": "http-status"})
+        self.assertEqual(200, status)
+        # Compact JSON, stable key order, exactly one trailing newline.
+        self.assertEqual(
+            b'{"status":{"workflows":{"limit":5,"held":1,"remaining":4},'
+            b'"executions":{"limit":9,"held":0,"remaining":9}}}\n',
+            data,
+        )
+        # The same query repeats byte for byte.
+        status, again = self.call("GET", "/quotas/status", headers={"X-Tenant-Id": "http-status"})
+        self.assertEqual(200, status)
+        self.assertEqual(data, again)
+
+    def test_quota_status_without_tenant_is_validation_error_and_leaks_nothing(self):
+        status, data = self.call("GET", "/quotas/status")
+        self.assertEqual(400, status)
+        error = json.loads(data)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertNotIn("status", data.decode())
+        status, data = self.call("GET", "/quotas/status", headers={"X-Tenant-Id": ""})
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_quota_status_rejects_query_parameters(self):
+        headers = {"X-Tenant-Id": "http-status-q"}
+        status, data = self.call("GET", "/quotas/status?bogus=1", headers=headers)
+        self.assertEqual(400, status)
+        error = json.loads(data)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertIn("bogus", error["message"])
+        # Repeated parameters are rejected even when they would be well known.
+        status, data = self.call("GET", "/quotas/status?limit=1&limit=2", headers=headers)
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_quota_status_rejections_write_nothing(self):
+        headers = {"X-Tenant-Id": "http-status-r"}
+        self.call(
+            "PUT",
+            "/quotas",
+            {"workflows": 1, "executions": 1},
+            key="quota-status-r",
+            headers=headers,
+        )
+        self.assertEqual(400, self.call("GET", "/quotas/status?bogus=1", headers=headers)[0])
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"quota": {"workflows": 1, "executions": 1}}, json.loads(data))
+        status, data = self.call("GET", "/quotas/status", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {
+                "status": {
+                    "workflows": {"limit": 1, "held": 0, "remaining": 1},
+                    "executions": {"limit": 1, "held": 0, "remaining": 1},
+                }
+            },
+            json.loads(data),
+        )
 
     def test_quota_exceeded_is_conflict_over_http(self):
         headers = {"X-Tenant-Id": "http-c"}

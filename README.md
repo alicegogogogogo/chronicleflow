@@ -103,7 +103,8 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the quota declaration, the price
+history and status queries, as well as the quota declaration, the quota
+remaining query, the price
 declaration and price delete, the price read and the price change history, and the usage, bill, and
 metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
@@ -145,6 +146,34 @@ X-Tenant-Id: acme
 
 Returns the declared quota, or the definite empty result `{"quota":null}`
 when the tenant has declared none.
+
+A separate read-only entry point reports how much room the declared quota
+leaves, with the same calling shape as the quota read:
+
+```http
+GET /quotas/status
+X-Tenant-Id: acme
+```
+
+Each limited resource gives three numbers — the declared `limit`, the
+`held` count the quota decision itself uses, and the `remaining` room, which
+is simply limit minus holding — in that key order, with workflows first and
+executions second; the same query repeats with the same ordering:
+
+```json
+{"status":{"workflows":{"limit":10,"held":3,"remaining":7},"executions":{"limit":100,"held":12,"remaining":88}}}
+```
+
+Lowering a limit below the current holding reports the `remaining` room
+truthfully as a negative number; it is neither clamped to zero nor rejected.
+A tenant that has never declared a quota gets the definite empty result
+`{"status":null}`, listing neither resource. The query is strictly read-only:
+it writes no metering record and changes no declared quota, usage, bill,
+scheduling, approval, or replay conclusion, and another tenant's quota and
+holdings are never visible and never influence the result. It requires a
+tenant and accepts no query parameters: a missing or empty `X-Tenant-Id`
+header, an unknown parameter (named in the error message), or a repeated
+parameter is a `400 validation_error`, and these rejections write nothing.
 
 When a write would take the tenant past either limit, the whole request is
 rejected with `409 conflict` and an error message that names the quota (for
@@ -2002,7 +2031,7 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations, price declarations and price deletes, and the usage, bill,
+declarations and both quota reads, price declarations and price deletes, and the usage, bill,
 and metrics queries require a tenant, and quota limits and declared unit
 prices are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
