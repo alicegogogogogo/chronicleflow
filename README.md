@@ -103,7 +103,8 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the usage, bill, and metrics queries. An empty
+history and status queries, as well as the quota and price declarations,
+the price read, and the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -158,6 +159,68 @@ schedule is left unchanged — its cursor, `last_triggered_at`, and
 `last_execution_id` stay as they were — so the period is settled on a later
 pass once capacity exists, under the usual per-period idempotence. Delivery
 history follows the tenant of the execution it belongs to.
+
+### Tenant price tables
+
+The bill's baseline unit prices are built in. A tenant may instead declare
+its own price table on a separate entry point with the same calling shape as
+the quota declaration:
+
+```http
+PUT /prices
+Idempotency-Key: price-request-1
+X-Tenant-Id: acme
+
+{"execution_started":200,"workflow_created":1500}
+```
+
+`POST` to the same path is accepted as well. The body must be a non-empty
+JSON object giving a map of metered action type to a positive-integer unit
+price in cents. A non-positive, non-integer, boolean, or non-finite price,
+an unknown metered type, a missing field (an empty object), an extra field
+that is not a metered type, or a non-object body is a `400
+validation_error` that writes nothing. Both price routes require a tenant:
+calling them without `X-Tenant-Id` (or with an empty one) is a `400
+validation_error`, and an unknown query parameter on the read is rejected
+the same way. The response is
+`{"prices":{"execution_started":200,"workflow_created":1500}}`, with the
+declared types in ascending type-identifier order.
+
+A successful declaration replaces the tenant's price table as a whole with
+exactly the types given this time; metered types the declaration does not
+name fall back to the built-in default prices when a bill is taken. The
+declaration rewrites no recorded usage counts and changes no bill taken
+before it was made.
+
+```http
+GET /prices
+X-Tenant-Id: acme
+```
+
+Returns the price table currently declared by the tenant, in ascending
+type-identifier order, or the definite empty result `{"prices":null}` for a
+tenant that has never declared one. The stored table lists only the types
+the declaration named; types left at the default are not copied into it.
+
+The declaration follows the same idempotency rules as every other write:
+the `Idempotency-Key` header is required, repeating the same declaration
+with the same key returns the first result and performs no second
+replacement, and reusing a key for another operation — including another
+price declaration — in the same tenant is a `409 conflict` that leaves the
+tenant's price table unchanged. Price tables are scoped per tenant like
+everything else: a tenant can never read another's declaration, and another
+tenant's declaration never affects this tenant's bill amounts.
+
+The bill and the bucketed bill price with the price table in effect **at
+query time**: a named type uses the tenant's declared price and every other
+type uses the built-in default. Each returned line still gives the metered
+type, the actual `unit_price` used, the `count`, and the integer-cent
+`subtotal`, and the total is exactly the sum of the listed subtotals; types
+with no matching record are still omitted rather than listed at zero. A
+declaration affects only later queries — it neither rewrites recorded usage
+nor revises historical bills — changes no metering, and leaves the bill and
+usage queries read-only. There is no delete entry point in this release; a
+declared table can only be replaced by another declaration.
 
 ### Usage metering and billing
 
@@ -217,7 +280,11 @@ Returns the per-type bill:
 Each item gives the metered `count`, a positive-integer `unit_price` in cents
 that is also returned in the response, and a `subtotal` equal to
 `count * unit_price`; `total` is the integer-cent sum of every subtotal. With
-no records, `items` is empty and `total` is `0`.
+no records, `items` is empty and `total` is `0`. The price used per type is
+the tenant's declared price when its price table names that type and the
+built-in default otherwise, read from the table in effect at query time (see
+[Tenant price tables](#tenant-price-tables)); tenants with no declaration are
+billed byte for byte as before.
 
 Both endpoints accept the same optional query parameters the events and
 metrics queries accept: an optional metered-type filter and an ISO-8601 UTC
@@ -1823,8 +1890,9 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations and the usage, bill, and metrics queries require a tenant, and
-quota limits are positive integers validated by the
+declarations, price declarations, and the usage, bill, and metrics queries
+require a tenant, and quota limits and declared unit prices are positive
+integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
 Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across

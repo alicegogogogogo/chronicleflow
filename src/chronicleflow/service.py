@@ -207,8 +207,11 @@ USAGE_TYPES = (
     USAGE_TYPE_WORKFLOW_CREATED,
 )
 
-# Unit price per metered action, in integer cents. Positive by contract and
-# reported verbatim on every bill line.
+# Built-in default unit price per metered action, in integer cents. Positive by
+# contract and reported verbatim on every bill line. A tenant may declare its
+# own price table: the declared table replaces these prices as a whole for the
+# metered types it names, and any type it leaves out falls back to the value
+# here, evaluated at query time.
 USAGE_UNIT_PRICES = {
     USAGE_TYPE_WORKFLOW_CREATED: 1000,
     USAGE_TYPE_EXECUTION_STARTED: 100,
@@ -730,6 +733,78 @@ class ChronicleFlow:
                     return {"quota": None}
                 return {"quota": {"workflows": row["workflows"], "executions": row["executions"]}}
 
+    def declare_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
+        """Declare the tenant's price table, replacing it as a whole.
+
+        The body is a JSON object whose keys name metered types and whose
+        values are positive integer-cent prices. A type the table omits keeps
+        the built-in default price. A non-object body, a missing or unknown
+        field, or a non-positive, non-integer, boolean, or non-finite price is
+        a validation error that writes nothing. The route requires a tenant
+        and an idempotency key; repeating the same declaration with the same
+        key returns the first result without a second replacement, while the
+        same key on another operation is the usual 409 conflict.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        if not isinstance(raw, dict) or not raw:
+            raise ValidationError("prices must be a non-empty object of metered types to positive integer prices")
+        prices: dict[str, int] = {}
+        for usage_type, value in raw.items():
+            if usage_type not in USAGE_TYPES:
+                raise ValidationError(f"unknown metered type: {usage_type}")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValidationError(f"price for {usage_type} must be a positive integer")
+            if value <= 0:
+                raise ValidationError(f"price for {usage_type} must be a positive integer")
+            prices[usage_type] = value
+        document = self.store.encode(prices)
+
+        def apply() -> dict[str, Any]:
+            self.store.connection.execute(
+                "INSERT INTO prices(tenant, document, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(tenant) DO UPDATE SET document = excluded.document, "
+                "updated_at = excluded.updated_at",
+                (tenant, document, self.store.now()),
+            )
+            return {"prices": dict(sorted(prices.items()))}
+
+        with self._operation():
+            return self._idempotent(key, "declare-prices", apply, tenant)
+
+    def _declared_prices(self, tenant: str) -> dict[str, int] | None:
+        """Return the tenant's declared price table, or None when it never declared one."""
+        row = self.store.connection.execute(
+            "SELECT document FROM prices WHERE tenant = ?",
+            (tenant,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.store.decode(row["document"])
+
+    def get_prices(self, tenant: str) -> dict[str, Any]:
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        with self._operation():
+            with self.store.transaction():
+                declared = self._declared_prices(tenant)
+                if declared is None:
+                    return {"prices": None}
+                return {"prices": dict(sorted(declared.items()))}
+
+    def _effective_prices(self, tenant: str) -> dict[str, int]:
+        """Prices in effect for the tenant at query time.
+
+        Declared prices override the built-in defaults per named metered type;
+        a type the declaration leaves out keeps its default. Read at query
+        time on the open transaction, so a later declaration never changes a
+        bill already taken and never rewrites recorded usage.
+        """
+        declared = self._declared_prices(tenant)
+        if not declared:
+            return dict(USAGE_UNIT_PRICES)
+        return {**USAGE_UNIT_PRICES, **declared}
+
     def _usage_counts(
         self,
         tenant: str,
@@ -828,6 +903,8 @@ class ChronicleFlow:
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
+        if bucket is not None and bucket not in USAGE_BUCKETS:
+            raise ValidationError("bucket must be hour or day")
         with self._operation():
             with self.store.transaction():
                 if bucket is not None:
@@ -867,15 +944,21 @@ class ChronicleFlow:
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
+        if bucket is not None and bucket not in USAGE_BUCKETS:
+            raise ValidationError("bucket must be hour or day")
         with self._operation():
             with self.store.transaction():
+                # Prices are read at query time on this transaction: the bill
+                # prices with the table in effect now, and never revises a
+                # previously taken answer when a declaration changes later.
+                unit_prices = self._effective_prices(tenant)
                 if bucket is not None:
                     # Each bucket lists its present types in ascending
-                    # identifier order with the usual unit price and a
-                    # subtotal of count times that price, then a per-bucket
-                    # subtotal; the window total is exactly the sum of the
-                    # listed per-bucket subtotals. A window or filter that
-                    # matches nothing yields an empty bucket list totaling 0.
+                    # identifier order with the price in effect at query time
+                    # and a subtotal of count times that price, then a
+                    # per-bucket subtotal; the window total is exactly the sum
+                    # of the listed per-bucket subtotals. A window or filter
+                    # that matches nothing yields an empty bucket list totaling 0.
                     buckets = []
                     total = 0
                     for start, counts in self._usage_bucket_counts(
@@ -884,7 +967,7 @@ class ChronicleFlow:
                         items = []
                         subtotal = 0
                         for usage_type, count in sorted(counts.items()):
-                            unit_price = USAGE_UNIT_PRICES[usage_type]
+                            unit_price = unit_prices[usage_type]
                             line_total = count * unit_price
                             subtotal += line_total
                             items.append(
@@ -905,11 +988,11 @@ class ChronicleFlow:
                 items = []
                 total = 0
                 # Only types with a record in the window and in the type filter
-                # appear, each with its usual unit price and a subtotal of
-                # count times that price; a filter or window that matches
-                # nothing yields an empty bill totaling 0.
+                # appear, each with the price in effect at query time and a
+                # subtotal of count times that price; a filter or window that
+                # matches nothing yields an empty bill totaling 0.
                 for usage_type, count in sorted(self._usage_counts(tenant, since, until, types).items()):
-                    unit_price = USAGE_UNIT_PRICES[usage_type]
+                    unit_price = unit_prices[usage_type]
                     subtotal = count * unit_price
                     total += subtotal
                     items.append(

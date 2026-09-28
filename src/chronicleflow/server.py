@@ -117,6 +117,17 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(status, response)
 
+    def _no_query(self, name: str) -> None:
+        """Reject every query parameter on a parameterless GET route.
+
+        The price (and similar) declaration reads accept only the tenant
+        header: like every other route, an unknown query parameter — even an
+        empty one — is a 400 validation_error.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if query:
+            raise ValidationError(f"{name} accepts no query parameters")
+
     def _window(self) -> tuple[Any, Any]:
         """Parse the optional since/until query parameters of a windowed route.
 
@@ -374,6 +385,11 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
+        if self.command in ("PUT", "POST") and parts == ["prices"]:
+            return 200, self.service.declare_prices(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "GET" and parts == ["prices"]:
+            self._no_query("prices")
+            return 200, self.service.get_prices(self._tenant())
         if self.command == "GET" and parts == ["usage"]:
             since, until, types, bucket = self._usage_query()
             return 200, self.service.usage(self._tenant(), since, until, types, bucket)
