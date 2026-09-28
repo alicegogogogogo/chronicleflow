@@ -433,6 +433,9 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"status": "ok"}
         if self.command in ("PUT", "POST") and parts == ["quotas"]:
             return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "DELETE" and parts == ["quotas"]:
+            self._no_query()
+            return 200, self.service.delete_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
         if self.command == "GET" and parts == ["quotas", "status"]:

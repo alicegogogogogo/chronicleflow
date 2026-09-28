@@ -189,6 +189,7 @@ def _declared_map_states(workflow: Workflow) -> dict[str, dict[str, Any]]:
 # behavior is unchanged from before multi-tenancy existed.
 DEFAULT_TENANT = ""
 
+# Default worker lease length in seconds, used when a claim names none of its own.
 DEFAULT_LEASE_SECONDS = 30.0
 
 # How often the background scheduler looks for due schedules.
@@ -794,6 +795,37 @@ class ChronicleFlow:
                     ).fetchone()["held"]
                     status[kind] = {"limit": ceiling, "held": held, "remaining": ceiling - held}
                 return {"status": status}
+
+    def delete_quota(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
+        """Remove the tenant's declared quota as a whole.
+
+        The body must be an empty object; deleting a quota that was never
+        declared is the same definite empty result as deleting one that was.
+        After the delete the tenant holds no quota of its own, so later reads
+        and remaining queries report ``None`` and later writes are no longer
+        quota-limited. Existing workflows and executions are never deleted and
+        stay fully usable, and the delete itself writes no metering record and
+        changes no recorded usage count or bill already taken. The route
+        requires a tenant and an idempotency key: repeating the same delete
+        with the same key returns the first result without a second effect,
+        while the same key on another operation is the usual 409 conflict and
+        leaves every quota row in place.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        self._empty_body(raw, "delete quota")
+
+        def apply() -> dict[str, Any]:
+            # Removing a quota that was never declared deletes no row but is
+            # still the same definite empty result, never an error.
+            self.store.connection.execute(
+                "DELETE FROM quotas WHERE tenant = ?",
+                (tenant,),
+            )
+            return {"quota": None}
+
+        with self._operation():
+            return self._idempotent(key, "delete-quota", apply, tenant)
 
     def declare_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
         """Declare the tenant's price table, replacing it as a whole.

@@ -16,4 +16,3 @@ class NotFoundError(ChronicleFlowError):
 class ConflictError(ChronicleFlowError):
     code = "conflict"
     status = 409
-
