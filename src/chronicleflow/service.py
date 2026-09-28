@@ -189,6 +189,10 @@ def _declared_map_states(workflow: Workflow) -> dict[str, dict[str, Any]]:
 # behavior is unchanged from before multi-tenancy existed.
 DEFAULT_TENANT = ""
 
+# The resources a quota limits and a growth policy may name, in the order they
+# appear in every quota response: workflows first, executions second.
+QUOTA_RESOURCES = ("workflows", "executions")
+
 # The lease length a claim gets when the request names no lease_seconds.
 DEFAULT_LEASE_SECONDS = 30.0
 
@@ -726,11 +730,46 @@ class ChronicleFlow:
 
     # --- quotas ---------------------------------------------------------
 
+    @staticmethod
+    def _parse_quota_growth(raw: Any, limits: dict[str, int]) -> dict[str, dict[str, int]]:
+        """Validate the optional growth policy of a quota declaration.
+
+        The policy names only the resources it covers; a resource it omits is
+        never auto-raised. Each named resource must declare exactly a positive
+        integer ``step`` and a positive integer ``cap`` no lower than the
+        resource's declared limit.
+        """
+        if not isinstance(raw, dict):
+            raise ValidationError("quota growth must be an object")
+        if not raw or set(raw) - set(QUOTA_RESOURCES):
+            raise ValidationError("quota growth must name only workflows and executions")
+        policy: dict[str, dict[str, int]] = {}
+        for kind in QUOTA_RESOURCES:
+            if kind not in raw:
+                continue
+            entry = raw[kind]
+            if not isinstance(entry, dict) or set(entry) != {"step", "cap"}:
+                raise ValidationError(f"quota growth {kind} must contain exactly step and cap")
+            values: dict[str, int] = {}
+            for field in ("step", "cap"):
+                value = entry[field]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValidationError(f"quota growth {kind} {field} must be a positive integer")
+                values[field] = value
+            if values["cap"] < limits[kind]:
+                raise ValidationError(f"quota growth {kind} cap must not be below the declared limit")
+            policy[kind] = values
+        return policy
+
     def declare_quota(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
-        if not isinstance(raw, dict) or set(raw) != {"workflows", "executions"}:
-            raise ValidationError("quota must contain exactly workflows and executions")
+        if not isinstance(raw, dict) or not {"workflows", "executions"} <= set(raw) <= {
+            "workflows",
+            "executions",
+            "growth",
+        }:
+            raise ValidationError("quota must contain exactly workflows and executions, and optionally growth")
         limits = {}
         for field in ("workflows", "executions"):
             value = raw[field]
@@ -739,18 +778,62 @@ class ChronicleFlow:
             if value <= 0:
                 raise ValidationError(f"quota {field} must be a positive integer")
             limits[field] = value
+        # The growth policy is optional; a declaration without one is exactly
+        # the two-limit request and removes any policy the tenant had, since a
+        # repeated declaration replaces limits and policy as a whole.
+        policy = self._parse_quota_growth(raw["growth"], limits) if "growth" in raw else {}
 
         def apply() -> dict[str, Any]:
             self.store.connection.execute(
-                "INSERT INTO quotas(tenant, workflows, executions, updated_at) VALUES (?, ?, ?, ?) "
+                "INSERT INTO quotas(tenant, workflows, executions, "
+                "workflows_step, workflows_cap, executions_step, executions_cap, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(tenant) DO UPDATE SET workflows = excluded.workflows, "
-                "executions = excluded.executions, updated_at = excluded.updated_at",
-                (tenant, limits["workflows"], limits["executions"], self.store.now()),
+                "executions = excluded.executions, workflows_step = excluded.workflows_step, "
+                "workflows_cap = excluded.workflows_cap, executions_step = excluded.executions_step, "
+                "executions_cap = excluded.executions_cap, updated_at = excluded.updated_at",
+                (
+                    tenant,
+                    limits["workflows"],
+                    limits["executions"],
+                    policy.get("workflows", {}).get("step"),
+                    policy.get("workflows", {}).get("cap"),
+                    policy.get("executions", {}).get("step"),
+                    policy.get("executions", {}).get("cap"),
+                    self.store.now(),
+                ),
             )
-            return {"quota": {"workflows": limits["workflows"], "executions": limits["executions"]}}
+            return self._quota_declaration(limits, policy)
 
         with self._operation():
             return self._idempotent(key, "declare-quota", apply, tenant)
+
+    @staticmethod
+    def _quota_declaration(
+        limits: dict[str, int], policy: dict[str, dict[str, int]]
+    ) -> dict[str, Any]:
+        """Render a declaration response (and a stored row back) in stable key order."""
+        quota: dict[str, Any] = {"workflows": limits["workflows"], "executions": limits["executions"]}
+        if policy:
+            # The policy names only the resources the declaration covered,
+            # workflows before executions, and within each entry step then cap.
+            growth = {
+                kind: {"step": policy[kind]["step"], "cap": policy[kind]["cap"]}
+                for kind in QUOTA_RESOURCES
+                if kind in policy
+            }
+            quota["growth"] = growth
+        return {"quota": quota}
+
+    @staticmethod
+    def _row_policy(row: Any) -> dict[str, dict[str, int]]:
+        """Collect the growth policy carried by a quotas row, omitting unmanaged resources."""
+        policy: dict[str, dict[str, int]] = {}
+        for kind in QUOTA_RESOURCES:
+            step, cap = row[f"{kind}_step"], row[f"{kind}_cap"]
+            if step is not None and cap is not None:
+                policy[kind] = {"step": step, "cap": cap}
+        return policy
 
     def get_quota(self, tenant: str) -> dict[str, Any]:
         if not tenant:
@@ -758,12 +841,14 @@ class ChronicleFlow:
         with self._operation():
             with self.store.transaction():
                 row = self.store.connection.execute(
-                    "SELECT workflows, executions FROM quotas WHERE tenant = ?",
+                    "SELECT workflows, executions, workflows_step, workflows_cap, "
+                    "executions_step, executions_cap FROM quotas WHERE tenant = ?",
                     (tenant,),
                 ).fetchone()
                 if row is None:
                     return {"quota": None}
-                return {"quota": {"workflows": row["workflows"], "executions": row["executions"]}}
+                limits = {"workflows": row["workflows"], "executions": row["executions"]}
+                return self._quota_declaration(limits, self._row_policy(row))
 
     def quota_status(self, tenant: str) -> dict[str, Any]:
         """Report each limited resource's declared limit, current holding, and remaining room.
@@ -786,7 +871,7 @@ class ChronicleFlow:
                 if limits is None:
                     return {"status": None}
                 status = {}
-                for kind in ("workflows", "executions"):
+                for kind in QUOTA_RESOURCES:
                     ceiling = limits[kind]
                     held = self.store.connection.execute(
                         f"SELECT COUNT(*) AS held FROM {kind} WHERE tenant = ?",
@@ -1468,22 +1553,57 @@ class ChronicleFlow:
 
     def _quota_limits(self, tenant: str) -> Any:
         return self.store.connection.execute(
-            "SELECT workflows, executions FROM quotas WHERE tenant = ?",
+            "SELECT workflows, executions, workflows_step, workflows_cap, "
+            "executions_step, executions_cap FROM quotas WHERE tenant = ?",
             (tenant,),
         ).fetchone()
 
-    def _assert_within_quota(self, tenant: str, kind: str) -> None:
-        """Reject a write that would grow a tenant past its declared quota."""
+    def _grow_quota_for_write(self, tenant: str, kind: str) -> tuple[bool, int, int]:
+        """Grow a resource's limit by whole steps to admit one more holding.
+
+        Returns ``(admitted, used, ceiling)``. With room under the declared
+        limit the check admits without changing anything. When the write would
+        exceed the limit and the resource declares a growth policy, the limit
+        is raised in whole steps just far enough to admit the write — never
+        past the cap, and never by a partial final step — and the new limit is
+        updated in the caller's transaction. Without a policy, or when no
+        whole-step raise within the cap can admit one more holding, the write
+        is not admitted and the limit is left untouched.
+        """
         limits = self._quota_limits(tenant)
         if limits is None:
-            return
+            return True, 0, 0
         ceiling = limits[kind]
         used = self.store.connection.execute(
             f"SELECT COUNT(*) AS used FROM {kind} WHERE tenant = ?",
             (tenant,),
         ).fetchone()["used"]
-        if used >= ceiling:
-            raise ConflictError(f"quota exceeded: tenant already holds {used} {kind} (quota limit is {ceiling})")
+        if used < ceiling:
+            return True, used, ceiling
+        step, cap = limits[f"{kind}_step"], limits[f"{kind}_cap"]
+        if step is None or cap is None:
+            return False, used, ceiling
+        steps = (used + 1 - ceiling + step - 1) // step
+        raised = ceiling + steps * step
+        if raised > cap:
+            return False, used, ceiling
+        self.store.connection.execute(
+            f"UPDATE quotas SET {kind} = ?, updated_at = ? WHERE tenant = ?",
+            (raised, self.store.now(), tenant),
+        )
+        return True, used, ceiling
+
+    def _assert_within_quota(self, tenant: str, kind: str) -> None:
+        """Admit a growing write, raising the limit per policy, or reject it.
+
+        A write that cannot be admitted is rejected with a 409 conflict whose
+        message names the quota, and performs no write at all.
+        """
+        admitted, used, ceiling = self._grow_quota_for_write(tenant, kind)
+        if not admitted:
+            raise ConflictError(
+                f"quota exceeded: tenant already holds {used} {kind} (quota limit is {ceiling})"
+            )
 
     def create_workflow(self, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         subscriptions = None
@@ -2816,14 +2936,13 @@ class ChronicleFlow:
                 (tenant, execution_id),
             ).fetchone()
             if not claimed:
-                limits = self._quota_limits(tenant)
-                if limits is not None:
-                    used = self.store.connection.execute(
-                        "SELECT COUNT(*) AS used FROM executions WHERE tenant = ?",
-                        (tenant,),
-                    ).fetchone()["used"]
-                    if used >= limits["executions"]:
-                        return None
+                admitted, _, _ = self._grow_quota_for_write(tenant, "executions")
+                if not admitted:
+                    # The execution quota leaves no room its growth policy can
+                    # reach within the cap: create nothing and leave the cursor
+                    # and schedule status untouched so the period is retried on
+                    # a later pass once capacity exists.
+                    return None
                 # A scheduled run binds the revision that is current at fire
                 # time (the unversioned revision for a workflow without
                 # versions); later upgrades never move it.

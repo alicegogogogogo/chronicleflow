@@ -141,6 +141,36 @@ limits (re-anchoring nothing else). Lowering a limit below the current
 holding deletes no existing data — existing workflows and executions stay
 fully usable — it only rejects later writes that would exceed the new limit.
 
+Besides the two limits a declaration may carry one optional `growth` object
+naming an automatic expansion policy for each limited resource. A policy
+names only the resources it covers, and a resource it omits is never raised
+automatically. Each named resource must declare exactly a positive integer
+`step` and a positive integer `cap`, and the cap must not be below the
+resource's declared limit:
+
+```http
+PUT /quotas
+Idempotency-Key: quota-request-2
+X-Tenant-Id: acme
+
+{"workflows":10,"executions":100,"growth":{"workflows":{"step":5,"cap":50},"executions":{"step":50,"cap":500}}}
+```
+
+A missing field, an unknown field (inside the policy or beside it), a
+non-object policy, a resource other than `workflows` or `executions`, or a
+step or cap that is non-positive, non-integer, boolean, or non-finite is a
+`400 validation_error`; a cap below the resource's declared limit is rejected
+the same way. Every such rejection writes nothing. A declaration without
+`growth` is byte-for-byte the two-limit request above; repeating a declaration
+replaces limits and policy as a whole, so a declaration that names no `growth`
+also drops the tenant's previous policy. The declaration response and the
+quota read include the policy only when one is declared, with each entry
+listing `step` before `cap` and resources in workflows-first order:
+
+```json
+{"quota":{"workflows":10,"executions":100,"growth":{"workflows":{"step":5,"cap":50},"executions":{"step":50,"cap":500}}}}
+```
+
 ```http
 GET /quotas
 X-Tenant-Id: acme
@@ -213,20 +243,38 @@ tenant and accepts no query parameters: a missing or empty `X-Tenant-Id`
 header, an unknown parameter (named in the error message), or a repeated
 parameter is a `400 validation_error`, and these rejections write nothing.
 
-When a write would take the tenant past either limit, the whole request is
+When a write would take the tenant past either limit, the write is admitted
+once the resource declares a growth policy that can make room: the declared
+limit is raised in whole steps — the smallest number of `step` increments
+that admits the write — never past the `cap` and never by a partial final
+step, and the raised limit commits with the write in the same transaction,
+so the request succeeds instead of returning a conflict. The expansion
+changes only the declared limit: it writes no metering record, changes no
+recorded usage count, and changes no bill conclusion already reached.
+Repeating the same write with the same idempotency key returns the first
+result without a second expansion, and reusing that key for another
+operation is the usual `409 conflict`. Without a policy on the resource, or
+when no whole-step raise within the cap can admit the write — including when
+the cap already leaves no room for one more holding — the whole request is
 rejected with `409 conflict` and an error message that names the quota (for
 example `quota exceeded: tenant already holds 10 workflows (quota limit is
 10)`), so callers can tell quota rejection apart from an ordinary identifier
-conflict. The rejection performs no partial write: nothing is inserted and
-previously stored data is unaffected, exactly as for validation failures.
+conflict. The rejection performs no partial write and leaves the limit
+untouched: nothing is inserted and previously stored data is unaffected,
+exactly as for validation failures. The quota read and the remaining query
+report the raised limit; the remaining query's `remaining` room is computed
+from it.
 
 A schedule firing on time creates its execution in the schedule's tenant and
 that execution counts against the tenant's execution quota. When the tenant
-is at its execution limit, the due period creates no execution and the
-schedule is left unchanged — its cursor, `last_triggered_at`, and
-`last_execution_id` stay as they were — so the period is settled on a later
-pass once capacity exists, under the usual per-period idempotence. Delivery
-history follows the tenant of the execution it belongs to.
+is at its execution limit, a growth policy raises the limit exactly as for a
+manual creation and the period fires normally; when there is no policy or
+the cap leaves no room a whole step can reach, the due period creates no
+execution and the schedule is left unchanged — its cursor,
+`last_triggered_at`, and `last_execution_id` stay as they were — so the
+period is settled on a later pass once capacity exists, under the usual
+per-period idempotence. Delivery history follows the tenant of the execution
+it belongs to.
 
 ### Tenant price tables
 
