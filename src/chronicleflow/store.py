@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS quotas (
   executions INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prices (
+  tenant TEXT PRIMARY KEY,
+  document TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS queue_targets (
   tenant TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,

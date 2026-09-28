@@ -357,6 +357,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ValidationError(f"{TENANT_HEADER} header must be a non-empty string")
         return tenant
 
+    def _assert_no_query_parameters(self) -> None:
+        """Reject any query string on a route that defines no query parameters.
+
+        The pricing read takes no parameters, so even a single unknown
+        parameter is a 400 validation_error, exactly like an unknown field on
+        a request body.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if query:
+            raise ValidationError(f"unknown query parameter: {sorted(query)[0]}")
+
     @staticmethod
     def _instance_index(segment: str) -> int:
         """Parse the element index path segment; a non-integer segment is malformed."""
@@ -374,6 +385,11 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
+        if self.command in ("PUT", "POST") and parts == ["prices"]:
+            return 200, self.service.declare_prices(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "GET" and parts == ["prices"]:
+            self._assert_no_query_parameters()
+            return 200, self.service.get_prices(self._tenant())
         if self.command == "GET" and parts == ["usage"]:
             since, until, types, bucket = self._usage_query()
             return 200, self.service.usage(self._tenant(), since, until, types, bucket)
