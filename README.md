@@ -220,12 +220,15 @@ that is also returned in the response, and a `subtotal` equal to
 no records, `items` is empty and `total` is `0`.
 
 Both endpoints accept the same optional query parameters the events and
-metrics queries accept: an optional metered-type filter and an ISO-8601 UTC
-timestamp window, each timestamp ending in `Z`:
+metrics queries accept: an optional metered-type filter, an ISO-8601 UTC
+timestamp window, each timestamp ending in `Z`, and an optional fixed time
+bucket:
 
 ```http
 GET /usage?type=execution_started,workflow_created&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
 GET /bill?type=execution_started&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
+GET /usage?bucket=hour
+GET /bill?bucket=day&since=2026-09-26T00:00:00.000Z&until=2026-09-27T00:00:00.000Z
 X-Tenant-Id: acme
 ```
 
@@ -238,6 +241,10 @@ X-Tenant-Id: acme
   occurrence time: a record whose time equals `since` or `until` is counted.
   When either parameter is absent the corresponding bound is open, so omitting
   both returns exactly the cumulative result above;
+- `bucket` is exactly `hour` or `day`; `hour` aligns each bucket to the UTC
+  hour and `day` to UTC midnight. An empty value or any other value is a
+  `400 validation_error`; when `bucket` is absent the response is byte for byte
+  the cumulative or windowed aggregate above;
 - a malformed `since` or `until`, a repeated parameter, or any unknown query
   parameter is a `400 validation_error` that writes nothing;
 - when `since` is later than `until` the request is not an error: the window
@@ -261,6 +268,86 @@ is exactly the sum of the subtotals of the listed items. The query is
 read-only: it writes no usage records, changes no prices or metering
 conclusions, and never alters already recorded usage — under event replay or
 recovery the same window and type filter always give the same answer.
+
+### Time buckets
+
+Giving `bucket=hour` or `bucket=day` summarizes the same filtered, windowed
+records into fixed UTC time buckets, so a trend can be read without pulling
+the per-record history and grouping it client-side. `hour` aligns each bucket
+to the UTC hour (`:00:00`) and `day` to UTC midnight (`T00:00:00`); buckets
+are never aligned to any other timezone. The type filter and time window
+combine with the bucket as an intersection: a bucket holds only records whose
+type is named by `type` (when given) and whose occurrence time falls in the
+closed `since`/`until` window (when given). The window keeps its closed
+endpoints, its open bounds when either side is absent, and its
+same-instant inclusion rules; the occurrence time of a record is judged by
+the same rule as without bucketing.
+
+The usage query returns the buckets in ascending order of bucket start time,
+each entry naming the bucket start followed by that bucket's per-type counts:
+
+```http
+GET /usage?bucket=hour&type=execution_started,workflow_created
+X-Tenant-Id: acme
+```
+
+```json
+{"buckets":[
+  {"bucket_start":"2026-09-26T08:00:00Z","counts":[
+    {"type":"execution_started","count":1},
+    {"type":"workflow_created","count":2}]},
+  {"bucket_start":"2026-09-26T09:00:00Z","counts":[
+    {"type":"workflow_created","count":1}]}
+]}
+```
+
+- `bucket_start` is the bucket's start as an ISO-8601 UTC string ending in
+  `Z`; every count in the entry is for records whose occurrence time is in the
+  half-open span from that start up to (but not including) the next bucket
+  start;
+- `counts` lists the metered types with at least one record in the bucket, in
+  ascending type identifier order, each with the same `type`/`count` shape as
+  the unbucketed usage list. A metered type with no record in that bucket is
+  omitted from that bucket rather than reported at zero;
+- a bucket that holds no matching record never appears, and buckets are not
+  padded with empty entries between recorded buckets.
+
+The bill returns the buckets in ascending start-time order, each with its own
+items, its own `subtotal`, and a window `total`:
+
+```json
+{"bill":{"buckets":[
+  {"bucket_start":"2026-09-26T08:00:00Z","items":[
+    {"type":"execution_started","count":1,"unit_price":100,"subtotal":100},
+    {"type":"workflow_created","count":2,"unit_price":1000,"subtotal":2000}],
+   "subtotal":2100},
+  {"bucket_start":"2026-09-26T09:00:00Z","items":[
+    {"type":"workflow_created","count":1,"unit_price":1000,"subtotal":1000}],
+   "subtotal":1000}],
+ "total":3100}}
+```
+
+Each bucket's `items` are sorted by ascending metered-type identifier and
+carry the same integer-cent `count`, `unit_price`, and `subtotal` as the
+unbucketed bill, with a type absent from the bucket omitted rather than billed
+at zero; `subtotal` is the integer-cent sum of that bucket's item subtotals,
+and the top-level `total` is exactly the sum of every listed bucket's
+`subtotal`, so it stays equal to the sum over all listed items. All money
+amounts are integer cents.
+
+A window with `since` later than `until`, a type filter that matches nothing,
+or a tenant with no matching records is not an error: both queries return a
+definite empty bucket list — `{"buckets":[]}` for usage and
+`{"bill":{"buckets":[],"total":0}}` for the bill, whose total is then `0`.
+Bucketing does not change what a record counts as: it appends no usage
+records, changes no metering conclusion or unit price, and leaves recorded
+usage and billing conclusions unchanged under event replay or checkpoint
+recovery. A missing or empty `X-Tenant-Id`, a malformed timestamp, an empty
+or invalid `bucket`, a repeated parameter, or an unknown query parameter is a
+`400 validation_error` that reveals no usage and performs no partial write;
+the queries stay read-only and tenant-isolated under every bucket, so another
+tenant's records are never visible and never affect a bucket's counts or the
+total.
 
 Both endpoints are tenant-scoped `GET` requests: a missing or empty
 `X-Tenant-Id` is a `400 validation_error` that reveals no usage. Usage and

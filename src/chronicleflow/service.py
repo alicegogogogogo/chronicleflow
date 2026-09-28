@@ -63,6 +63,13 @@ def _parse_stored_time(value: str) -> datetime:
     return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
+def _bucket_start(moment: datetime, bucket: str) -> datetime:
+    """Floor a UTC moment to its fixed bucket start: the UTC hour or UTC day."""
+    if bucket == USAGE_BUCKET_HOUR:
+        return moment.replace(minute=0, second=0, microsecond=0)
+    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _iso_utc(epoch_seconds: float) -> str:
     """Render epoch seconds as an ISO-8601 UTC timestamp string ending in Z."""
     return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -198,6 +205,13 @@ USAGE_UNIT_PRICES = {
     USAGE_TYPE_SCHEDULE_TRIGGERED: 50,
     USAGE_TYPE_DELIVERY_ATTEMPTED: 10,
 }
+
+# The only fixed time buckets the aggregate usage and bill queries accept: an
+# hour bucket aligns to the UTC hour and a day bucket to UTC midnight. Any
+# other value (including an empty one) is a validation error.
+USAGE_BUCKET_HOUR = "hour"
+USAGE_BUCKET_DAY = "day"
+USAGE_BUCKETS = (USAGE_BUCKET_HOUR, USAGE_BUCKET_DAY)
 
 # Termination reasons in ascending identifier order. The metrics status
 # distribution always reports every reason, zero when no execution ended for
@@ -745,17 +759,76 @@ class ChronicleFlow:
             if counts.get(usage_type) and (types is None or usage_type in types)
         }
 
+    def _usage_bucket_counts(
+        self,
+        tenant: str,
+        bucket: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        types: tuple[str, ...] | None = None,
+    ) -> dict[datetime, dict[str, int]]:
+        """Per-bucket per-type counts of the tenant's usage records.
+
+        Each matching record lands in the fixed UTC bucket its occurrence time
+        floors to (the UTC hour for ``hour`` and UTC midnight for ``day``).
+        The type filter and the closed time window combine with the bucket as
+        an intersection exactly as for the unbucketed counts, so a window with
+        ``since`` later than ``until`` or a filter that matches nothing yields
+        no buckets. Buckets that hold no matching record never appear.
+        """
+        wanted = set(types) if types is not None else None
+        rows = self.store.connection.execute(
+            "SELECT type, created_at FROM usage_records WHERE tenant = ?",
+            (tenant,),
+        ).fetchall()
+        buckets: dict[datetime, dict[str, int]] = {}
+        for row in rows:
+            if wanted is not None and row["type"] not in wanted:
+                continue
+            occurred_at = _parse_stored_time(row["created_at"])
+            if not self._within_window(occurred_at, since, until):
+                continue
+            start = _bucket_start(occurred_at, bucket)
+            per_type = buckets.setdefault(start, {})
+            per_type[row["type"]] = per_type.get(row["type"], 0) + 1
+        return buckets
+
+    @staticmethod
+    def _iso_bucket_start(start: datetime) -> str:
+        """Render a bucket start as an ISO-8601 UTC timestamp string ending in Z."""
+        return start.isoformat().replace("+00:00", "Z")
+
     def usage(
         self,
         tenant: str,
         since: datetime | None = None,
         until: datetime | None = None,
         types: tuple[str, ...] | None = None,
+        bucket: str | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
+        if bucket is not None and bucket not in USAGE_BUCKETS:
+            raise ValidationError("bucket must be hour or day")
         with self._operation():
             with self.store.transaction():
+                if bucket is not None:
+                    # Buckets are returned in ascending start-time order; within
+                    # a bucket types are reported in ascending identifier order,
+                    # a type with no records in the bucket omitted, so a filter
+                    # or window that matches nothing gets a definite empty list.
+                    bucketed = self._usage_bucket_counts(tenant, bucket, since, until, types)
+                    entries = [
+                        {
+                            "bucket_start": self._iso_bucket_start(start),
+                            "counts": [
+                                {"type": usage_type, "count": count}
+                                for usage_type, count in sorted(per_type.items())
+                            ],
+                        }
+                        for start, per_type in sorted(bucketed.items())
+                    ]
+                    return {"buckets": entries}
                 # Types are reported in ascending identifier order; a type
                 # with no records in the window, or one the filter does not
                 # name, is omitted, so a filter or window that matches nothing
@@ -772,11 +845,47 @@ class ChronicleFlow:
         since: datetime | None = None,
         until: datetime | None = None,
         types: tuple[str, ...] | None = None,
+        bucket: str | None = None,
     ) -> dict[str, Any]:
         if not tenant:
             raise ValidationError("tenant id must be a non-empty string")
+        if bucket is not None and bucket not in USAGE_BUCKETS:
+            raise ValidationError("bucket must be hour or day")
         with self._operation():
             with self.store.transaction():
+                if bucket is not None:
+                    # Each bucket carries its own items, subtotal, and bucket
+                    # total; buckets appear in ascending start-time order and
+                    # types within a bucket in ascending identifier order. The
+                    # window total is exactly the sum of the bucket subtotals,
+                    # so an empty bucket list totals 0.
+                    bucketed = self._usage_bucket_counts(tenant, bucket, since, until, types)
+                    result_buckets = []
+                    total = 0
+                    for start, per_type in sorted(bucketed.items()):
+                        items = []
+                        subtotal = 0
+                        for usage_type, count in sorted(per_type.items()):
+                            unit_price = USAGE_UNIT_PRICES[usage_type]
+                            line_total = count * unit_price
+                            subtotal += line_total
+                            items.append(
+                                {
+                                    "type": usage_type,
+                                    "count": count,
+                                    "unit_price": unit_price,
+                                    "subtotal": line_total,
+                                }
+                            )
+                        total += subtotal
+                        result_buckets.append(
+                            {
+                                "bucket_start": self._iso_bucket_start(start),
+                                "items": items,
+                                "subtotal": subtotal,
+                            }
+                        )
+                    return {"bill": {"buckets": result_buckets, "total": total}}
                 items = []
                 total = 0
                 # Only types with a record in the window and in the type filter
