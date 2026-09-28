@@ -118,6 +118,10 @@ CREATE TABLE IF NOT EXISTS quotas (
   tenant TEXT PRIMARY KEY,
   workflows INTEGER NOT NULL,
   executions INTEGER NOT NULL,
+  workflows_step INTEGER,
+  workflows_cap INTEGER,
+  executions_step INTEGER,
+  executions_cap INTEGER,
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS prices (
@@ -190,6 +194,12 @@ ADDED_COLUMNS = {
     "workflows": ("current_version", "TEXT"),
     "executions": [("workflow_version", "TEXT"), ("created_at", "TEXT")],
     "subscriptions": ("version", "TEXT NOT NULL DEFAULT ''"),
+    "quotas": [
+        ("workflows_step", "INTEGER"),
+        ("workflows_cap", "INTEGER"),
+        ("executions_step", "INTEGER"),
+        ("executions_cap", "INTEGER"),
+    ],
 }
 
 

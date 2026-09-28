@@ -128,18 +128,69 @@ X-Tenant-Id: acme
 {"workflows": 10, "executions": 100}
 ```
 
-`POST` to the same path is accepted as well. The body must contain exactly
-`workflows` and `executions`, each a positive integer; a non-positive,
-non-integer, boolean, or non-finite value, a missing or extra field, or a
+`POST` to the same path is accepted as well. The body must contain
+`workflows` and `executions`, each a positive integer, and may contain only
+those two fields plus the optional `growth`; a non-positive, non-integer,
+boolean, or non-finite value, a missing field, an unknown field, or a
 non-object body is a `400 validation_error` that writes nothing. Every quota
 route requires a tenant: declaring, deleting, and reading without
 `X-Tenant-Id` (or with an empty one) is a `400 validation_error`, and an
 unknown query parameter on the delete or the remaining query is rejected the
 same way, with the message naming the offending parameter. The response is
-`{"quota":{"workflows":10,"executions":100}}`; declaring again replaces the
+`{"quota":{"workflows":10,"executions":100}}`; a declaration containing only
+the two limits is byte-for-byte the same request and response as before, and
+the legacy tenantless namespace is unchanged. Declaring again replaces the
 limits (re-anchoring nothing else). Lowering a limit below the current
 holding deletes no existing data — existing workflows and executions stay
 fully usable — it only rejects later writes that would exceed the new limit.
+
+Besides the two limits a declaration may carry an optional `growth` policy
+naming either or both limited resources, each entry giving a positive-integer
+`step` and a positive-integer `cap`, with the step listed before the cap:
+
+```http
+PUT /quotas
+Idempotency-Key: quota-request-2
+X-Tenant-Id: acme
+
+{"workflows":10,"executions":100,"growth":{
+  "workflows":{"step":5,"cap":50},
+  "executions":{"step":50,"cap":500}}}
+```
+
+An entry whose `cap` is below the same declaration's limit for that resource,
+a missing or unknown field on the policy or an entry, an empty policy object,
+or a step or cap that is not a positive integer (a boolean, a float, or a
+non-finite number) is a `400 validation_error` that writes nothing, exactly
+like a bad limit. The policy covers only the resources named this time: a
+resource the policy does not name is never auto-raised. Declaring again
+replaces limits and policy as one whole, so a declaration that omits
+`growth` removes any policy the tenant had. A declaration with a policy gets
+the policy back on reads, in the same shape and key order:
+
+```json
+{"quota":{"workflows":10,"executions":100,"growth":{
+  "workflows":{"step":5,"cap":50},"executions":{"step":50,"cap":500}}}}
+```
+
+When a write that creates a workflow or execution would take the tenant past
+the current limit, and that resource declares a growth policy, the limit is
+raised in whole steps just far enough to admit the write — never past the
+cap, and never by a partial final step — and the write then succeeds instead
+of returning a conflict; the raised limit is committed together with the
+write. The expansion changes only the declared limit: it writes no metering
+record, changes no recorded usage, and revises no bill conclusion already
+reached. With no policy for the resource, or when no whole-step raise within
+the cap can admit the write, the request is rejected with `409 conflict` and
+an error message that names the quota (for example `quota exceeded: tenant
+already holds 10 workflows (quota limit is 10)`); nothing is inserted. The
+remaining query reports the limit after any such raise. A schedule firing on
+time behaves the same way: when its tenant's execution policy can make room,
+the due period creates its execution and raises the limit with it; once the
+cap cannot admit another execution the period creates nothing and the
+schedule is left unchanged — its cursor, `last_triggered_at`, and
+`last_execution_id` stay as they were — so the period settles on a later
+pass.
 
 ```http
 GET /quotas
@@ -213,7 +264,9 @@ tenant and accepts no query parameters: a missing or empty `X-Tenant-Id`
 header, an unknown parameter (named in the error message), or a repeated
 parameter is a `400 validation_error`, and these rejections write nothing.
 
-When a write would take the tenant past either limit, the whole request is
+When a write would take the tenant past either limit, the limit is raised
+automatically when the resource declares a growth policy that can admit the
+write within its cap, as described above; otherwise the whole request is
 rejected with `409 conflict` and an error message that names the quota (for
 example `quota exceeded: tenant already holds 10 workflows (quota limit is
 10)`), so callers can tell quota rejection apart from an ordinary identifier
@@ -221,12 +274,14 @@ conflict. The rejection performs no partial write: nothing is inserted and
 previously stored data is unaffected, exactly as for validation failures.
 
 A schedule firing on time creates its execution in the schedule's tenant and
-that execution counts against the tenant's execution quota. When the tenant
-is at its execution limit, the due period creates no execution and the
-schedule is left unchanged — its cursor, `last_triggered_at`, and
-`last_execution_id` stay as they were — so the period is settled on a later
-pass once capacity exists, under the usual per-period idempotence. Delivery
-history follows the tenant of the execution it belongs to.
+that execution counts against the tenant's execution quota, growing the
+declared limit with the write when its policy allows. When the tenant is at
+its execution limit and the policy cannot raise the limit within the cap,
+the due period creates no execution and the schedule is left unchanged — its
+cursor, `last_triggered_at`, and `last_execution_id` stay as they were — so
+the period is settled on a later pass once capacity exists, under the usual
+per-period idempotence. Delivery history follows the tenant of the execution
+it belongs to.
 
 ### Tenant price tables
 
