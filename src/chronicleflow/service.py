@@ -772,6 +772,34 @@ class ChronicleFlow:
         with self._operation():
             return self._idempotent(key, "declare-prices", apply, tenant)
 
+    def delete_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
+        """Remove the tenant's declared price table as a whole.
+
+        The body must be an empty object; deleting a table that was never
+        declared is the same definite empty result as deleting one that was.
+        After the delete the tenant holds no table of its own, so later bills
+        use the built-in defaults; recorded usage and bills already taken are
+        untouched. The route requires a tenant and an idempotency key:
+        repeating the same delete with the same key returns the first result
+        without a second effect, while the same key on another operation is
+        the usual 409 conflict and leaves every table in place.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        self._empty_body(raw, "delete prices")
+
+        def apply() -> dict[str, Any]:
+            # Removing a table that was never declared deletes no row but is
+            # still the same definite empty result, never an error.
+            self.store.connection.execute(
+                "DELETE FROM prices WHERE tenant = ?",
+                (tenant,),
+            )
+            return {"prices": None}
+
+        with self._operation():
+            return self._idempotent(key, "delete-prices", apply, tenant)
+
     def _declared_prices(self, tenant: str) -> dict[str, int] | None:
         """Return the tenant's declared price table, or None when it never declared one."""
         row = self.store.connection.execute(

@@ -103,8 +103,9 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the quota and price declarations,
-the price read, and the usage, bill, and metrics queries. An empty
+history and status queries, as well as the quota declaration, the price
+declaration and price delete, the price read, and the usage, bill, and
+metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -179,10 +180,11 @@ JSON object giving a map of metered action type to a positive-integer unit
 price in cents. A non-positive, non-integer, boolean, or non-finite price,
 an unknown metered type, a missing field (an empty object), an extra field
 that is not a metered type, or a non-object body is a `400
-validation_error` that writes nothing. Both price routes require a tenant:
-calling them without `X-Tenant-Id` (or with an empty one) is a `400
-validation_error`, and an unknown query parameter on the read is rejected
-the same way. The response is
+validation_error` that writes nothing. Every price route requires a tenant:
+declaring, deleting, and reading without `X-Tenant-Id` (or with an empty
+one) is a `400 validation_error`, and an unknown query parameter on the
+read or the delete is rejected the same way, with the message naming the
+offending parameter. The response is
 `{"prices":{"execution_started":200,"workflow_created":1500}}`, with the
 declared types in ascending type-identifier order.
 
@@ -202,14 +204,40 @@ type-identifier order, or the definite empty result `{"prices":null}` for a
 tenant that has never declared one. The stored table lists only the types
 the declaration named; types left at the default are not copied into it.
 
-The declaration follows the same idempotency rules as every other write:
-the `Idempotency-Key` header is required, repeating the same declaration
-with the same key returns the first result and performs no second
-replacement, and reusing a key for another operation — including another
-price declaration — in the same tenant is a `409 conflict` that leaves the
-tenant's price table unchanged. Price tables are scoped per tenant like
-everything else: a tenant can never read another's declaration, and another
-tenant's declaration never affects this tenant's bill amounts.
+A tenant can also remove the table it declared, on the same path with the
+`DELETE` method and the same calling shape as the other price writes:
+
+```http
+DELETE /prices
+Idempotency-Key: price-delete-1
+X-Tenant-Id: acme
+
+{}
+```
+
+The body must be exactly an empty object; a non-empty or non-object body,
+an unknown field, or a non-finite value is a `400 validation_error` that
+touches no price table. The delete removes the table as a whole and leaves
+no partial write: it is atomic with the declaration and the read, so a
+concurrent reader sees either the complete old table or no table at all.
+After it succeeds the tenant no longer holds a declared table, and both the
+delete response and the following read give the definite empty result
+`{"prices":null}`. Deleting the table of a tenant that never declared one
+returns that same definite empty result rather than an error. The delete
+rewrites no recorded usage counts and changes no bill taken before it was
+made; afterward both the bill and the bucketed bill price every type at the
+built-in default, each line still giving the metered type, the actual
+`unit_price` used, the `count`, and the integer-cent `subtotal`.
+
+The declaration and the delete follow the same idempotency rules as every
+other write: the `Idempotency-Key` header is required, repeating the same
+declaration or the same delete with the same key returns the first result
+and performs no second replacement or removal, and reusing a key for
+another operation — including another price declaration or a price delete
+— in the same tenant is a `409 conflict` that leaves the tenant's price
+table unchanged. Price tables are scoped per tenant like everything else: a
+tenant can never read or delete another's declaration, and another tenant's
+declaration or deletion never affects this tenant's bill amounts.
 
 The bill and the bucketed bill price with the price table in effect **at
 query time**: a named type uses the tenant's declared price and every other
@@ -219,8 +247,10 @@ type, the actual `unit_price` used, the `count`, and the integer-cent
 with no matching record are still omitted rather than listed at zero. A
 declaration affects only later queries — it neither rewrites recorded usage
 nor revises historical bills — changes no metering, and leaves the bill and
-usage queries read-only. There is no delete entry point in this release; a
-declared table can only be replaced by another declaration.
+usage queries read-only. A delete affects only later queries in the same
+way: the table is removed as a whole, later bills fall back to the
+built-in defaults, and recorded usage and already-taken bills stay exactly
+as they were.
 
 ### Usage metering and billing
 
@@ -1890,9 +1920,9 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations, price declarations, and the usage, bill, and metrics queries
-require a tenant, and quota limits and declared unit prices are positive
-integers validated by the
+declarations, price declarations and price deletes, and the usage, bill,
+and metrics queries require a tenant, and quota limits and declared unit
+prices are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
 Reusing a workflow or execution identifier, adding a workflow version whose
 tag already exists for that workflow, or reusing an idempotency key across
