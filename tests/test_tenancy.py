@@ -322,6 +322,128 @@ class QuotaServiceTests(unittest.TestCase):
         self.assertEqual(usage_before, self.service.usage("alpha", None, None, None, None))
         self.assertEqual({"quota": {"workflows": 2, "executions": 2}}, self.service.get_quota("alpha"))
 
+    def test_delete_quota_without_a_declaration_is_the_definite_empty_result(self):
+        self.assertEqual({"quota": None}, self.service.delete_quota({}, "d1", "alpha"))
+        # The tenant still reads as never having declared a quota.
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+        self.assertEqual({"status": None}, self.service.quota_status("alpha"))
+
+    def test_delete_quota_removes_the_declaration_as_a_whole(self):
+        self.service.declare_quota({"workflows": 2, "executions": 5}, "q1", "alpha")
+        self.assertEqual({"quota": None}, self.service.delete_quota({}, "d1", "alpha"))
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+        self.assertEqual({"status": None}, self.service.quota_status("alpha"))
+        # A later declaration works exactly as the first one ever did.
+        redeclared = self.service.declare_quota({"workflows": 7, "executions": 70}, "q2", "alpha")
+        self.assertEqual({"quota": {"workflows": 7, "executions": 70}}, redeclared)
+        self.assertEqual({"quota": {"workflows": 7, "executions": 70}}, self.service.get_quota("alpha"))
+
+    def test_delete_quota_keeps_held_data_and_lifts_the_check_for_later_writes(self):
+        self.service.declare_quota({"workflows": 1, "executions": 1}, "q1", "alpha")
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "alpha")
+        self.service.create_execution({"id": "run-0", "workflow_id": "wf", "input": {}}, "run-0", "alpha")
+        self.service.delete_quota({}, "d", "alpha")
+        # Existing workflows and executions stay present and fully usable.
+        self.assertEqual("wf", self.service.get_workflow("wf", "alpha")["id"])
+        self.assertEqual("running", self.service.get_execution("run-0", "alpha")["status"])
+        # The status query lists neither resource and repeats identically.
+        for _ in range(2):
+            self.assertEqual({"status": None}, self.service.quota_status("alpha"))
+        # The limits no longer bound writes that would previously have exceeded them.
+        self.service.create_workflow({"id": "wf-2", "nodes": TASK}, "wf-2", "alpha")
+        self.service.create_execution({"id": "run-1", "workflow_id": "wf", "input": {}}, "run-1", "alpha")
+
+    def test_delete_quota_requires_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.delete_quota({}, "d-default", "")
+        # A delete rejected for a missing tenant writes nowhere.
+        self.service.declare_quota({"workflows": 1, "executions": 1}, "q1", "acme")
+        with self.assertRaises(ValidationError):
+            self.service.delete_quota({}, "d-default", "")
+        self.assertEqual({"quota": {"workflows": 1, "executions": 1}}, self.service.get_quota("acme"))
+
+    def test_delete_quota_requires_an_idempotency_key(self):
+        with self.assertRaises(ValidationError):
+            self.service.delete_quota({}, None, "alpha")
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+
+    def test_delete_quota_body_must_be_an_empty_object(self):
+        self.service.declare_quota({"workflows": 1, "executions": 1}, "q1", "alpha")
+        bad_bodies = [
+            {"workflows": 1},
+            {"executions": 1},
+            {"unknown": 1},
+            {"workflows": 1, "executions": 1, "extra": 2},
+            [],
+            None,
+            "",
+            42,
+        ]
+        for index, body in enumerate(bad_bodies):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.delete_quota(body, f"d-bad-{index}", "alpha")
+        # Every rejected delete leaves the declared quota in place.
+        self.assertEqual({"quota": {"workflows": 1, "executions": 1}}, self.service.get_quota("alpha"))
+
+    def test_replaying_a_quota_delete_returns_the_first_result_without_a_second_effect(self):
+        self.service.declare_quota({"workflows": 2, "executions": 5}, "q1", "alpha")
+        first = self.service.delete_quota({}, "d", "alpha")
+        self.assertEqual({"quota": None}, first)
+        replay = self.service.delete_quota({}, "d", "alpha")
+        self.assertEqual(first, replay)
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+
+    def test_replaying_a_quota_delete_that_matched_nothing_returns_the_first_result(self):
+        first = self.service.delete_quota({}, "d", "alpha")
+        self.service.declare_quota({"workflows": 9, "executions": 90}, "q1", "alpha")
+        # Replaying an earlier no-op delete cannot remove the later declaration.
+        replay = self.service.delete_quota({}, "d", "alpha")
+        self.assertEqual(first, replay)
+        self.assertEqual({"quota": {"workflows": 9, "executions": 90}}, self.service.get_quota("alpha"))
+
+    def test_distinct_quota_delete_keys_each_return_the_empty_result(self):
+        self.service.declare_quota({"workflows": 2, "executions": 5}, "q1", "alpha")
+        self.assertEqual({"quota": None}, self.service.delete_quota({}, "d1", "alpha"))
+        # A second delete against the now-absent declaration is not an error.
+        self.assertEqual({"quota": None}, self.service.delete_quota({}, "d2", "alpha"))
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+
+    def test_cross_operation_key_reuse_with_quota_delete_conflicts_and_leaves_the_quota(self):
+        self.service.declare_quota({"workflows": 2, "executions": 5}, "p1", "alpha")
+        # A declaration key reused for a delete conflicts and removes nothing.
+        with self.assertRaises(ConflictError):
+            self.service.delete_quota({}, "p1", "alpha")
+        self.assertEqual({"quota": {"workflows": 2, "executions": 5}}, self.service.get_quota("alpha"))
+        # A delete key reused for a declaration conflicts and writes nothing.
+        self.service.delete_quota({}, "shared", "beta")
+        with self.assertRaises(ConflictError):
+            self.service.declare_quota({"workflows": 1, "executions": 1}, "shared", "beta")
+        self.assertEqual({"quota": None}, self.service.get_quota("beta"))
+
+    def test_delete_quota_writes_no_metering_record(self):
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "alpha")
+        before = self.service.usage("alpha", None, None, None, None)
+        self.service.declare_quota({"workflows": 10, "executions": 10}, "q", "alpha")
+        self.service.delete_quota({}, "d", "alpha")
+        self.assertEqual(before, self.service.usage("alpha", None, None, None, None))
+
+    def test_delete_quota_is_isolated_between_tenants(self):
+        self.service.declare_quota({"workflows": 2, "executions": 5}, "q-a", "alpha")
+        self.service.declare_quota({"workflows": 3, "executions": 6}, "q-b", "beta")
+        self.service.delete_quota({}, "d", "alpha")
+        self.assertEqual({"quota": None}, self.service.get_quota("alpha"))
+        self.assertEqual({"quota": {"workflows": 3, "executions": 6}}, self.service.get_quota("beta"))
+        self.assertEqual(
+            {
+                "status": {
+                    "workflows": {"limit": 3, "held": 0, "remaining": 3},
+                    "executions": {"limit": 6, "held": 0, "remaining": 6},
+                }
+            },
+            self.service.quota_status("beta"),
+        )
+
     def test_scheduled_execution_counts_against_execution_quota(self):
         self.service.declare_quota({"workflows": 10, "executions": 1}, "q", "alpha")
         self.service.create_workflow(
@@ -482,6 +604,9 @@ class TenantHttpTests(unittest.TestCase):
         status, data = self.call("PUT", "/quotas", {"workflows": 1, "executions": 1}, key="q-no-tenant")
         self.assertEqual(400, status)
         self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call("DELETE", "/quotas", {}, key="d-no-tenant")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
 
     def test_quota_validation_errors_over_http(self):
         for index, raw in enumerate((b'{"workflows":0,"executions":1}', b'{"workflows":1.5,"executions":1}')):
@@ -596,6 +721,108 @@ class TenantHttpTests(unittest.TestCase):
         error = json.loads(data)["error"]
         self.assertEqual("conflict", error["code"])
         self.assertIn("quota", error["message"])
+
+    def test_delete_quota_route_over_http(self):
+        headers = {"X-Tenant-Id": "http-del"}
+        # Deleting a never-declared quota is the definite empty result.
+        status, data = self.call("DELETE", "/quotas", {}, key="d-empty", headers=headers)
+        self.assertEqual(200, status, data)
+        self.assertEqual(b'{"quota":null}\n', data)
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        self.call(
+            "PUT", "/quotas",
+            {"workflows": 1, "executions": 2},
+            key="q-declare", headers=headers,
+        )
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":{"workflows":1,"executions":2}}\n', data)
+        status, data = self.call("DELETE", "/quotas", {}, key="d-del", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"quota":null}\n', data)
+        # Both reads now give the never-declared empty results.
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":null}\n', data)
+        status, data = self.call("GET", "/quotas/status", headers=headers)
+        self.assertEqual(b'{"status":null}\n', data)
+
+    def test_delete_quota_without_an_idempotency_key_is_a_validation_error(self):
+        headers = {"X-Tenant-Id": "http-del-nokey"}
+        self.call("PUT", "/quotas", {"workflows": 1, "executions": 1}, key="q", headers=headers)
+        status, data = self.call("DELETE", "/quotas", {}, headers=headers)
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        # The rejected delete touched no declaration.
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":{"workflows":1,"executions":1}}\n', data)
+
+    def test_delete_quota_validation_errors_over_http(self):
+        headers = {"X-Tenant-Id": "http-del-bad"}
+        self.call("PUT", "/quotas", {"workflows": 1, "executions": 1}, key="q", headers=headers)
+        raw_bodies = (
+            b'{"workflows":1}',
+            b'{"extra":1}',
+            b'[]',
+            b'null',
+            b'""',
+            b'42',
+            b'{"x":1e400}',
+        )
+        for index, raw in enumerate(raw_bodies):
+            status, data = self.call(
+                "DELETE", "/quotas", raw=raw, key=f"dq-bad-{index}", headers=headers
+            )
+            self.assertEqual(400, status, raw)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], raw)
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":{"workflows":1,"executions":1}}\n', data)
+
+    def test_delete_quota_replay_and_cross_operation_conflict_over_http(self):
+        headers = {"X-Tenant-Id": "http-del-idem"}
+        self.call("PUT", "/quotas", {"workflows": 2, "executions": 5}, key="q1", headers=headers)
+        status, first = self.call("DELETE", "/quotas", {}, key="d", headers=headers)
+        self.assertEqual(200, status)
+        status, replay = self.call("DELETE", "/quotas", {}, key="d", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(first, replay)
+        # Reusing a declaration key for a delete conflicts and leaves the declaration.
+        self.call("PUT", "/quotas", {"workflows": 8, "executions": 80}, key="q2", headers=headers)
+        status, data = self.call("DELETE", "/quotas", {}, key="q2", headers=headers)
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":{"workflows":8,"executions":80}}\n', data)
+        # A delete key reused for a declaration conflicts and writes nothing.
+        status, data = self.call(
+            "PUT", "/quotas", {"workflows": 9, "executions": 90}, key="d", headers=headers
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        status, data = self.call("GET", "/quotas", headers=headers)
+        self.assertEqual(b'{"quota":{"workflows":8,"executions":80}}\n', data)
+
+    def test_delete_quota_rejects_unknown_query_parameters_by_name(self):
+        headers = {"X-Tenant-Id": "http-del-query"}
+        for path in ("/quotas?bogus=1", "/quotas?limit=1"):
+            status, data = self.call("DELETE", path, {}, key=f"dq-{path}", headers=headers)
+            self.assertEqual(400, status, path)
+            payload = json.loads(data)
+            self.assertEqual("validation_error", payload["error"]["code"], path)
+            parameter = "bogus" if "bogus" in path else "limit"
+            self.assertIn(parameter, payload["error"]["message"], path)
+
+    def test_delete_quota_is_isolated_over_http(self):
+        alpha = {"X-Tenant-Id": "http-del-alpha"}
+        beta = {"X-Tenant-Id": "http-del-beta"}
+        self.call("PUT", "/quotas", {"workflows": 2, "executions": 5}, key="q-a", headers=alpha)
+        self.call("PUT", "/quotas", {"workflows": 3, "executions": 6}, key="q-b", headers=beta)
+        status, data = self.call("DELETE", "/quotas", {}, key="d", headers=alpha)
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"quota":null}\n', data)
+        status, data = self.call("GET", "/quotas", headers=alpha)
+        self.assertEqual(b'{"quota":null}\n', data)
+        status, data = self.call("GET", "/quotas", headers=beta)
+        self.assertEqual(b'{"quota":{"workflows":3,"executions":6}}\n', data)
 
     def test_tenant_isolation_over_http(self):
         for tenant in ("http-d", "http-e"):

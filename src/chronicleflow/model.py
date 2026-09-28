@@ -6,7 +6,11 @@ from typing import Any
 
 from .errors import ValidationError
 
+# The largest loop max_iterations a declaration may request; larger values are
+# a validation error.
 MAX_LOOP_ITERATIONS = 100
+# The largest node or template retries value a declaration may request; the
+# allowed range is 0 through this value.
 MAX_RETRIES = 10
 
 

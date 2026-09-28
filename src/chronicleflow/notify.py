@@ -10,8 +10,12 @@ from .errors import ValidationError
 # termination is a single event type regardless of its reason.
 NOTIFY_EVENT_TYPES = ("node_completed", "execution_completed", "execution_terminated", "approval_decided")
 
+# The largest delivery max_attempts a subscription may declare; the allowed
+# range is 1 through this value.
 MAX_DELIVERY_ATTEMPTS = 10
+# The outbound delivery timeout a subscription gets when it declares none.
 DEFAULT_TIMEOUT_SECONDS = 5.0
+# The number of delivery attempts a subscription gets when it declares none.
 DEFAULT_MAX_ATTEMPTS = 1
 
 # A queue target hides a pulled message for this many seconds unless the

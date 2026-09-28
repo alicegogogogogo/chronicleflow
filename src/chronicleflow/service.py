@@ -189,6 +189,7 @@ def _declared_map_states(workflow: Workflow) -> dict[str, dict[str, Any]]:
 # behavior is unchanged from before multi-tenancy existed.
 DEFAULT_TENANT = ""
 
+# The lease length a claim gets when the request names no lease_seconds.
 DEFAULT_LEASE_SECONDS = 30.0
 
 # How often the background scheduler looks for due schedules.
@@ -429,7 +430,6 @@ class ChronicleFlow:
             "VALUES (?, ?, ?, ?, ?)",
             (tenant, sequence_row["sequence"], action, document, occurred_at),
         )
-
 
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
         message = {"event_type": notice["type"], "execution_id": notice["execution_id"], **notice["payload"]}
@@ -794,6 +794,37 @@ class ChronicleFlow:
                     ).fetchone()["held"]
                     status[kind] = {"limit": ceiling, "held": held, "remaining": ceiling - held}
                 return {"status": status}
+
+    def delete_quota(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
+        """Remove the tenant's declared quota as a whole.
+
+        The body must be an empty object; deleting the quota of a tenant that
+        never declared one is the same definite empty result as deleting one
+        it held. After the delete the tenant holds no declared limits, so both
+        quota reads report the never-declared empty results and later writes
+        run without quota checks. Existing workflows and executions are not
+        deleted or made unusable, recorded usage counts and bill conclusions
+        are untouched, and the delete itself writes no metering record. The
+        route requires a tenant and an idempotency key: repeating the same
+        delete with the same key returns the first result without a second
+        effect, while the same key on another operation is the usual 409
+        conflict and leaves every declaration in place.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        self._empty_body(raw, "delete quota")
+
+        def apply() -> dict[str, Any]:
+            # Removing a declaration that was never made deletes no row but
+            # is still the same definite empty result, never an error.
+            self.store.connection.execute(
+                "DELETE FROM quotas WHERE tenant = ?",
+                (tenant,),
+            )
+            return {"quota": None}
+
+        with self._operation():
+            return self._idempotent(key, "delete-quota", apply, tenant)
 
     def declare_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
         """Declare the tenant's price table, replacing it as a whole.

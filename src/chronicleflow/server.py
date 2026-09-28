@@ -20,6 +20,8 @@ from .service import (
     _parse_timestamp,
 )
 
+# The header carrying the request's tenant identifier; an absent header keeps
+# the single legacy namespace and an empty value is a validation error.
 TENANT_HEADER = "X-Tenant-Id"
 
 # The only query parameters the metrics queries accept; anything else is a
@@ -433,6 +435,9 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"status": "ok"}
         if self.command in ("PUT", "POST") and parts == ["quotas"]:
             return 200, self.service.declare_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
+        if self.command == "DELETE" and parts == ["quotas"]:
+            self._no_query()
+            return 200, self.service.delete_quota(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "GET" and parts == ["quotas"]:
             return 200, self.service.get_quota(self._tenant())
         if self.command == "GET" and parts == ["quotas", "status"]:

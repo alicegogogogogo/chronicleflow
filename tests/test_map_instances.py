@@ -468,4 +468,3 @@ class InstanceOperationHttpTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("validation_error", json.loads(data)["error"]["code"])
-

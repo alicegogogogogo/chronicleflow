@@ -103,8 +103,8 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the quota declaration, the quota
-remaining query, the price
+history and status queries, as well as the quota declaration and delete, the quota
+read and remaining query, the price
 declaration and price delete, the price read and the price change history, and the usage, bill, and
 metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
@@ -131,9 +131,11 @@ X-Tenant-Id: acme
 `POST` to the same path is accepted as well. The body must contain exactly
 `workflows` and `executions`, each a positive integer; a non-positive,
 non-integer, boolean, or non-finite value, a missing or extra field, or a
-non-object body is a `400 validation_error` that writes nothing. Both quota
-routes require a tenant: calling them without `X-Tenant-Id` (or with an empty
-one) is a `400 validation_error`. The response is
+non-object body is a `400 validation_error` that writes nothing. Every quota
+route requires a tenant: declaring, deleting, and reading without
+`X-Tenant-Id` (or with an empty one) is a `400 validation_error`, and an
+unknown query parameter on the delete or the remaining query is rejected the
+same way, with the message naming the offending parameter. The response is
 `{"quota":{"workflows":10,"executions":100}}`; declaring again replaces the
 limits (re-anchoring nothing else). Lowering a limit below the current
 holding deletes no existing data — existing workflows and executions stay
@@ -146,6 +148,42 @@ X-Tenant-Id: acme
 
 Returns the declared quota, or the definite empty result `{"quota":null}`
 when the tenant has declared none.
+
+A tenant can also remove the quota it declared, on the same path with the
+`DELETE` method and the same calling shape as the other quota writes:
+
+```http
+DELETE /quotas
+Idempotency-Key: quota-delete-1
+X-Tenant-Id: acme
+
+{}
+```
+
+The body must be exactly an empty object; a non-empty or non-object body, an
+unknown field, or a non-finite value is a `400 validation_error` that touches
+no quota. The delete removes the declaration as a whole and leaves no partial
+write, so a later read gives the same definite empty result as for a tenant
+that never declared one: the delete response and every following read both
+return `{"quota":null}`, and the remaining query lists neither resource —
+neither limit, holding, nor remaining — and repeats with exactly the same
+result. Deleting the quota of a tenant that never declared one returns that
+same definite empty result rather than an error. The delete clears only the
+declaration: it deletes no existing workflow or execution, and data already
+held stays fully usable. It writes no metering record, so recorded usage
+counts and bill conclusions already reached stay exactly as they were; later
+writes simply run without a quota check until the tenant declares again.
+
+The delete follows the same idempotency rules as every other write: the
+`Idempotency-Key` header is required, repeating the same delete with the same
+key returns the first result and performs no second removal, and reusing a
+key for another operation — including a quota declaration — in the same
+tenant is a `409 conflict` that leaves the tenant's quota unchanged. Quotas
+are scoped per tenant like everything else: deleting one tenant's quota never
+affects another tenant's declaration or remaining room. A missing or empty
+tenant and a missing idempotency key are `400 validation_error`, and every
+failed validation writes nothing — no quota row, no metering record, and no
+price-table change history.
 
 A separate read-only entry point reports how much room the declared quota
 leaves, with the same calling shape as the quota read:
@@ -2031,7 +2069,7 @@ Errors use this shape:
 
 Validation errors return 400, missing resources return 404, and conflicts
 return 409. An empty `X-Tenant-Id` header value is a validation error; quota
-declarations and both quota reads, price declarations and price deletes, and the usage, bill,
+declarations and deletes and both quota reads, price declarations and price deletes, and the usage, bill,
 and metrics queries require a tenant, and quota limits and declared unit
 prices are positive integers validated by the
 same rules as every other body (no non-finite numbers, no unknown fields).
