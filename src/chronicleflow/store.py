@@ -125,6 +125,14 @@ CREATE TABLE IF NOT EXISTS prices (
   document TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS price_history (
+  tenant TEXT NOT NULL DEFAULT '',
+  sequence INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  snapshot TEXT,
+  occurred_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, sequence)
+);
 CREATE TABLE IF NOT EXISTS queue_targets (
   tenant TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,

@@ -104,8 +104,8 @@ including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
 history and status queries, as well as the quota declaration, the price
-declaration and price delete, the price read, and the usage, bill, and
-metrics queries. An empty
+declaration and price delete, the price read, the price change history, and
+the usage, bill, and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -251,6 +251,83 @@ usage queries read-only. A delete affects only later queries in the same
 way: the table is removed as a whole, later bills fall back to the
 built-in defaults, and recorded usage and already-taken bills stay exactly
 as they were.
+
+### Price-table change history
+
+Every successful price-table declaration or delete leaves one change record,
+so callers can see the moment each repricing and each table removal took
+effect. The record is written on the same transaction as the change itself,
+so a declaration or delete and its history commit atomically and roll back
+together; an idempotent replay returns the first result and appends no second
+record, and reusing an idempotency key for another operation is the usual
+`409 conflict` and writes no history. A delete of a table that was never
+declared still records the delete.
+
+```http
+GET /prices/history?limit=50
+X-Tenant-Id: acme
+```
+
+Returns `{"history":[...]}` with the records in ascending order of occurrence
+time; records sharing one instant are ordered by a stable ascending sequence.
+Each record is:
+
+```json
+{"sequence":7,"action":"declare","occurred_at":"2026-09-26T08:30:00.000Z","snapshot":{"execution_started":200,"workflow_created":1500}}
+```
+
+- `sequence` is a stable, strictly increasing positive integer per tenant. It
+  identifies the record across every query and is never renumbered by a filter
+  or a page;
+- `action` is `declare` for a price-table declaration or `delete` for a price
+  table removal;
+- `occurred_at` is the moment the change took effect, as an ISO-8601 UTC
+  string ending in `Z`;
+- `snapshot` is the table in effect after the change: for a declaration, the
+  type-to-unit-price map that took effect, listing only the types named in
+  that declaration in ascending type-identifier order; for a delete it is
+  `null`.
+
+The keys always appear in exactly the order `sequence`, `action`,
+`occurred_at`, `snapshot`. A tenant with no matching records gets the
+definite empty result `{"history":[]}`, never an error. The response ends
+with a single newline, like every other JSON endpoint.
+
+The endpoint accepts an optional action filter, the same optional closed
+time window the events and usage-record queries accept, plus cursor
+pagination:
+
+```http
+GET /prices/history?action=declare,delete&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `action` names one change action or a comma-separated set of them
+  (`declare`, `delete`); only records whose action is in the set are
+  returned. A single action needs no comma. An empty entry, a duplicate
+  entry, or an unknown action is a `400 validation_error`; when `action` is
+  absent every action is returned;
+- `since` and `until` are ISO-8601 UTC timestamps ending in `Z` and bind a
+  **closed** interval on each record's occurrence time: a record whose time
+  equals either boundary is included. When either is absent the corresponding
+  bound is open; when `since` is later than `until` the window matches
+  nothing and the definite empty list is returned;
+- `limit` is **required** and must be a positive integer; a page never
+  contains more than that many records;
+- `cursor` is the `sequence` of the previous page's last record; only records
+  whose `sequence` is strictly greater are returned, so pages neither overlap
+  nor skip. It is omitted on the first page and must be a positive integer;
+- the action filter, time window, and pagination apply together as an
+  intersection, and filtering never changes a record's `sequence`.
+
+A malformed timestamp, an unknown, empty, or duplicated `action` entry, a
+missing or non-positive-integer `limit`, a non-positive-integer `cursor`, a
+repeated parameter, or any unknown query parameter is a `400
+validation_error` that writes nothing. A missing or empty `X-Tenant-Id` is a
+`400 validation_error` that reveals no records. The query is read-only: it
+appends no change records, writes no events or usage records, and changes no
+price table, metering, quota, schedule, or billing conclusion. Change
+records follow the usual tenant isolation, so another tenant's history is
+never visible under any action filter, window, or page.
 
 ### Usage metering and billing
 
