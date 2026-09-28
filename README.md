@@ -104,7 +104,8 @@ including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
 history and status queries, as well as the quota and price declarations,
-the price read, and the usage, bill, and metrics queries. An empty
+the price read and deletion, and the usage, bill, and metrics queries. An
+empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -179,10 +180,11 @@ JSON object giving a map of metered action type to a positive-integer unit
 price in cents. A non-positive, non-integer, boolean, or non-finite price,
 an unknown metered type, a missing field (an empty object), an extra field
 that is not a metered type, or a non-object body is a `400
-validation_error` that writes nothing. Both price routes require a tenant:
-calling them without `X-Tenant-Id` (or with an empty one) is a `400
-validation_error`, and an unknown query parameter on the read is rejected
-the same way. The response is
+validation_error` that writes nothing. All three price routes require a
+tenant: calling them without `X-Tenant-Id` (or with an empty one) is a
+`400 validation_error`, and an unknown query parameter on the read or the
+deletion is rejected the same way, with an error message that names the
+offending parameter. The response is
 `{"prices":{"execution_started":200,"workflow_created":1500}}`, with the
 declared types in ascending type-identifier order.
 
@@ -202,14 +204,47 @@ type-identifier order, or the definite empty result `{"prices":null}` for a
 tenant that has never declared one. The stored table lists only the types
 the declaration named; types left at the default are not copied into it.
 
-The declaration follows the same idempotency rules as every other write:
-the `Idempotency-Key` header is required, repeating the same declaration
-with the same key returns the first result and performs no second
-replacement, and reusing a key for another operation — including another
-price declaration — in the same tenant is a `409 conflict` that leaves the
-tenant's price table unchanged. Price tables are scoped per tenant like
-everything else: a tenant can never read another's declaration, and another
-tenant's declaration never affects this tenant's bill amounts.
+A tenant may remove the table it declared on the same entry point, using
+the same calling shape as the declaration and an empty body:
+
+```http
+DELETE /prices
+Idempotency-Key: price-delete-1
+X-Tenant-Id: acme
+
+{}
+```
+
+The body must be exactly an empty object: a missing, non-object, or
+non-empty body, an unknown field, or a non-finite number is a `400
+validation_error` that writes nothing, as is a missing or empty
+`X-Tenant-Id`, a missing `Idempotency-Key`, or an unknown query parameter
+(named in the error message). A successful deletion removes the tenant's
+table as a whole and returns the definite empty result
+`{"prices":null}`; a following read gives the same result, exactly as for
+a tenant that never declared one, so a declaration is still an overall
+replacement and a deletion is an overall removal — neither leaves a
+partial write. Deleting the table of a tenant that never declared one
+succeeds with the same `{"prices":null}` result rather than an error.
+After the removal every type is billed at the built-in default price, in
+both the bill and the bucketed bill, with each line still giving the
+actual `unit_price` used, the `count`, and the integer-cent `subtotal`.
+The deletion rewrites no recorded usage counts, revises no bill taken
+before it, and changes no metering.
+
+The declaration and the deletion follow the same idempotency rules as every
+other write: the `Idempotency-Key` header is required, repeating the same
+declaration or deletion with the same key returns the first result and
+performs no second replacement or removal, and reusing a key for another
+operation — including another price declaration or a price deletion — in
+the same tenant is a `409 conflict` that leaves the tenant's price table
+unchanged. Both writes are atomic with the price read and the bill: a
+reader always sees either the complete old table or the complete new one
+(or, after a deletion, no table at all), never a partial write. Price
+tables are scoped per tenant like everything else: a tenant can never read
+another's declaration, deleting one tenant's table never touches another
+tenant's, and another tenant's declaration or deletion never affects this
+tenant's bill amounts.
 
 The bill and the bucketed bill price with the price table in effect **at
 query time**: a named type uses the tenant's declared price and every other
@@ -218,9 +253,11 @@ type, the actual `unit_price` used, the `count`, and the integer-cent
 `subtotal`, and the total is exactly the sum of the listed subtotals; types
 with no matching record are still omitted rather than listed at zero. A
 declaration affects only later queries — it neither rewrites recorded usage
-nor revises historical bills — changes no metering, and leaves the bill and
-usage queries read-only. There is no delete entry point in this release; a
-declared table can only be replaced by another declaration.
+nor revises historical bills — and a deletion likewise only removes the
+table: it rewrites no recorded usage, revises no historical bill, changes
+no metering, and leaves the bill and usage queries read-only. A declared
+table can be replaced wholesale by another declaration or removed
+wholesale by the deletion above; neither leaves any partial state.
 
 ### Usage metering and billing
 

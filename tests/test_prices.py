@@ -190,6 +190,94 @@ class PriceServiceTests(unittest.TestCase):
         self.assertEqual({"prices": None}, self.service.get_prices("acme"))
         self.assertEqual({"usage": []}, self.service.usage("acme"))
 
+    def test_deleting_the_table_returns_the_definite_empty_result(self):
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        self.assertEqual({"prices": None}, self.service.delete_prices({}, "d", "acme"))
+        self.assertEqual({"prices": None}, self.service.get_prices("acme"))
+
+    def test_deleting_a_never_declared_table_is_the_same_empty_result(self):
+        self.assertEqual({"prices": None}, self.service.delete_prices({}, "d", "acme"))
+        self.assertEqual({"prices": None}, self.service.get_prices("acme"))
+
+    def test_delete_requires_tenant_key_and_empty_object_body(self):
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        with self.assertRaises(ValidationError):
+            self.service.delete_prices({}, "d", "")
+        with self.assertRaises(ValidationError):
+            self.service.delete_prices({}, None, "acme")
+        for body in (None, [], "x", 42, {"execution_started": 200}, {"extra": 1}):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError):
+                    self.service.delete_prices(body, f"bad-{body!r}", "acme")
+        # Every rejected deletion leaves the declared table in place.
+        self.assertEqual({"prices": {"execution_started": 200}}, self.service.get_prices("acme"))
+
+    def test_delete_restores_default_prices_without_touching_counts(self):
+        self._some_usage()
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        self.service.delete_prices({}, "d", "acme")
+        items = _bill_items(self.service, "acme")
+        self.assertEqual(
+            USAGE_UNIT_PRICES["execution_started"], items["execution_started"]["unit_price"]
+        )
+        self.assertEqual(
+            USAGE_UNIT_PRICES["workflow_created"], items["workflow_created"]["unit_price"]
+        )
+        # The bucketed bill prices with the built-in defaults as well.
+        bucketed = self.service.bill("acme", bucket="hour")["bill"]
+        for bucket in bucketed["buckets"]:
+            for item in bucket["items"]:
+                self.assertEqual(USAGE_UNIT_PRICES[item["type"]], item["unit_price"])
+        # Recorded usage never moves with a deletion.
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 2},
+                {"type": "workflow_created", "count": 1},
+            ],
+            self.service.usage("acme")["usage"],
+        )
+
+    def test_delete_meters_nothing(self):
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        self.service.delete_prices({}, "d", "acme")
+        self.assertEqual({"usage": []}, self.service.usage("acme"))
+
+    def test_replaying_a_delete_returns_the_first_result_without_a_second_effect(self):
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        first = self.service.delete_prices({}, "d", "acme")
+        # A fresh declaration lands after the deletion.
+        self.service.declare_prices({"execution_started": 350}, "p2", "acme")
+        # Replaying the delete key returns the first result but performs no
+        # second removal, so the fresh table survives.
+        replay = self.service.delete_prices({}, "d", "acme")
+        self.assertEqual(first, replay)
+        self.assertEqual({"prices": {"execution_started": 350}}, self.service.get_prices("acme"))
+
+    def test_delete_key_reuse_conflicts_in_both_directions_and_leaves_tables(self):
+        self.service.declare_prices({"execution_started": 200}, "p", "acme")
+        # A declaration's key reused for a deletion conflicts.
+        with self.assertRaises(ConflictError):
+            self.service.delete_prices({}, "p", "acme")
+        self.assertEqual({"prices": {"execution_started": 200}}, self.service.get_prices("acme"))
+        # A deletion's key reused for another operation conflicts.
+        self.service.delete_prices({}, "d", "acme")
+        with self.assertRaises(ConflictError):
+            self.service.declare_prices({"execution_started": 999}, "d", "acme")
+        with self.assertRaises(ConflictError):
+            self.service.declare_quota({"workflows": 1, "executions": 1}, "d", "acme")
+        self.assertEqual({"prices": None}, self.service.get_prices("acme"))
+
+    def test_deleting_one_tenants_table_never_affects_another_tenant(self):
+        self._some_usage("acme")
+        self._some_usage("beta")
+        self.service.declare_prices({"execution_started": 200}, "pa", "acme")
+        self.service.declare_prices({"execution_started": 300}, "pb", "beta")
+        self.service.delete_prices({}, "da", "acme")
+        self.assertEqual({"prices": None}, self.service.get_prices("acme"))
+        self.assertEqual({"prices": {"execution_started": 300}}, self.service.get_prices("beta"))
+        beta_items = _bill_items(self.service, "beta")
+        self.assertEqual(300, beta_items["execution_started"]["unit_price"])
+
 
 class PriceHttpTests(unittest.TestCase):
     @classmethod
@@ -310,6 +398,101 @@ class PriceHttpTests(unittest.TestCase):
         self.assertEqual("conflict", json.loads(data)["error"]["code"])
         status, data = self.call("GET", "/prices", headers=headers)
         self.assertEqual(b'{"prices":{"execution_started":200}}\n', data)
+
+    def test_delete_price_table_over_http(self):
+        headers = {"X-Tenant-Id": "http-del"}
+        # Deleting a never-declared table gives the definite empty result.
+        status, data = self.call("DELETE", "/prices", {}, key="d-none", headers=headers)
+        self.assertEqual(200, status, data)
+        self.assertEqual(b'{"prices":null}\n', data)
+        # Declare, then delete.
+        status, data = self.call(
+            "PUT", "/prices", {"execution_started": 200, "workflow_created": 1500},
+            key="d-put", headers=headers,
+        )
+        self.assertEqual(200, status)
+        status, data = self.call("DELETE", "/prices", {}, key="d-1", headers=headers)
+        self.assertEqual(200, status, data)
+        self.assertEqual(b'{"prices":null}\n', data)
+        status, data = self.call("GET", "/prices", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"prices":null}\n', data)
+
+    def test_delete_replay_returns_first_result_without_a_second_effect(self):
+        headers = {"X-Tenant-Id": "http-replay-del"}
+        self.call("PUT", "/prices", {"execution_started": 200}, key="dr-put1", headers=headers)
+        status, first = self.call("DELETE", "/prices", {}, key="dr-del", headers=headers)
+        self.assertEqual(200, status)
+        self.call("PUT", "/prices", {"execution_started": 350}, key="dr-put2", headers=headers)
+        status, replay = self.call("DELETE", "/prices", {}, key="dr-del", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(first, replay)
+        # The replay removed nothing; the fresh table survives.
+        status, data = self.call("GET", "/prices", headers=headers)
+        self.assertEqual(b'{"prices":{"execution_started":350}}\n', data)
+
+    def test_delete_without_tenant_or_key_is_a_validation_error(self):
+        status, data = self.call("DELETE", "/prices", {}, key="d-no-tenant")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "DELETE", "/prices", {}, headers={"X-Tenant-Id": ""}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call(
+            "DELETE", "/prices", {}, headers={"X-Tenant-Id": "http-del-bad"}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+
+    def test_delete_validation_errors_over_http(self):
+        headers = {"X-Tenant-Id": "http-del-bad-body"}
+        self.call("PUT", "/prices", {"execution_started": 200}, key="db-put", headers=headers)
+        for raw in (b'{"execution_started":200}', b'{"extra":1}', b'[]', b'null', b'""', b'42'):
+            status, data = self.call(
+                "DELETE", "/prices", raw=raw, key=f"db-{raw}", headers=headers
+            )
+            self.assertEqual(400, status, raw)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], raw)
+        # The invalid body 1e400 is a non-finite number and must be rejected.
+        status, data = self.call(
+            "DELETE", "/prices", raw=b'{"x":1e400}', key="db-inf", headers=headers
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        status, data = self.call("GET", "/prices", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"prices":{"execution_started":200}}\n', data)
+
+    def test_delete_rejects_unknown_query_parameter_by_name(self):
+        headers = {"X-Tenant-Id": "http-del-q"}
+        status, data = self.call(
+            "DELETE", "/prices?bogus=1", {}, key="dq-bogus", headers=headers
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        self.assertIn("bogus", json.loads(data)["error"]["message"])
+
+    def test_delete_cross_operation_key_conflict_leaves_table_over_http(self):
+        headers = {"X-Tenant-Id": "http-del-conflict"}
+        self.call("PUT", "/prices", {"execution_started": 200}, key="dc-shared", headers=headers)
+        status, data = self.call("DELETE", "/prices", {}, key="dc-shared", headers=headers)
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(data)["error"]["code"])
+        status, data = self.call("GET", "/prices", headers=headers)
+        self.assertEqual(b'{"prices":{"execution_started":200}}\n', data)
+
+    def test_delete_is_isolated_between_tenants_over_http(self):
+        alpha = {"X-Tenant-Id": "http-del-alpha"}
+        beta = {"X-Tenant-Id": "http-del-beta"}
+        self.call("PUT", "/prices", {"execution_started": 200}, key="di-a", headers=alpha)
+        self.call("PUT", "/prices", {"execution_started": 300}, key="di-b", headers=beta)
+        status, data = self.call("DELETE", "/prices", {}, key="di-del", headers=alpha)
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"prices":null}\n', data)
+        status, data = self.call("GET", "/prices", headers=beta)
+        self.assertEqual(b'{"prices":{"execution_started":300}}\n', data)
 
     def test_bill_without_a_declaration_is_byte_for_byte_unchanged(self):
         headers = {"X-Tenant-Id": "http-default"}
