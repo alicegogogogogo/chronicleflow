@@ -221,7 +221,8 @@ no records, `items` is empty and `total` is `0`.
 
 Both endpoints accept the same optional query parameters the events and
 metrics queries accept: an optional metered-type filter and an ISO-8601 UTC
-timestamp window, each timestamp ending in `Z`:
+timestamp window, each timestamp ending in `Z`, plus an optional fixed time
+bucket:
 
 ```http
 GET /usage?type=execution_started,workflow_created&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z
@@ -251,6 +252,56 @@ in the window. A type the filter names but that has no matching record is
 omitted rather than reported at zero, so a filter that matches nothing gives
 the same definite empty results as an empty window: `{"usage":[]}` for usage
 and an empty `items` list with a `total` of `0` for the bill.
+
+Both endpoints also accept an optional `bucket` parameter for a fixed-bucket
+trend summary, so callers never have to pull records and group them
+themselves:
+
+```http
+GET /usage?bucket=hour&since=2026-09-26T00:00:00.000Z&until=2026-09-27T00:00:00.000Z
+GET /bill?bucket=day&type=execution_started
+X-Tenant-Id: acme
+```
+
+- `bucket` is exactly `hour` or `day`: `hour` buckets start on the UTC hour
+  and `day` buckets at UTC midnight, both aligned solely to UTC. An empty or
+  any other value is a `400 validation_error`, exactly like a repeated
+  parameter or an unknown query parameter;
+- when `bucket` is present, usage returns
+  `{"usage_buckets":[{"bucket_start":"2026-09-26T08:00:00Z","usage":[{"type":"execution_started","count":1}, ...]}, ...]}`:
+  the buckets with at least one matching record, in ascending bucket-start
+  order. Each entry gives its `bucket_start` first — an ISO-8601 UTC string
+  ending in `Z` at the hour or midnight — followed by `usage`, the per-type
+  counts inside that bucket in ascending type-identifier order; a type with no
+  record in the bucket is omitted;
+- when `bucket` is present, the bill returns
+  `{"bill":{"buckets":[{"bucket_start":"2026-09-26T00:00:00Z","items":[{"type":"execution_started","count":1,"unit_price":100,"subtotal":100}, ...],"subtotal":100}, ...],"total":100}}`.
+  Buckets appear in ascending bucket-start order; each bucket's `items` stay
+  sorted by ascending type identifier, each line giving the filtered count,
+  the usual positive-integer `unit_price`, and an integer-cent `subtotal` of
+  the two, and a type with no matching record is omitted rather than reported
+  at zero. Each bucket also carries its own `subtotal`, and the window
+  `total` is exactly the sum of the listed per-bucket subtotals, all amounts
+  integer cents;
+- a bucket that holds no matching record never appears, so an empty tenant, a
+  window with `since` later than `until`, or a filter that matches nothing
+  returns the definite empty bucket lists `{"usage_buckets":[]}` and
+  `{"bill":{"buckets":[],"total":0}` — never an error, with the empty bill's
+  total at `0`;
+- bucketing applies together with the type filter and the time window as an
+  intersection: a bucket holds only records whose occurrence time is in the
+  closed window **and** whose type the filter names. The window keeps its
+  closed endpoints, its open bounds when either side is omitted, and the
+  existing rule for when a record's instant falls in it; buckets are simply
+  the same matching records rolled up to their UTC bucket;
+- the bucketed queries are read-only like the others: they append no usage
+  records, change no metering basis or prices, and never alter recorded usage
+  or billing conclusions — under event replay or recovery the same window,
+  type filter, and bucket always give the same answer;
+- omitting `bucket` leaves both queries exactly as before: the same compact
+  JSON responses with `usage` / `items` shapes, full float precision and the
+  `-0.0` convention, byte for byte. The parameter introduces no second
+  protocol and changes no entry point's existing behavior.
 
 Only records whose occurrence time falls in the window are counted. Within
 the window the bill keeps the same basis as always: each present type reports

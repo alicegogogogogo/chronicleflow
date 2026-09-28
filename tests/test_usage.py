@@ -788,5 +788,402 @@ class UsageHttpTests(unittest.TestCase):
         self.assertEqual({"bill": {"items": [], "total": 0}}, json.loads(data))
 
 
+class UsageBucketServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = ChronicleFlow(str(Path(self.directory.name) / "buckets.db"))
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    B08 = "2026-01-01T08:00:00.000Z"
+    B0830 = "2026-01-01T08:30:00.000Z"
+    B09 = "2026-01-01T09:00:00.000Z"
+    B1015_NEXT_DAY = "2026-01-02T10:15:00.000Z"
+
+    def _bucketed_records(self):
+        """Four records across two UTC days, stamped at explicit moments.
+
+        Sequence 1 is the workflow creation at 08:00 on Jan 1; sequences 2-4
+        are execution starts at 08:30 Jan 1, 09:00 Jan 1, and 10:15 Jan 2.
+        """
+        self.service.create_workflow({"id": "wf", "nodes": TASK}, "wf", "acme")
+        self.service.create_execution({"id": "r1", "workflow_id": "wf", "input": {}}, "r1", "acme")
+        self.service.create_execution({"id": "r2", "workflow_id": "wf", "input": {}}, "r2", "acme")
+        self.service.create_execution({"id": "r3", "workflow_id": "wf", "input": {}}, "r3", "acme")
+        for sequence, stamped in (
+            (1, self.B08),
+            (2, self.B0830),
+            (3, self.B09),
+            (4, self.B1015_NEXT_DAY),
+        ):
+            with self.service.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE usage_records SET created_at = ? WHERE tenant = ? AND sequence = ?",
+                    (stamped, "acme", sequence),
+                )
+
+    def test_empty_tenant_gets_a_definite_empty_bucket_list(self):
+        self.assertEqual({"usage_buckets": []}, self.service.usage("acme", bucket="hour"))
+        self.assertEqual({"usage_buckets": []}, self.service.usage("acme", bucket="day"))
+        self.assertEqual(
+            {"bill": {"buckets": [], "total": 0}},
+            self.service.bill("acme", bucket="hour"),
+        )
+
+    def test_buckets_require_a_tenant(self):
+        with self.assertRaises(ValidationError):
+            self.service.usage("", bucket="hour")
+        with self.assertRaises(ValidationError):
+            self.service.bill("", bucket="day")
+
+    def test_hour_buckets_align_to_the_utc_hour_and_sort_ascending(self):
+        self._bucketed_records()
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-01-01T08:00:00Z",
+                     "usage": [
+                         {"type": "execution_started", "count": 1},
+                         {"type": "workflow_created", "count": 1},
+                     ]},
+                    {"bucket_start": "2026-01-01T09:00:00Z",
+                     "usage": [{"type": "execution_started", "count": 1}]},
+                    {"bucket_start": "2026-01-02T10:00:00Z",
+                     "usage": [{"type": "execution_started", "count": 1}]},
+                ]
+            },
+            self.service.usage("acme", bucket="hour"),
+        )
+
+    def test_day_buckets_align_to_utc_midnight_and_sort_ascending(self):
+        self._bucketed_records()
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-01-01T00:00:00Z",
+                     "usage": [
+                         {"type": "execution_started", "count": 2},
+                         {"type": "workflow_created", "count": 1},
+                     ]},
+                    {"bucket_start": "2026-01-02T00:00:00Z",
+                     "usage": [{"type": "execution_started", "count": 1}]},
+                ]
+            },
+            self.service.usage("acme", bucket="day"),
+        )
+
+    def test_bill_buckets_carry_items_subtotal_and_the_window_total(self):
+        self._bucketed_records()
+        bill = self.service.bill("acme", bucket="hour")["bill"]
+        self.assertEqual(
+            ["2026-01-01T08:00:00Z", "2026-01-01T09:00:00Z", "2026-01-02T10:00:00Z"],
+            [entry["bucket_start"] for entry in bill["buckets"]],
+        )
+        first = bill["buckets"][0]
+        self.assertEqual(
+            [
+                {"type": "execution_started", "count": 1,
+                 "unit_price": USAGE_UNIT_PRICES["execution_started"],
+                 "subtotal": USAGE_UNIT_PRICES["execution_started"]},
+                {"type": "workflow_created", "count": 1,
+                 "unit_price": USAGE_UNIT_PRICES["workflow_created"],
+                 "subtotal": USAGE_UNIT_PRICES["workflow_created"]},
+            ],
+            first["items"],
+        )
+        self.assertEqual(
+            USAGE_UNIT_PRICES["execution_started"] + USAGE_UNIT_PRICES["workflow_created"],
+            first["subtotal"],
+        )
+        for entry in bill["buckets"]:
+            types = [item["type"] for item in entry["items"]]
+            self.assertEqual(sorted(types), types)
+            for item in entry["items"]:
+                self.assertIsInstance(item["unit_price"], int)
+                self.assertEqual(item["count"] * item["unit_price"], item["subtotal"])
+            self.assertEqual(sum(item["subtotal"] for item in entry["items"]), entry["subtotal"])
+        # The window total is exactly the sum of the listed per-bucket subtotals
+        # and matches the unbucketed bill over the same (open) window.
+        self.assertEqual(sum(entry["subtotal"] for entry in bill["buckets"]), bill["total"])
+        self.assertEqual(self.service.bill("acme")["bill"]["total"], bill["total"])
+        self.assertIsInstance(bill["total"], int)
+
+    def test_buckets_intersect_with_the_closed_time_window(self):
+        self._bucketed_records()
+        # A window covering only 08:00..09:00 on Jan 1 keeps both hour buckets
+        # but never the Jan 2 bucket.
+        windowed = self.service.usage(
+            "acme", _ts(self.B08), _ts(self.B09), bucket="hour"
+        )
+        self.assertEqual(
+            ["2026-01-01T08:00:00Z", "2026-01-01T09:00:00Z"],
+            [entry["bucket_start"] for entry in windowed["usage_buckets"]],
+        )
+        # The boundary record at 09:00 is included and stays in the 09 bucket.
+        self.assertEqual(
+            [{"type": "execution_started", "count": 1}],
+            windowed["usage_buckets"][1]["usage"],
+        )
+        # A narrow window still rolls a hit into its bucket; the open-until
+        # window reaches the 08:00 and 08:30 records in the single 08 bucket.
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-01-01T08:00:00Z",
+                     "usage": [
+                         {"type": "execution_started", "count": 1},
+                         {"type": "workflow_created", "count": 1},
+                     ]}
+                ]
+            },
+            self.service.usage("acme", None, _ts(self.B0830), bucket="hour"),
+        )
+        # Day buckets respect the window too: the Jan 2-only window returns the
+        # Jan 2 day bucket by its midnight start.
+        day_windowed = self.service.usage(
+            "acme",
+            _ts("2026-01-02T00:00:00.000Z"),
+            _ts("2026-01-02T23:59:59.999Z"),
+            bucket="day",
+        )
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-01-02T00:00:00Z",
+                     "usage": [{"type": "execution_started", "count": 1}]}
+                ]
+            },
+            day_windowed,
+        )
+
+    def test_buckets_intersect_with_the_type_filter(self):
+        self._bucketed_records()
+        filtered = self.service.usage(
+            "acme", bucket="hour", types=("workflow_created",)
+        )
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-01-01T08:00:00Z",
+                     "usage": [{"type": "workflow_created", "count": 1}]}
+                ]
+            },
+            filtered,
+        )
+        # Buckets whose only records were filtered out disappear entirely
+        # rather than reporting an empty type list.
+        both = self.service.usage(
+            "acme", bucket="day", types=("execution_started", "workflow_created")
+        )
+        self.assertEqual(
+            [
+                {"bucket_start": "2026-01-01T00:00:00Z",
+                 "usage": [
+                     {"type": "execution_started", "count": 2},
+                     {"type": "workflow_created", "count": 1},
+                 ]},
+                {"bucket_start": "2026-01-02T00:00:00Z",
+                 "usage": [{"type": "execution_started", "count": 1}]},
+            ],
+            both["usage_buckets"],
+        )
+
+    def test_reverse_window_and_missed_filter_give_empty_buckets_not_errors(self):
+        self._bucketed_records()
+        self.assertEqual(
+            {"usage_buckets": []},
+            self.service.usage("acme", _ts(self.B09), _ts(self.B08), bucket="hour"),
+        )
+        self.assertEqual(
+            {"bill": {"buckets": [], "total": 0}},
+            self.service.bill("acme", _ts(self.B09), _ts(self.B08), bucket="day"),
+        )
+        self.assertEqual(
+            {"usage_buckets": []},
+            self.service.usage("acme", bucket="hour", types=("schedule_triggered",)),
+        )
+        self.assertEqual(
+            {"bill": {"buckets": [], "total": 0}},
+            self.service.bill("acme", bucket="day", types=("delivery_attempted",)),
+        )
+
+    def test_buckets_are_read_only_and_tenant_isolated(self):
+        self._bucketed_records()
+        self.service.create_workflow({"id": "wf-b", "nodes": TASK}, "wf-b", "beta")
+        before = self.service.usage("acme")
+        self.service.usage("acme", bucket="hour")
+        self.service.bill("acme", _ts(self.B08), _ts(self.B09), ("execution_started",), "day")
+        self.assertEqual(before, self.service.usage("acme"))
+        # Another tenant's records never enter this tenant's buckets, and a
+        # window around acme's stamped records matches none of beta's.
+        self.assertEqual(
+            {"usage_buckets": []},
+            self.service.usage(
+                "beta", _ts("2026-01-01T00:00:00.000Z"),
+                _ts("2026-01-03T00:00:00.000Z"), bucket="hour"
+            ),
+        )
+        self.assertEqual(
+            {"bill": {"buckets": [], "total": 0}},
+            self.service.bill(
+                "beta", _ts("2026-01-01T00:00:00.000Z"),
+                _ts("2026-01-03T00:00:00.000Z"), bucket="day"
+            ),
+        )
+
+    def test_without_bucket_the_responses_keep_their_old_shape(self):
+        self._bucketed_records()
+        self.assertEqual(
+            {
+                "usage": [
+                    {"type": "execution_started", "count": 3},
+                    {"type": "workflow_created", "count": 1},
+                ]
+            },
+            self.service.usage("acme"),
+        )
+        self.assertEqual(
+            {"items", "total"},
+            set(self.service.bill("acme")["bill"].keys()),
+        )
+
+
+class UsageBucketHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        Handler.service = ChronicleFlow(str(Path(cls.directory.name) / "http-buckets.db"))
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.directory.cleanup()
+
+    def call(self, method, path, body=None, key=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        all_headers = {"Content-Type": "application/json"}
+        if key is not None:
+            all_headers["Idempotency-Key"] = key
+        all_headers.update(headers or {})
+        connection.request(method, path, json.dumps(body) if body is not None else None, all_headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def test_empty_tenant_buckets_are_definite_empty_results(self):
+        headers = {"X-Tenant-Id": "http-bucket-empty"}
+        for path in ("/usage?bucket=hour", "/usage?bucket=day", "/bill?bucket=hour"):
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(200, status, path)
+            parsed = json.loads(data)
+            if path.startswith("/usage"):
+                self.assertEqual({"usage_buckets": []}, parsed, path)
+            else:
+                self.assertEqual({"bill": {"buckets": [], "total": 0}}, parsed, path)
+            self.assertTrue(data.endswith(b"\n"), path)
+            self.assertFalse(data.endswith(b"\n\n"), path)
+
+    def test_buckets_over_http(self):
+        headers = {"X-Tenant-Id": "http-bucket-hit"}
+        self.call(
+            "POST", "/workflows", {"id": "wf-bk", "nodes": TASK},
+            key="wf-bk", headers=headers,
+        )
+        self.call(
+            "POST", "/executions",
+            {"id": "r-bk", "workflow_id": "wf-bk", "input": {}},
+            key="r-bk", headers=headers,
+        )
+        with Handler.service.store.transaction() as connection:
+            connection.execute(
+                "UPDATE usage_records SET created_at = ? "
+                "WHERE tenant = ? AND type = 'workflow_created'",
+                ("2026-03-03T07:10:00.000Z", "http-bucket-hit"),
+            )
+            connection.execute(
+                "UPDATE usage_records SET created_at = ? "
+                "WHERE tenant = ? AND type = 'execution_started'",
+                ("2026-03-03T07:50:00.000Z", "http-bucket-hit"),
+            )
+        status, data = self.call("GET", "/usage?bucket=hour", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {
+                "usage_buckets": [
+                    {"bucket_start": "2026-03-03T07:00:00Z",
+                     "usage": [
+                         {"type": "execution_started", "count": 1},
+                         {"type": "workflow_created", "count": 1},
+                     ]}
+                ]
+            },
+            json.loads(data),
+        )
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertFalse(data.endswith(b"\n\n"))
+        status, data = self.call("GET", "/bill?bucket=day", headers=headers)
+        self.assertEqual(200, status)
+        bill = json.loads(data)["bill"]
+        self.assertEqual(["2026-03-03T00:00:00Z"], [b["bucket_start"] for b in bill["buckets"]])
+        self.assertEqual(sum(b["subtotal"] for b in bill["buckets"]), bill["total"])
+
+    def test_bucket_is_validated_on_both_routes(self):
+        headers = {"X-Tenant-Id": "http-bucket-bad"}
+        bad_paths = (
+            "/usage?bucket=week",
+            "/bill?bucket=Week",
+            "/usage?bucket=",
+            "/bill?bucket=hours",
+            "/usage?bucket=hour&bucket=day",
+            "/bill?bucket=day&bogus=1",
+            "/usage?bucket=hour&since=not-a-time",
+            "/bill?bucket=day&type=not_a_type",
+        )
+        for path in bad_paths:
+            status, data = self.call("GET", path, headers=headers)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_bucket_validation_failure_writes_nothing_and_reveals_nothing(self):
+        headers = {"X-Tenant-Id": "http-bucket-validation"}
+        status, _ = self.call("GET", "/usage?bucket=year", headers=headers)
+        self.assertEqual(400, status)
+        status, data = self.call("GET", "/usage?bucket=hour", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"usage_buckets": []}, json.loads(data))
+        status, data = self.call("GET", "/bill?bucket=day", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"bill": {"buckets": [], "total": 0}}, json.loads(data))
+
+    def test_bucket_requires_a_tenant_header(self):
+        for path in ("/usage?bucket=hour", "/bill?bucket=day"):
+            status, data = self.call("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+            status, data = self.call("GET", path, headers={"X-Tenant-Id": ""})
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", json.loads(data)["error"]["code"], path)
+
+    def test_no_bucket_parameter_is_byte_for_byte_the_old_response(self):
+        headers = {"X-Tenant-Id": "http-bucket-absent"}
+        self.call(
+            "POST", "/workflows", {"id": "wf-na", "nodes": TASK},
+            key="wf-na", headers=headers,
+        )
+        status, plain = self.call("GET", "/usage", headers=headers)
+        self.assertEqual(200, status)
+        self.assertNotIn("usage_buckets", json.loads(plain))
+        status, data = self.call("GET", "/bill", headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"items", "total"}, set(json.loads(data)["bill"].keys()))
+
+
 if __name__ == "__main__":
     unittest.main()
