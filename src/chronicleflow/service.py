@@ -226,6 +226,13 @@ USAGE_BUCKET_HOUR = "hour"
 USAGE_BUCKET_DAY = "day"
 USAGE_BUCKETS = (USAGE_BUCKET_HOUR, USAGE_BUCKET_DAY)
 
+# Actions recorded in a tenant's price-table change history, in ascending
+# identifier order. ``declare`` leaves the declared type-to-price map in
+# effect; ``delete`` leaves no declared table, so its snapshot is null.
+PRICE_ACTION_DELETE = "delete"
+PRICE_ACTION_DECLARE = "declare"
+PRICE_HISTORY_ACTIONS = (PRICE_ACTION_DELETE, PRICE_ACTION_DECLARE)
+
 # Termination reasons in ascending identifier order. The metrics status
 # distribution always reports every reason, zero when no execution ended for
 # it, so the breakdown shape never depends on the recorded facts.
@@ -397,6 +404,31 @@ class ChronicleFlow:
             return
         with self.store.transaction():
             self._record_usage(tenant, USAGE_TYPE_DELIVERY_ATTEMPTED)
+
+    def _record_price_history(
+        self, tenant: str, action: str, snapshot: dict[str, int] | None, occurred_at: str
+    ) -> None:
+        """Append one price-table change record on the open transaction.
+
+        The record carries the action (``declare`` or ``delete``) and the table
+        snapshot in effect after it: the declared type-to-price map for a
+        declaration and null for a delete. Sequences are stable, strictly
+        increasing positive integers per tenant shared across every action.
+        Callers run inside a store transaction so the record commits atomically
+        with the change it describes and is absent when that change is rolled
+        back; replaying an idempotent command never reaches here, so a replay
+        appends no second record.
+        """
+        sequence_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM price_history WHERE tenant = ?",
+            (tenant,),
+        ).fetchone()
+        document = None if snapshot is None else self.store.encode(snapshot)
+        self.store.connection.execute(
+            "INSERT INTO price_history(tenant, sequence, action, snapshot, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tenant, sequence_row["sequence"], action, document, occurred_at),
+        )
 
 
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
@@ -761,13 +793,19 @@ class ChronicleFlow:
         document = self.store.encode(prices)
 
         def apply() -> dict[str, Any]:
+            # The history record shares the change's effective timestamp and
+            # commits in the same transaction, so a reader always sees the
+            # table and its history agree.
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "INSERT INTO prices(tenant, document, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(tenant) DO UPDATE SET document = excluded.document, "
                 "updated_at = excluded.updated_at",
-                (tenant, document, self.store.now()),
+                (tenant, document, occurred_at),
             )
-            return {"prices": dict(sorted(prices.items()))}
+            snapshot = dict(sorted(prices.items()))
+            self._record_price_history(tenant, PRICE_ACTION_DECLARE, snapshot, occurred_at)
+            return {"prices": snapshot}
 
         with self._operation():
             return self._idempotent(key, "declare-prices", apply, tenant)
@@ -790,11 +828,14 @@ class ChronicleFlow:
 
         def apply() -> dict[str, Any]:
             # Removing a table that was never declared deletes no row but is
-            # still the same definite empty result, never an error.
+            # still the same definite empty result, never an error; the delete
+            # itself still takes effect, so it leaves its own history record.
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "DELETE FROM prices WHERE tenant = ?",
                 (tenant,),
             )
+            self._record_price_history(tenant, PRICE_ACTION_DELETE, None, occurred_at)
             return {"prices": None}
 
         with self._operation():
@@ -819,6 +860,70 @@ class ChronicleFlow:
                 if declared is None:
                     return {"prices": None}
                 return {"prices": dict(sorted(declared.items()))}
+
+    def price_history(
+        self,
+        tenant: str,
+        actions: tuple[str, ...] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the tenant's price-table change history, filtered and paged.
+
+        The query is read-only: it appends no history, writes no table, and
+        changes no metering, usage, bill, or quota conclusion. Records come
+        back in ascending occurrence-time order, with records sharing one
+        instant ordered by ascending sequence. ``actions`` keeps only records
+        whose action is in the set; ``since`` and ``until`` bind a closed
+        interval on each record's own occurrence time (a window with ``since``
+        later than ``until`` simply matches nothing); ``cursor`` keeps only
+        records with a sequence strictly greater than it; ``limit`` caps the
+        page at that many records. Filters combine as an intersection and
+        sequences are never renumbered, so consecutive pages neither overlap
+        nor skip. A tenant with no matching records gets the definite empty
+        list, and another tenant's history is never visible.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        wanted = set(actions) if actions is not None else None
+        with self._operation():
+            with self.store.transaction():
+                rows = self.store.connection.execute(
+                    "SELECT sequence, action, snapshot, occurred_at FROM price_history WHERE tenant = ?",
+                    (tenant,),
+                ).fetchall()
+                hits = []
+                for row in rows:
+                    if wanted is not None and row["action"] not in wanted:
+                        continue
+                    occurred_at = _parse_stored_time(row["occurred_at"])
+                    if not self._within_window(occurred_at, since, until):
+                        continue
+                    if cursor is not None and row["sequence"] <= cursor:
+                        continue
+                    hits.append((occurred_at, row))
+                hits.sort(key=lambda hit: (hit[0], hit[1]["sequence"]))
+                if limit is not None:
+                    hits = hits[:limit]
+                records = []
+                for _, row in hits:
+                    if row["snapshot"] is None:
+                        snapshot = None
+                    else:
+                        # A declaration's snapshot lists only the named types,
+                        # in ascending type-identifier order.
+                        snapshot = dict(sorted(self.store.decode(row["snapshot"]).items()))
+                    records.append(
+                        {
+                            "sequence": row["sequence"],
+                            "action": row["action"],
+                            "occurred_at": row["occurred_at"],
+                            "snapshot": snapshot,
+                        }
+                    )
+                return {"history": records}
 
     def _effective_prices(self, tenant: str) -> dict[str, int]:
         """Prices in effect for the tenant at query time.
