@@ -765,6 +765,36 @@ class ChronicleFlow:
                     return {"quota": None}
                 return {"quota": {"workflows": row["workflows"], "executions": row["executions"]}}
 
+    def quota_status(self, tenant: str) -> dict[str, Any]:
+        """Report each restricted resource's declared limit, holding, and remaining room.
+
+        Read-only: the query writes no metering record and changes no declared
+        quota. The holding is the same real count quota enforcement uses, and
+        the remaining room is the limit minus that holding; when a limit was
+        lowered below the current holding the remaining room is reported
+        truthfully as a negative number, neither clamped to zero nor rejected.
+        A tenant that has never declared a quota gets the definite empty
+        result ``{"status": None}`` rather than an error. Resources always
+        appear workflows first, then executions, with the same ordering on
+        every query.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        with self._operation():
+            with self.store.transaction():
+                limits = self._quota_limits(tenant)
+                if limits is None:
+                    return {"status": None}
+                resources = {}
+                for kind in ("workflows", "executions"):
+                    held = self.store.connection.execute(
+                        f"SELECT COUNT(*) AS used FROM {kind} WHERE tenant = ?",
+                        (tenant,),
+                    ).fetchone()["used"]
+                    limit = limits[kind]
+                    resources[kind] = {"limit": limit, "held": held, "remaining": limit - held}
+                return {"status": resources}
+
     def declare_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
         """Declare the tenant's price table, replacing it as a whole.
 

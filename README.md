@@ -103,9 +103,10 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the quota declaration, the price
-declaration and price delete, the price read and the price change history, and the usage, bill, and
-metrics queries. An empty
+history and status queries, as well as the quota declaration, the quota read
+and the remaining-quota status query, the price declaration and price
+delete, the price read and the price change history, and the usage, bill,
+and metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
 header entirely keep using the single legacy namespace, whose advancement,
 approvals, leases, retries, timeouts, cancellation, checkpoints, recovery,
@@ -145,6 +146,44 @@ X-Tenant-Id: acme
 
 Returns the declared quota, or the definite empty result `{"quota":null}`
 when the tenant has declared none.
+
+A separate read-only entry point reports how much room each declared limit
+still leaves, with exactly the same calling shape as the quota read:
+
+```http
+GET /quotas/status
+X-Tenant-Id: acme
+```
+
+Each restricted resource is represented by an object that gives, in this
+fixed key order, the declared `limit`, the `held` count the quota check
+actually uses (the real number of the tenant's stored workflows or
+executions), and the `remaining` room, equal to `limit - held`. The two
+resources always appear in the fixed order workflows first and executions
+second, so repeating the query returns the same arrangement:
+
+```json
+{"status":{"workflows":{"limit":10,"held":4,"remaining":6},"executions":{"limit":100,"held":103,"remaining":-3}}}
+```
+
+Lowering a limit below the current holding changes nothing and reports the
+remaining room truthfully as a negative number: it is neither clamped to
+zero nor rejected. A tenant that has never declared a quota gets the
+definite empty result `{"status":null}`, listing neither resource's limit
+nor holding, rather than an error. The response is one line of compact JSON
+with the stable key order above, numbers keeping their full precision and
+`-0.0`, and exactly one trailing newline, like every other JSON endpoint.
+
+The query is read-only: it writes no metering record and changes no
+declared quota, usage, bill, schedule, approval, or replay conclusion.
+Another tenant's quota or holding is never visible under any circumstances
+and never affects this tenant's remaining room. The route requires a
+tenant: a missing or empty `X-Tenant-Id` is a `400 validation_error` that
+reveals no remaining room. It accepts no query parameters: any unknown
+parameter — including an empty one, a repeated parameter, or a request
+containing a non-finite number — is a `400 validation_error` whose message
+names the offending parameter. Every such rejection writes nothing and
+changes no quota, usage, or bill conclusion.
 
 When a write would take the tenant past either limit, the whole request is
 rejected with `409 conflict` and an error message that names the quota (for
