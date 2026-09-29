@@ -212,6 +212,12 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
+        # Two connections open against the same file (separate service
+        # processes, or a replacement connection) serialize their write
+        # transactions through BEGIN IMMEDIATE. Wait for the writer lock
+        # instead of failing immediately with SQLITE_BUSY, so a concurrent
+        # quota write blocks and then proceeds rather than surfacing a 500.
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self._migrate_legacy_schema()
         self._migrate_added_columns()
         self.connection.executescript(SCHEMA)
