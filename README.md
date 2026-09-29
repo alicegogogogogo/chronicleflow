@@ -51,8 +51,10 @@ The initial release intentionally supports a compact public contract:
   five-field cron plan — and the service automatically creates one execution
   per due period with the declared input; schedules can be paused and
   resumed, periods missed while paused are either caught up once or
-  skipped, according to the declared missed policy, and a read-only preview
-  query projects the upcoming trigger times and their inputs.
+  skipped, according to the declared missed policy, a read-only preview
+  query projects the upcoming trigger times and their inputs, and a
+  read-only change history records every successful declaration,
+  replacement, pause, and resume with the moment each took effect.
 
 ## Requirements
 
@@ -103,7 +105,8 @@ The header applies to every workflow, execution, and schedule entry point,
 including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
-history and status queries, as well as the quota declaration and delete, the quota
+history and status queries (including the schedule change history), as well
+as the quota declaration and delete, the quota
 read and remaining query, the quota change history, the price
 declaration and price delete, the price read and the price change history, and the usage, bill, and
 metrics queries. An empty
@@ -1989,6 +1992,93 @@ Workflows that declare no schedule are unaffected: their creation,
 advancement, approvals, deliveries, checkpoints, recovery, and replay behave
 exactly as before, with no additional fields or events.
 
+### Schedule change history
+
+Every successful schedule declaration, replacement, pause, and resume leaves
+one change record, so a caller can see exactly when each scheduling change
+took effect; the schedule's own firings and trigger settlements leave no such
+record. A separate read-only entry point hangs off the same schedule entry
+point, with the same calling shape as the price-table change history:
+
+```http
+GET /workflows/nightly-orders/schedule/history?limit=50
+X-Tenant-Id: acme
+```
+
+Returns `{"history":[...]}` with the records in ascending order of occurrence
+time; records sharing one instant are ordered by a stable ascending sequence.
+Each record is:
+
+```json
+{"sequence":3,"action":"pause","occurred_at":"2026-09-26T08:30:00.000Z","snapshot":{"schedule":{"interval_seconds":3600,"input":{"mode":"nightly"},"missed_policy":"catch_up"},"paused":true}}
+```
+
+- `sequence` is a stable, strictly increasing positive integer per tenant and
+  workflow, shared across every kind of schedule change. It identifies the
+  record across every query and is never renumbered by a filter or a page;
+- `action` is `declare` for an initial declaration or a replacement,
+  `pause` for a pause, or `resume` for a resume;
+- `occurred_at` is the moment the change took effect, an ISO-8601 UTC string
+  ending in `Z`;
+- `snapshot` is the complete schedule in effect after the change, listing the
+  effective plan under `schedule` exactly as declared — the plan text is kept
+  verbatim and never rewritten — followed by the `paused` flag.
+
+The history record is written atomically with the change it describes, in the
+same transaction as the schedule write, so a reader always sees the schedule
+and its history agree and a declaration, replacement, pause, or resume rejected
+by validation, a missing-resource or conflict response, or an idempotency-key
+conflict leaves no record. Repeating an idempotent declaration, replacement,
+pause, or resume with the same key returns the first result — exactly matching
+the first response — and appends no second record; reusing a key for another
+operation is the usual `409 conflict` and, again, writes no history.
+
+A schedule with no matching records gets the definite empty result
+`{"history":[]}`, never an error. The response is one line of compact JSON
+with the record keys in the order above, full number precision preserved
+(including `-0.0` inside the declared plan), and a single trailing newline,
+like every other JSON endpoint.
+
+The endpoint accepts an optional action filter, the same optional closed time
+window the per-record usage query accepts, plus cursor pagination, in exactly
+the same shape as the price-table change history:
+
+```http
+GET /workflows/nightly-orders/schedule/history?action=declare,pause,resume&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `action` names one action or a comma-separated set of them (`declare`,
+  `pause`, and `resume`); only records whose action is in the set are
+  returned. A single value needs no comma. An empty entry, a duplicate entry,
+  or an unknown action is a `400 validation_error`; when `action` is absent
+  every change is returned;
+- `since` and `until` are ISO-8601 UTC timestamps ending in `Z` and bind a
+  **closed** interval on each record's occurrence time: a record whose time
+  equals either boundary is included. When either is absent the corresponding
+  bound is open; when `since` is later than `until` the window matches nothing
+  and the definite empty list is returned;
+- `limit` is **required** and must be a positive integer; a page never
+  contains more than that many records;
+- `cursor` is the `sequence` of the previous page's last record; only records
+  whose `sequence` is strictly greater are returned, so pages neither overlap
+  nor skip. It is omitted on the first page and must be a positive integer;
+- the action filter, time window, and pagination apply together as an
+  intersection, and filtering never changes a record's `sequence`.
+
+A malformed timestamp, an unknown, empty, or duplicated `action` entry, a
+missing or non-positive-integer `limit`, a non-positive-integer `cursor`, a
+repeated parameter, or any unknown query parameter is a `400
+validation_error` that writes nothing. A missing or empty `X-Tenant-Id` is a
+`400 validation_error` that reveals no records. The query is read-only: it
+appends no history, writes no metering record, settles no due period, and
+changes no schedule declaration, pause state, usage, bill, approval, replay,
+or trigger conclusion. History follows the usual tenant isolation, so another
+tenant's changes are never visible under any action filter, window, or page,
+and querying a missing workflow or a workflow owned by another tenant is the
+usual `404 not_found`, indistinguishable from a workflow that does not exist.
+Replay and recovery leave every recorded sequence, time, and snapshot
+unchanged.
+
 ### Checkpoints
 
 Every successful `advance` that settles a node boundary — a task is
@@ -2276,9 +2366,13 @@ a non-positive or non-integer interval, a malformed or out-of-range cron
 expression, declaring both an interval and a cron plan, an unknown missed
 policy, or an unknown field — is a validation error that rejects the whole
 request without partial writes; pausing, resuming, or updating the schedule
-of a missing workflow, or pausing and resuming a workflow that has no
+of a missing workflow, querying the schedule status, preview, or change
+history of a missing workflow, or pausing and resuming a workflow that has no
 schedule, is a missing resource, and a malformed pause or resume body is a
-validation error. Request bodies must not contain
+validation error; the schedule change history rejects a missing or empty
+tenant, a malformed timestamp, an unknown, empty, or duplicated action entry,
+a repeated or unknown parameter, and a missing or non-positive limit or
+cursor as a validation error, and it is read-only. Request bodies must not contain
 non-finite numbers (`NaN`, `Infinity`, or overflowing values such as `1e400`);
 they are rejected with 400. Finite floats keep their full precision, including negative zero
 (`-0.0`), and every response body ends with a single newline.
