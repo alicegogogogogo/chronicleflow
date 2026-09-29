@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS schedule_triggers (
   PRIMARY KEY (tenant, workflow_id, period_key),
   FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
 );
+CREATE TABLE IF NOT EXISTS schedule_history (
+  tenant TEXT NOT NULL DEFAULT '',
+  workflow_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  plan TEXT NOT NULL,
+  paused INTEGER NOT NULL,
+  occurred_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, workflow_id, sequence),
+  FOREIGN KEY (tenant, workflow_id) REFERENCES workflows(tenant, id)
+);
 CREATE TABLE IF NOT EXISTS quotas (
   tenant TEXT PRIMARY KEY,
   workflows INTEGER NOT NULL,

@@ -246,6 +246,20 @@ QUOTA_ACTION_DELETE = "delete"
 QUOTA_ACTION_DECLARE = "declare"
 QUOTA_HISTORY_ACTIONS = (QUOTA_ACTION_DELETE, QUOTA_ACTION_DECLARE)
 
+# Actions recorded in a workflow's schedule change history, in ascending
+# identifier order. Every successful declaration or replacement records
+# ``declare``; pausing records ``pause`` and resuming ``resume``. The snapshot
+# is the complete plan in effect together with the pause flag, so no action's
+# snapshot is null.
+SCHEDULE_ACTION_DECLARE = "declare"
+SCHEDULE_ACTION_PAUSE = "pause"
+SCHEDULE_ACTION_RESUME = "resume"
+SCHEDULE_HISTORY_ACTIONS = (
+    SCHEDULE_ACTION_DECLARE,
+    SCHEDULE_ACTION_PAUSE,
+    SCHEDULE_ACTION_RESUME,
+)
+
 # Termination reasons in ascending identifier order. The metrics status
 # distribution always reports every reason, zero when no execution ended for
 # it, so the breakdown shape never depends on the recorded facts.
@@ -467,6 +481,46 @@ class ChronicleFlow:
             "INSERT INTO quota_history(tenant, sequence, action, snapshot, occurred_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (tenant, sequence_row["sequence"], action, document, occurred_at),
+        )
+
+    def _record_schedule_history(
+        self,
+        tenant: str,
+        workflow_id: str,
+        action: str,
+        plan: dict[str, Any],
+        paused: bool,
+        occurred_at: str,
+    ) -> None:
+        """Append one schedule change record on the open transaction.
+
+        The record carries the action (``declare`` for a declaration or
+        replacement, ``pause``, or ``resume``) and the snapshot in effect after
+        it: the complete plan and the pause flag. The plan is stored verbatim,
+        never rewritten. Sequences are stable, strictly increasing positive
+        integers per tenant and workflow shared across every action. Callers
+        run inside a store transaction so the record commits atomically with
+        the schedule write it describes and is absent when that write is rolled
+        back; replaying an idempotent command never reaches here, so a replay
+        appends no second record.
+        """
+        sequence_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM schedule_history "
+            "WHERE tenant = ? AND workflow_id = ?",
+            (tenant, workflow_id),
+        ).fetchone()
+        self.store.connection.execute(
+            "INSERT INTO schedule_history(tenant, workflow_id, sequence, action, plan, paused, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant,
+                workflow_id,
+                sequence_row["sequence"],
+                action,
+                self.store.encode(plan),
+                1 if paused else 0,
+                occurred_at,
+            ),
         )
 
     def _attempt_delivery(self, subscription: dict[str, Any], notice: dict[str, Any], key: str) -> dict[str, Any]:
@@ -1953,6 +2007,7 @@ class ChronicleFlow:
 
     def _insert_schedule(self, workflow_id: str, schedule: dict[str, Any], tenant: str) -> None:
         """Attach a fresh schedule declaration to a workflow; it is due from now on."""
+        occurred_at = self.store.now()
         self.store.connection.execute(
             "INSERT INTO schedules(tenant, workflow_id, document, paused, anchor_at, cursor) "
             "VALUES (?, ?, ?, 0, ?, '') "
@@ -1965,6 +2020,14 @@ class ChronicleFlow:
         self.store.connection.execute(
             "DELETE FROM schedule_triggers WHERE tenant = ? AND workflow_id = ?",
             (tenant, workflow_id),
+        )
+        # A replacement keeps the pause flag (the ON CONFLICT update leaves it
+        # untouched) while a fresh declaration starts unpaused; read back the
+        # row so the snapshot always reflects the flag actually in effect. The
+        # history row commits with the declaration in this same transaction.
+        row = self._schedule_row(workflow_id, tenant)
+        self._record_schedule_history(
+            tenant, workflow_id, SCHEDULE_ACTION_DECLARE, schedule, bool(row["paused"]), occurred_at
         )
 
     def create_execution(self, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
@@ -2844,6 +2907,75 @@ class ChronicleFlow:
                 self._process_schedules(workflow_id, tenant)
                 return self._schedule_status(self._schedule_row(workflow_id, tenant))
 
+    def schedule_history(
+        self,
+        workflow_id: str,
+        tenant: str,
+        actions: tuple[str, ...] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return one workflow's schedule change history, filtered and paged.
+
+        The query is read-only: it appends no history, settles no due period,
+        writes no metering record, and changes no schedule. A missing or
+        another tenant's workflow is the usual 404 not_found. Records come back
+        in ascending occurrence-time order, with records sharing one instant
+        ordered by ascending sequence. ``actions`` keeps only records whose
+        action is in the set; ``since`` and ``until`` bind a closed interval on
+        each record's own occurrence time (a window with ``since`` later than
+        ``until`` simply matches nothing); ``cursor`` keeps only records with a
+        sequence strictly greater it; ``limit`` caps the page at that many
+        records. Filters combine as an intersection and sequences are never
+        renumbered, so consecutive pages neither overlap nor skip. A workflow
+        with no matching records gets the definite empty list.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        wanted = set(actions) if actions is not None else None
+        with self._operation():
+            with self.store.transaction():
+                # A missing or cross-tenant workflow is indistinguishable from
+                # one that does not exist, so the route never reveals it.
+                self._assert_workflow_exists(workflow_id, tenant)
+                rows = self.store.connection.execute(
+                    "SELECT sequence, action, plan, paused, occurred_at FROM schedule_history "
+                    "WHERE tenant = ? AND workflow_id = ?",
+                    (tenant, workflow_id),
+                ).fetchall()
+                hits = []
+                for row in rows:
+                    if wanted is not None and row["action"] not in wanted:
+                        continue
+                    occurred_at = _parse_stored_time(row["occurred_at"])
+                    if not self._within_window(occurred_at, since, until):
+                        continue
+                    if cursor is not None and row["sequence"] <= cursor:
+                        continue
+                    hits.append((occurred_at, row))
+                hits.sort(key=lambda hit: (hit[0], hit[1]["sequence"]))
+                if limit is not None:
+                    hits = hits[:limit]
+                records = []
+                for _, row in hits:
+                    # The snapshot is the plan in effect after the change,
+                    # verbatim, followed by the pause flag then in effect.
+                    snapshot = {
+                        "schedule": self.store.decode(row["plan"]),
+                        "paused": bool(row["paused"]),
+                    }
+                    records.append(
+                        {
+                            "sequence": row["sequence"],
+                            "action": row["action"],
+                            "occurred_at": row["occurred_at"],
+                            "snapshot": snapshot,
+                        }
+                    )
+                return {"history": records}
+
     @staticmethod
     def _preview_points(document: dict[str, Any], anchor: float, cursor: str, limit: int) -> list[float]:
         """Project up to ``limit`` trigger times from the first unsettled period.
@@ -2902,11 +3034,23 @@ class ChronicleFlow:
 
         def apply() -> dict[str, Any]:
             self._assert_workflow_exists(workflow_id, tenant)
-            if self._schedule_row(workflow_id, tenant) is None:
+            row = self._schedule_row(workflow_id, tenant)
+            if row is None:
                 raise NotFoundError(f"workflow {workflow_id} has no schedule")
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "UPDATE schedules SET paused = 1 WHERE tenant = ? AND workflow_id = ?",
                 (tenant, workflow_id),
+            )
+            # The snapshot is the unchanged plan, verbatim, with the pause
+            # flag now in effect; the record commits with the update.
+            self._record_schedule_history(
+                tenant,
+                workflow_id,
+                SCHEDULE_ACTION_PAUSE,
+                self.store.decode(row["document"]),
+                True,
+                occurred_at,
             )
             return self._schedule_status(self._schedule_row(workflow_id, tenant))
 
@@ -2920,11 +3064,24 @@ class ChronicleFlow:
 
         def apply() -> dict[str, Any]:
             self._assert_workflow_exists(workflow_id, tenant)
-            if self._schedule_row(workflow_id, tenant) is None:
+            row = self._schedule_row(workflow_id, tenant)
+            if row is None:
                 raise NotFoundError(f"workflow {workflow_id} has no schedule")
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "UPDATE schedules SET paused = 0 WHERE tenant = ? AND workflow_id = ?",
                 (tenant, workflow_id),
+            )
+            # The snapshot is the unchanged plan, verbatim, with the schedule
+            # resumed; the record commits before the missed periods are settled
+            # so it shares exactly the resume's effective moment.
+            self._record_schedule_history(
+                tenant,
+                workflow_id,
+                SCHEDULE_ACTION_RESUME,
+                self.store.decode(row["document"]),
+                False,
+                occurred_at,
             )
             # Periods that came due while paused are settled immediately
             # according to the missed policy.

@@ -14,6 +14,7 @@ from .service import (
     EXECUTION_STATUSES,
     PRICE_HISTORY_ACTIONS,
     QUOTA_HISTORY_ACTIONS,
+    SCHEDULE_HISTORY_ACTIONS,
     TERMINATION_REASONS,
     USAGE_BUCKETS,
     USAGE_TYPES,
@@ -58,6 +59,12 @@ PRICE_HISTORY_QUERY_PARAMETERS = ("action", "since", "until", "cursor", "limit")
 # price-table change history. Anything else is a validation error exactly like
 # an unknown field.
 QUOTA_HISTORY_QUERY_PARAMETERS = ("action", "since", "until", "cursor", "limit")
+
+# The only query parameters the schedule change history accepts: an optional
+# action set, a closed time window, and cursor pagination, exactly like the
+# price-table and quota change histories. Anything else is a validation error
+# exactly like an unknown field.
+SCHEDULE_HISTORY_QUERY_PARAMETERS = ("action", "since", "until", "cursor", "limit")
 
 # The only query parameter the schedule preview accepts: the number of
 # projected trigger times. Anything else is a validation error exactly like
@@ -370,6 +377,48 @@ class Handler(BaseHTTPRequestHandler):
             "limit": _positive_integer(query["limit"][0], "limit"),
         }
 
+    def _schedule_history_query(self) -> dict[str, Any]:
+        """Parse the filter and pagination parameters of the schedule history query.
+
+        ``action`` is a single action or a comma-separated set of them
+        (``declare``, ``pause``, or ``resume``), without empty or duplicate
+        entries and naming only known actions; ``since`` and ``until`` are
+        ISO-8601 UTC timestamps ending in Z, and ``cursor`` and ``limit`` are
+        positive integers. Every parameter may appear at most once, and any
+        other parameter is a 400 validation_error, as is any malformed value.
+        ``limit`` is required — every page carries an explicit size cap — while
+        ``cursor`` is omitted on the first page.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in SCHEDULE_HISTORY_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in SCHEDULE_HISTORY_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        if "limit" not in query:
+            raise ValidationError("query parameter limit is required")
+        actions = None
+        if "action" in query:
+            entries = query["action"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError(
+                    "action must be a comma-separated set of schedule actions without empty entries"
+                )
+            if len(set(entries)) != len(entries):
+                raise ValidationError("action must not contain duplicate schedule actions")
+            unknown_actions = [entry for entry in entries if entry not in SCHEDULE_HISTORY_ACTIONS]
+            if unknown_actions:
+                raise ValidationError(f"unknown schedule action: {unknown_actions[0]}")
+            actions = tuple(entries)
+        return {
+            "actions": actions,
+            "since": _parse_timestamp(query["since"][0], "since") if "since" in query else None,
+            "until": _parse_timestamp(query["until"][0], "until") if "until" in query else None,
+            "cursor": _positive_integer(query["cursor"][0], "cursor") if "cursor" in query else None,
+            "limit": _positive_integer(query["limit"][0], "limit"),
+        }
+
     def _preview_limit(self) -> int:
         """Parse the required limit parameter of the schedule preview query.
 
@@ -532,6 +581,9 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_workflow(parts[1], self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command == "GET":
             return 200, self.service.schedule_status(parts[1], self._tenant())
+        if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "history" and self.command == "GET":
+            parameters = self._schedule_history_query()
+            return 200, self.service.schedule_history(parts[1], self._tenant(), **parameters)
         if len(parts) == 4 and parts[0] == "workflows" and parts[2] == "schedule" and parts[3] == "preview" and self.command == "GET":
             return 200, self.service.schedule_preview(parts[1], self._preview_limit(), self._tenant())
         if len(parts) == 3 and parts[0] == "workflows" and parts[2] == "schedule" and self.command in ("POST", "PUT"):
