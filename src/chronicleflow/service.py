@@ -238,6 +238,14 @@ PRICE_ACTION_DELETE = "delete"
 PRICE_ACTION_DECLARE = "declare"
 PRICE_HISTORY_ACTIONS = (PRICE_ACTION_DELETE, PRICE_ACTION_DECLARE)
 
+# Actions recorded in a tenant's quota change history, in ascending identifier
+# order. ``declare`` leaves the declared limits (and growth policy) in effect;
+# ``delete`` leaves no declared quota, so its snapshot is null. The sequence
+# space is the quota history's own, independent of the price history.
+QUOTA_ACTION_DELETE = "delete"
+QUOTA_ACTION_DECLARE = "declare"
+QUOTA_HISTORY_ACTIONS = (QUOTA_ACTION_DELETE, QUOTA_ACTION_DECLARE)
+
 # Termination reasons in ascending identifier order. The metrics status
 # distribution always reports every reason, zero when no execution ended for
 # it, so the breakdown shape never depends on the recorded facts.
@@ -431,6 +439,32 @@ class ChronicleFlow:
         document = None if snapshot is None else self.store.encode(snapshot)
         self.store.connection.execute(
             "INSERT INTO price_history(tenant, sequence, action, snapshot, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tenant, sequence_row["sequence"], action, document, occurred_at),
+        )
+
+    def _record_quota_history(
+        self, tenant: str, action: str, snapshot: dict[str, Any] | None, occurred_at: str
+    ) -> None:
+        """Append one quota change record on the open transaction.
+
+        The record carries the action (``declare`` or ``delete``) and the quota
+        snapshot in effect after it: the declared limits and the growth policy
+        that took effect for a declaration, and null for a delete. Sequences
+        are stable, strictly increasing positive integers per tenant shared
+        across every action, in the quota history's own sequence space.
+        Callers run inside a store transaction so the record commits atomically
+        with the change it describes and is absent when that change is rolled
+        back; replaying an idempotent command never reaches here, so a replay
+        appends no second record.
+        """
+        sequence_row = self.store.connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM quota_history WHERE tenant = ?",
+            (tenant,),
+        ).fetchone()
+        document = None if snapshot is None else self.store.encode(snapshot)
+        self.store.connection.execute(
+            "INSERT INTO quota_history(tenant, sequence, action, snapshot, occurred_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (tenant, sequence_row["sequence"], action, document, occurred_at),
         )
@@ -784,6 +818,10 @@ class ChronicleFlow:
         policy = self._parse_quota_growth(raw["growth"], limits) if "growth" in raw else {}
 
         def apply() -> dict[str, Any]:
+            # The history record shares the change's effective timestamp and
+            # commits in the same transaction, so a reader always sees the
+            # quota and its history agree.
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "INSERT INTO quotas(tenant, workflows, executions, "
                 "workflows_step, workflows_cap, executions_step, executions_cap, updated_at) "
@@ -800,10 +838,16 @@ class ChronicleFlow:
                     policy.get("workflows", {}).get("cap"),
                     policy.get("executions", {}).get("step"),
                     policy.get("executions", {}).get("cap"),
-                    self.store.now(),
+                    occurred_at,
                 ),
             )
-            return self._quota_declaration(limits, policy)
+            response = self._quota_declaration(limits, policy)
+            # The declaration's snapshot is exactly the limits and growth
+            # policy that took effect this time, in their stable key order.
+            self._record_quota_history(
+                tenant, QUOTA_ACTION_DECLARE, response["quota"], occurred_at
+            )
+            return response
 
         with self._operation():
             return self._idempotent(key, "declare-quota", apply, tenant)
@@ -901,15 +945,102 @@ class ChronicleFlow:
 
         def apply() -> dict[str, Any]:
             # Removing a declaration that was never made deletes no row but
-            # is still the same definite empty result, never an error.
+            # is still the same definite empty result, never an error; the
+            # delete itself still takes effect, so it leaves its own history
+            # record with a null snapshot.
+            occurred_at = self.store.now()
             self.store.connection.execute(
                 "DELETE FROM quotas WHERE tenant = ?",
                 (tenant,),
             )
+            self._record_quota_history(tenant, QUOTA_ACTION_DELETE, None, occurred_at)
             return {"quota": None}
 
         with self._operation():
             return self._idempotent(key, "delete-quota", apply, tenant)
+
+    @staticmethod
+    def _quota_history_snapshot(document: dict[str, Any]) -> dict[str, Any]:
+        """Render a stored declare snapshot back in the quota's stable key order.
+
+        The document is stored as compact JSON with sorted keys, so it is
+        rebuilt here: ``workflows`` then ``executions``, followed by ``growth``
+        only when this declaration carried one, with resources workflows-first
+        and each entry giving ``step`` before ``cap``. A snapshot lists only
+        what that declaration actually put into effect.
+        """
+        quota: dict[str, Any] = {
+            "workflows": document["workflows"],
+            "executions": document["executions"],
+        }
+        if "growth" in document:
+            quota["growth"] = {
+                kind: {"step": document["growth"][kind]["step"], "cap": document["growth"][kind]["cap"]}
+                for kind in QUOTA_RESOURCES
+                if kind in document["growth"]
+            }
+        return quota
+
+    def quota_history(
+        self,
+        tenant: str,
+        actions: tuple[str, ...] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the tenant's quota change history, filtered and paged.
+
+        The query is read-only: it appends no history, writes no metering
+        record, and changes no quota declaration, usage, bill, or scheduling
+        conclusion. Records come back in ascending occurrence-time order, with
+        records sharing one instant ordered by ascending sequence. ``actions``
+        keeps only records whose action is in the set; ``since`` and ``until``
+        bind a closed interval on each record's own occurrence time (a window
+        with ``since`` later than ``until`` simply matches nothing); ``cursor``
+        keeps only records with a sequence strictly greater than it; ``limit``
+        caps the page at that many records. Filters combine as an intersection
+        and sequences are never renumbered, so consecutive pages neither
+        overlap nor skip. A tenant with no matching records gets the definite
+        empty list, and another tenant's history is never visible.
+        """
+        if not tenant:
+            raise ValidationError("tenant id must be a non-empty string")
+        wanted = set(actions) if actions is not None else None
+        with self._operation():
+            with self.store.transaction():
+                rows = self.store.connection.execute(
+                    "SELECT sequence, action, snapshot, occurred_at FROM quota_history WHERE tenant = ?",
+                    (tenant,),
+                ).fetchall()
+                hits = []
+                for row in rows:
+                    if wanted is not None and row["action"] not in wanted:
+                        continue
+                    occurred_at = _parse_stored_time(row["occurred_at"])
+                    if not self._within_window(occurred_at, since, until):
+                        continue
+                    if cursor is not None and row["sequence"] <= cursor:
+                        continue
+                    hits.append((occurred_at, row))
+                hits.sort(key=lambda hit: (hit[0], hit[1]["sequence"]))
+                if limit is not None:
+                    hits = hits[:limit]
+                records = []
+                for _, row in hits:
+                    snapshot = None if row["snapshot"] is None else self._quota_history_snapshot(
+                        self.store.decode(row["snapshot"])
+                    )
+                    records.append(
+                        {
+                            "sequence": row["sequence"],
+                            "action": row["action"],
+                            "occurred_at": row["occurred_at"],
+                            "snapshot": snapshot,
+                        }
+                    )
+                return {"history": records}
 
     def declare_prices(self, raw: Any, key: str | None, tenant: str) -> dict[str, Any]:
         """Declare the tenant's price table, replacing it as a whole.
