@@ -104,7 +104,7 @@ including creation, advancement, migration, approval decisions, lease
 operations, cancellation, recovery, replay, instance deletion and
 modification and re-expansion, queue pulls, acknowledgements, and all
 history and status queries, as well as the quota declaration and delete, the quota
-read and remaining query, the price
+read and remaining query, the quota change history, the price
 declaration and price delete, the price read and the price change history, and the usage, bill, and
 metrics queries. An empty
 `X-Tenant-Id` value is a `400 validation_error`. Requests that omit the
@@ -214,7 +214,7 @@ are scoped per tenant like everything else: deleting one tenant's quota never
 affects another tenant's declaration or remaining room. A missing or empty
 tenant and a missing idempotency key are `400 validation_error`, and every
 failed validation writes nothing — no quota row, no metering record, and no
-price-table change history.
+quota or price-table change history.
 
 A separate read-only entry point reports how much room the declared quota
 leaves, with the same calling shape as the quota read:
@@ -276,6 +276,95 @@ execution and the schedule is left unchanged — its cursor,
 period is settled on a later pass once capacity exists, under the usual
 per-period idempotence. Delivery history follows the tenant of the execution
 it belongs to.
+
+### Quota change history
+
+Every successful quota declaration or delete leaves one change record, so a
+caller can see exactly when each quota declaration and each removal took
+effect. A separate read-only entry point returns the tenant's change history
+with the same calling shape as the price-table change history:
+
+```http
+GET /quotas/history?limit=50
+X-Tenant-Id: acme
+```
+
+Returns `{"history":[...]}` with the records in ascending order of occurrence
+time; records sharing one instant are ordered by a stable ascending sequence.
+Each record is:
+
+```json
+{"sequence":7,"action":"declare","occurred_at":"2026-09-26T08:30:00.000Z","snapshot":{"workflows":10,"executions":100,"growth":{"workflows":{"step":5,"cap":50},"executions":{"step":50,"cap":500}}}}
+```
+
+- `sequence` is a stable, strictly increasing positive integer per tenant,
+  shared across both kinds of quota change. It identifies the record across
+  every query and is never renumbered by a filter or a page;
+- `action` is `declare` for a quota declaration or `delete` for a removal;
+- `occurred_at` is the moment the change took effect, an ISO-8601 UTC string
+  ending in `Z`;
+- `snapshot` is the complete quota in effect after the change. A
+  declaration's snapshot is the limits and growth policy that took effect:
+  the two limits first, `workflows` before `executions`, followed by the
+  optional `growth` object containing only the resources this declaration
+  named, each entry listing `step` before `cap`; a declaration without a
+  growth policy lists no `growth` at all. A delete's snapshot is `null`.
+
+The history record is written atomically with the change it describes, in the
+same transaction as the quota write, so a reader always sees the declaration
+and its history agree and a declaration or delete rejected by validation, a
+quota conflict, or an idempotency-key conflict leaves no record. Repeating an
+idempotent declaration or delete with the same key returns the first result
+and appends no second record; reusing a key for another operation is the
+usual `409 conflict` and, again, writes no history. Deleting the quota of a
+tenant that never declared one still succeeds and still leaves its own
+`delete` record (with a `null` snapshot), exactly as it returns the definite
+empty result for the quota itself.
+
+A tenant with no matching records gets the definite empty result
+`{"history":[]}`, never an error. The response is one line of compact JSON
+with the record keys in the order above, full number precision preserved, and
+a single trailing newline, like every other JSON endpoint.
+
+The endpoint accepts an optional action filter, the same optional closed time
+window the per-record usage query accepts, plus cursor pagination, in exactly
+the same shape as the price-table change history:
+
+```http
+GET /quotas/history?action=declare,delete&since=2026-09-26T08:00:00.000Z&until=2026-09-26T09:00:00.000Z&cursor=12&limit=50
+```
+
+- `action` names one action or a comma-separated set of them (`declare` and
+  `delete`); only records whose action is in the set are returned. A single
+  value needs no comma. An empty entry, a duplicate entry, or an unknown
+  action is a `400 validation_error`; when `action` is absent every change is
+  returned;
+- `since` and `until` are ISO-8601 UTC timestamps ending in `Z` and bind a
+  **closed** interval on each record's occurrence time: a record whose time
+  equals either boundary is included. When either is absent the corresponding
+  bound is open; when `since` is later than `until` the window matches nothing
+  and the definite empty list is returned;
+- `limit` is **required** and must be a positive integer; a page never
+  contains more than that many records;
+- `cursor` is the `sequence` of the previous page's last record; only records
+  whose `sequence` is strictly greater are returned, so pages neither overlap
+  nor skip. It is omitted on the first page and must be a positive integer;
+- the action filter, time window, and pagination apply together as an
+  intersection, and filtering never changes a record's `sequence`.
+
+A malformed timestamp, an unknown, empty, or duplicated `action` entry, a
+missing or non-positive-integer `limit`, a non-positive-integer `cursor`, a
+repeated parameter, or any unknown query parameter is a `400
+validation_error` that writes nothing. A missing or empty `X-Tenant-Id` is a
+`400 validation_error` that reveals no records, and another tenant's history
+is never visible under any filter. The query is read-only: it appends no
+history, writes no metering record, and changes no quota declaration, usage,
+bill, scheduling, approval, or replay conclusion. A quota declaration or
+delete not participating in this change — reads, the remaining query,
+scheduling, metering, and billing included — is byte-for-byte unchanged, and
+no metering record is added. After a replay or a recovery each record's
+sequence, occurrence time, and snapshot stay exactly as they were first
+written.
 
 ### Tenant price tables
 

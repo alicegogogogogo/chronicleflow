@@ -124,6 +124,14 @@ CREATE TABLE IF NOT EXISTS quotas (
   executions_cap INTEGER,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quota_history (
+  tenant TEXT NOT NULL DEFAULT '',
+  sequence INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  snapshot TEXT,
+  occurred_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, sequence)
+);
 CREATE TABLE IF NOT EXISTS prices (
   tenant TEXT PRIMARY KEY,
   document TEXT NOT NULL,

@@ -13,6 +13,7 @@ from .service import (
     EVENT_TYPES,
     EXECUTION_STATUSES,
     PRICE_HISTORY_ACTIONS,
+    QUOTA_HISTORY_ACTIONS,
     TERMINATION_REASONS,
     USAGE_BUCKETS,
     USAGE_TYPES,
@@ -51,6 +52,12 @@ USAGE_RECORDS_QUERY_PARAMETERS = ("type", "since", "until", "cursor", "limit")
 # like the per-record usage query. Anything else is a validation error exactly
 # like an unknown field.
 PRICE_HISTORY_QUERY_PARAMETERS = ("action", "since", "until", "cursor", "limit")
+
+# The only query parameters the quota change history accepts: an optional
+# action set, a closed time window, and cursor pagination, exactly like the
+# price-table change history. Anything else is a validation error exactly like
+# an unknown field.
+QUOTA_HISTORY_QUERY_PARAMETERS = ("action", "since", "until", "cursor", "limit")
 
 # The only query parameter the schedule preview accepts: the number of
 # projected trigger times. Anything else is a validation error exactly like
@@ -321,6 +328,48 @@ class Handler(BaseHTTPRequestHandler):
             "limit": _positive_integer(query["limit"][0], "limit"),
         }
 
+    def _quota_history_query(self) -> dict[str, Any]:
+        """Parse the filter and pagination parameters of the quota history query.
+
+        ``action`` is a single action or a comma-separated set of them
+        (``declare`` or ``delete``), without empty or duplicate entries and
+        naming only known actions; ``since`` and ``until`` are ISO-8601 UTC
+        timestamps ending in Z, and ``cursor`` and ``limit`` are positive
+        integers. Every parameter may appear at most once, and any other
+        parameter is a 400 validation_error, as is any malformed value.
+        ``limit`` is required — every page carries an explicit size cap — while
+        ``cursor`` is omitted on the first page.
+        """
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        unknown = [name for name in query if name not in QUOTA_HISTORY_QUERY_PARAMETERS]
+        if unknown:
+            raise ValidationError(f"unknown query parameter: {sorted(unknown)[0]}")
+        for name in QUOTA_HISTORY_QUERY_PARAMETERS:
+            if len(query.get(name, [])) > 1:
+                raise ValidationError(f"query parameter {name} must appear at most once")
+        if "limit" not in query:
+            raise ValidationError("query parameter limit is required")
+        actions = None
+        if "action" in query:
+            entries = query["action"][0].split(",")
+            if any(not entry for entry in entries):
+                raise ValidationError(
+                    "action must be a comma-separated set of quota actions without empty entries"
+                )
+            if len(set(entries)) != len(entries):
+                raise ValidationError("action must not contain duplicate quota actions")
+            unknown_actions = [entry for entry in entries if entry not in QUOTA_HISTORY_ACTIONS]
+            if unknown_actions:
+                raise ValidationError(f"unknown quota action: {unknown_actions[0]}")
+            actions = tuple(entries)
+        return {
+            "actions": actions,
+            "since": _parse_timestamp(query["since"][0], "since") if "since" in query else None,
+            "until": _parse_timestamp(query["until"][0], "until") if "until" in query else None,
+            "cursor": _positive_integer(query["cursor"][0], "cursor") if "cursor" in query else None,
+            "limit": _positive_integer(query["limit"][0], "limit"),
+        }
+
     def _preview_limit(self) -> int:
         """Parse the required limit parameter of the schedule preview query.
 
@@ -443,6 +492,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and parts == ["quotas", "status"]:
             self._no_query()
             return 200, self.service.quota_status(self._tenant())
+        if self.command == "GET" and parts == ["quotas", "history"]:
+            parameters = self._quota_history_query()
+            return 200, self.service.quota_history(self._tenant(), **parameters)
         if self.command in ("PUT", "POST") and parts == ["prices"]:
             return 200, self.service.declare_prices(self._body(), self.headers.get("Idempotency-Key"), self._tenant())
         if self.command == "DELETE" and parts == ["prices"]:
