@@ -129,7 +129,8 @@ X-Tenant-Id: acme
 ```
 
 `POST` to the same path is accepted as well. The body must contain exactly
-`workflows` and `executions`, each a positive integer; a non-positive,
+`workflows` and `executions`, each a positive integer, and may additionally
+carry the optional `growth` object described below; a non-positive,
 non-integer, boolean, or non-finite value, a missing or extra field, or a
 non-object body is a `400 validation_error` that writes nothing. Every quota
 route requires a tenant: declaring, deleting, and reading without
