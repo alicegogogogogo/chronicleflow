@@ -2247,6 +2247,62 @@ Leases live in the same SQLite database as the execution state, so
 unexpired leases and claim ownership remain valid after the service
 restarts.
 
+### Claim a ready target
+
+A claim may instead take a parallel lease on one independent ready target —
+a ready task or one ready map instance — by naming the `target` scope:
+
+```http
+POST /executions/run-1/claim
+Idempotency-Key: claim-request-2
+
+{"worker_id":"worker-8","lease_seconds":30,"scope":"target"}
+```
+
+`scope` is either `execution` or `target`; omitting it keeps the
+execution-level mode above unchanged. A target claim leases the first
+un-leased target in the usual ready order and returns a `work_item`
+carrying the `execution_id`, the `workflow_id`, and the target's
+`node_id`; a map instance additionally carries its `map_id` and element
+`index`, plus the owning `loop_id` and `iteration` when the map sits in a
+loop body. The `lease` records the `work_item_id` identifying the leased
+target, the `worker_id`, the `lease_seconds` duration, and the
+`expires_at` deadline and `heartbeat_at` active time as ISO-8601 UTC
+strings ending in `Z`. When every ready target is already leased the
+claim is a 409 `conflict`; when no target is ready at all, or the
+execution has already completed or terminated, the response is the
+definite empty result `{"work_item":null,"lease":null}`.
+
+A leased target is settled through the usual `advance` entry by naming
+the lease's work item:
+
+```http
+POST /executions/run-1/advance
+Idempotency-Key: advance-request-4
+
+{"output":{"reservation_id":"r-9"},"worker_id":"worker-8","work_item_id":"task:reserve"}
+```
+
+A target-level advance carries exactly an `output` object or a `failure`
+object, plus the holder's `worker_id` and the lease's `work_item_id`, and
+settles only that target: completing it releases its successors into the
+ready set, and a failure keeps the usual retry, map, and loop event
+semantics. Heartbeats and releases name the work item the same way,
+carrying exactly `worker_id` and `work_item_id`. An expired or released
+target lease returns the target to the claimable set, and the old
+holder's submissions, heartbeats, and releases are 409 `conflict`s; an
+unknown work item — including one owned by another tenant — is a 404
+`not_found`. A target settlement updates the state, the event stream,
+and the checkpoint atomically, exactly like an execution-level advance;
+claims, heartbeats, and releases write no events.
+
+While at least one target lease is valid, the execution-level operations
+conflict: an `advance`, `heartbeat`, or `release` without a
+`work_item_id`, and an execution-scope claim, are 409 `conflict`s. Once
+every target lease is released or has expired, the execution-level mode
+behaves exactly as before. Replay, recovery, approvals, cancellation,
+and timeouts are unaffected by target leases.
+
 ### Recover from a checkpoint
 
 ```http
@@ -2363,7 +2419,14 @@ resolved the latest one), is a conflict. Claiming a work item whose lease is
 still active, submitting results for a work item held by another worker or
 after the lease expired, and heartbeating or releasing a lease held by
 another worker are conflicts, while heartbeating or releasing an execution
-with no claimed work item is a missing resource. Recovering a missing
+with no claimed work item is a missing resource. Target-scoped leases follow
+the same rules per ready target: claiming when every ready target is already
+leased, submitting, heartbeating, or releasing with an expired, released, or
+another worker's target lease, and any execution-level advance, heartbeat,
+release, or claim while a target lease is valid are conflicts, while an
+unknown `work_item_id` is a missing resource; a `scope` other than
+`execution` or `target`, a missing or mistyped `work_item_id`, and any other
+malformed claim, advance, heartbeat, or release body are validation errors. Recovering a missing
 execution is a missing resource, while recovering an execution that has no
 checkpoint or whose latest checkpoint is unparseable is a conflict; an
 invalid recover body is a validation error. An invalid schedule declaration —
