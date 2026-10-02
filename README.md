@@ -38,6 +38,9 @@ The initial release intentionally supports a compact public contract:
   time-bounded lease, renew the lease with heartbeats, and release it;
   while a lease is active only its holder may submit results, and an
   expired or released lease returns the work item to the claimable set;
+  a target-scoped claim instead leases one independent ready target, so
+  several workers can settle different ready targets of one execution in
+  parallel;
 - duplicate commands with the same idempotency key return the original result;
 - workflows and executions may declare webhook subscriptions, and matching
   business events are delivered to the declared targets with bounded retries,
@@ -2178,14 +2181,41 @@ Idempotency-Key: claim-request-1
 Claiming is how an external worker takes ownership of a running execution
 before advancing its ready tasks. `worker_id` is a non-empty string and
 `lease_seconds` is an optional positive number of seconds (default 30). The
-response contains the claimed `work_item` (its `execution_id` and
-`workflow_id`) and a `lease` recording the `worker_id`, the `lease_seconds`
-duration, the `expires_at` deadline, and the `heartbeat_at` active time.
-Each work item is held by at most one worker at a time: claiming a work
-item whose lease is still active — even by the same worker — is a 409
-`conflict`. Claiming a completed or terminated execution returns the
-definite empty result `{"work_item":null,"lease":null}` and absorbs no
-input, and claiming a missing execution returns 404.
+body may additionally carry `scope`, either `execution` (the default when
+omitted) or `target`. With `scope` omitted or `execution`, the claim takes the
+single execution-wide lease described here: the response contains the claimed
+`work_item` (its `execution_id` and `workflow_id`) and a `lease` recording the
+`worker_id`, the `lease_seconds` duration, the `expires_at` deadline, and the
+`heartbeat_at` active time. Each execution work item is held by at most one
+worker at a time: claiming a work item whose lease is still active — even by
+the same worker — is a 409 `conflict`. Claiming a completed or terminated
+execution returns the definite empty result
+`{"work_item":null,"lease":null}` and absorbs no input, and claiming a missing
+or another tenant's execution returns 404.
+
+#### Parallel target leases
+
+With `"scope":"target"` a claim does not take the execution-wide lease.
+Instead it leases, in ready order, one independent ready target that no other
+valid target lease currently holds, so several workers can settle different
+ready targets of the same execution in parallel. The returned `work_item`
+always contains `execution_id`, `workflow_id`, and the target's `node_id`; a
+map instance additionally carries `map_id` and the element `index`, and an
+instance of a map inside a loop body also carries the owning `loop_id` and
+`iteration`. The `lease` contains `work_item_id`, `worker_id`,
+`lease_seconds`, `expires_at`, and `heartbeat_at`; the two times are ISO-8601
+UTC strings ending in `Z`.
+
+Re-claiming while a valid target lease still exists for every ready target is
+a 409 `conflict` (re-claiming a validly held target, even by the same worker).
+When no target can be leased — the execution has finished, is parked at an
+approval point with no other ready target, or simply has no ready target — the
+claim returns the same definite empty result
+`{"work_item":null,"lease":null}`. A missing or cross-tenant execution is a 404
+`not_found`, as is a finished execution's claim. A missing or empty
+`worker_id`, a `scope` other than `execution` or `target`, an unknown field, or
+a non-positive, non-numeric, or non-finite `lease_seconds` is a 400
+`validation_error` that writes nothing.
 
 While a work item is held, results are submitted through the usual
 `advance` entry by including the holder's identity:
@@ -2209,6 +2239,36 @@ from the materialized state: node outputs and results recorded by the
 earlier holder are never advanced or recorded twice, and every written
 output belongs to the single advance that submitted it.
 
+##### Settling a target lease
+
+A target lease is settled through the same `advance` entry, but the body must
+contain exactly one of `output` or `failure`, plus `worker_id` and
+`work_item_id`; only that one target is settled. Completing its output marks
+the target's successors ready under the usual ordering, and a submitted
+failure keeps the target's retry semantics (re-queue with `node_failed` and
+`node_retried` while retries remain, otherwise terminating the execution) and
+the existing map and loop event semantics. A target approval point is parked
+by the advance and resolved through the usual decision entry. The target's
+state, events, and checkpoint commit atomically, and the lease is released as
+part of the same transaction.
+
+`heartbeat` and `release` for a target lease take exactly `worker_id` and
+`work_item_id`; a heartbeat extends only that lease and a release returns only
+that target to the claimable set. Claims, heartbeats, and releases append no
+events and write no checkpoint. After a lease expires or is released, the
+target may be claimed again (under a new `work_item_id`); the previous holder
+submitting, heartbeating, or releasing the old `work_item_id` is a 409
+`conflict`, while an unknown or cross-tenant `work_item_id` is a 404
+`not_found`. A missing field, an unknown field, a non-object or invalid body,
+an illegal time value, or a non-finite number on these operations is a 400
+`validation_error`.
+
+While any valid target lease is active, the execution-wide mode is parked: an
+old-style `advance`, `heartbeat`, or `release` that carries no
+`work_item_id`, and an execution-scoped claim, all return 409 `conflict`. Once
+every target lease has been released or has expired, the execution-wide mode is
+available again.
+
 ### Renew a lease
 
 ```http
@@ -2223,7 +2283,9 @@ the lease duration and refresh the `heartbeat_at` active time; the response
 carries the updated `lease`. A heartbeat never advances nodes, writes
 outputs, or appends node events. A heartbeat from another worker or after
 the lease expired is a 409 `conflict`; a heartbeat for a missing execution
-or an execution with no claimed work item is a 404 `not_found`.
+or an execution with no claimed work item is a 404 `not_found`. A target
+lease is heartbeated with a body of `worker_id` and `work_item_id` (see
+"Parallel target leases"), which extends only that one lease.
 
 ### Release a work item
 

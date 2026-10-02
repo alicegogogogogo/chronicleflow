@@ -7,8 +7,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError, ValidationError
@@ -66,6 +67,20 @@ def _parse_stored_time(value: str) -> datetime:
 def _iso_utc(epoch_seconds: float) -> str:
     """Render epoch seconds as an ISO-8601 UTC timestamp string ending in Z."""
     return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _iso_fixed(moment: datetime) -> str:
+    """Render a UTC moment with fixed millisecond precision ending in Z.
+
+    Fixed-width fractional seconds make lexicographic string comparison of two
+    stamps agree with chronological order, including a whole second.
+    """
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse an ISO-8601 UTC timestamp the target-lease code itself stored."""
+    return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
 def _bucket_start(occurred_at: datetime, bucket: str) -> datetime:
@@ -195,6 +210,12 @@ QUOTA_RESOURCES = ("workflows", "executions")
 
 # The lease length a claim gets when the request names no lease_seconds.
 DEFAULT_LEASE_SECONDS = 30.0
+
+# Claim scopes: ``execution`` keeps the single execution-wide lease and
+# lexicographic advancement; ``target`` claims one independent ready target so
+# several workers can settle different targets in parallel.
+SCOPE_EXECUTION = "execution"
+SCOPE_TARGET = "target"
 
 # How often the background scheduler looks for due schedules.
 SCHEDULER_TICK_SECONDS = 0.05
@@ -2349,16 +2370,31 @@ class ChronicleFlow:
     def advance(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
     ) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) not in (
+        execution_fields = (
             {"output"},
             {"failure"},
             {"output", "worker_id"},
             {"failure", "worker_id"},
-        ):
-            raise ValidationError("advance body must contain exactly an output object or a failure object")
+        )
+        target_fields = (
+            {"output", "worker_id", "work_item_id"},
+            {"failure", "worker_id", "work_item_id"},
+        )
+        if not isinstance(raw, dict) or set(raw) not in execution_fields + target_fields:
+            raise ValidationError(
+                "advance body must contain exactly an output object or a failure object, "
+                "plus worker_id and work_item_id for a target-claimed work item"
+            )
+        target_mode = "work_item_id" in raw
         worker_id = raw.get("worker_id")
-        if worker_id is not None:
+        if not target_mode:
+            if worker_id is not None:
+                worker_id = _identifier(worker_id, "worker id")
+        else:
+            # A target settlement always names both its lease and its holder;
+            # either missing or mistyped is a validation error.
             worker_id = _identifier(worker_id, "worker id")
+            work_item_id = _identifier(raw["work_item_id"], "work item id")
         if "output" in raw:
             if not isinstance(raw["output"], dict):
                 raise ValidationError("advance output must be an object")
@@ -2372,6 +2408,10 @@ class ChronicleFlow:
             state = self.get_execution(execution_id, tenant)
             if state["status"] != "running":
                 return state
+            if target_mode:
+                return self._advance_target(
+                    execution_id, state, work_item_id, worker_id, raw, tenant
+                )
             self._assert_submission_allowed(execution_id, worker_id, tenant)
             # Parked at an approval point: the decision operation is the only
             # way forward, so an advance absorbs its output or failure and
@@ -2386,18 +2426,7 @@ class ChronicleFlow:
                 if not ready:
                     raise ConflictError("execution has no ready node")
                 target = ready[0]
-                if target.get("map_id") is not None:
-                    map_node = next(node for node in workflow.nodes if node.id == target["map_id"])
-                    approval = map_node.template.approval
-                else:
-                    node = next(node for node in workflow.nodes if node.id == target["node_id"])
-                    approval = node.approval
-                if approval is not None:
-                    self._request_approval(execution_id, workflow, state, target, tenant)
-                elif "failure" in raw:
-                    self._fail_target(execution_id, workflow, state, target, raw["failure"]["reason"], tenant)
-                else:
-                    self._complete_target(execution_id, workflow, state, target, raw["output"], tenant)
+                self._settle_target(execution_id, workflow, state, target, raw, tenant)
                 if state["status"] == "running" and state.get("waiting_approval") is None:
                     self._auto_process(execution_id, workflow, state, tenant)
             self.store.connection.execute(
@@ -2411,7 +2440,106 @@ class ChronicleFlow:
             return state
 
         with self._operation():
-            return self._idempotent(key, f"advance:{execution_id}", apply, tenant)
+            if target_mode:
+                operation = f"advance-target:{execution_id}:{work_item_id}"
+            else:
+                operation = f"advance:{execution_id}"
+            return self._idempotent(key, operation, apply, tenant)
+
+    def _advance_target(
+        self,
+        execution_id: str,
+        state: dict[str, Any],
+        work_item_id: str,
+        worker_id: str,
+        raw: dict[str, Any],
+        tenant: str,
+    ) -> dict[str, Any]:
+        """Settle exactly the ready target held by one target lease.
+
+        Only the active holder of the named work item may submit its result,
+        and the target must still be the ready target the lease was granted
+        for: an expired or released lease, another holder, an unknown or
+        another execution's work item, and a target that has already moved on
+        are all rejected before any state is touched.
+        """
+        row = self._target_lease_row(execution_id, work_item_id, tenant)
+        if row is None:
+            raise NotFoundError(f"work item {work_item_id} was not found")
+        now = datetime.now(timezone.utc)
+        if row["status"] != "active" or now >= _parse_iso(row["expires_at"]):
+            raise ConflictError(f"work item {work_item_id} lease is no longer active")
+        if row["worker_id"] != worker_id:
+            raise ConflictError(f"work item {work_item_id} is held by another worker")
+        target = self.store.decode(row["target"])
+        workflow = self._bound_workflow(execution_id, tenant)
+        if not self._target_is_ready(workflow, state, target):
+            # The lease names a target that has already moved on (a failover
+            # double submit after re-claim, or a target consumed elsewhere), so
+            # its holder no longer has anything to settle.
+            raise ConflictError(f"work item {work_item_id} is no longer a ready target")
+        # A target lease never spans an approval-parked execution, and a target
+        # settlement leaves the cascade's approvals for later claims.
+        self._settle_target(execution_id, workflow, state, target, raw, tenant)
+        if state["status"] == "running" and state.get("waiting_approval") is None:
+            self._auto_process(execution_id, workflow, state, tenant)
+        self.store.connection.execute(
+            "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+            (self.store.encode(state), tenant, execution_id),
+        )
+        # The result settles the target's node boundary: commit its state,
+        # events, and checkpoint together with the lease release.
+        self._write_checkpoint(execution_id, state, tenant)
+        self.store.connection.execute(
+            "UPDATE target_leases SET status = 'settled' "
+            "WHERE tenant = ? AND execution_id = ? AND work_item_id = ?",
+            (tenant, execution_id, work_item_id),
+        )
+        return state
+
+    def _settle_target(
+        self,
+        execution_id: str,
+        workflow: Workflow,
+        state: dict[str, Any],
+        target: dict[str, Any],
+        raw: dict[str, Any],
+        tenant: str,
+    ) -> None:
+        """Apply one submitted result to one ready target.
+
+        A target declaring an approval point parks at the point instead of
+        consuming the output or failure; otherwise the failure is retried or
+        the target completed. Only the named target is ever settled.
+        """
+        if target.get("map_id") is not None:
+            map_node = next(node for node in workflow.nodes if node.id == target["map_id"])
+            approval = map_node.template.approval
+        else:
+            node = next(node for node in workflow.nodes if node.id == target["node_id"])
+            approval = node.approval
+        if approval is not None:
+            self._request_approval(execution_id, workflow, state, target, tenant)
+        elif "failure" in raw:
+            self._fail_target(execution_id, workflow, state, target, raw["failure"]["reason"], tenant)
+        else:
+            self._complete_target(execution_id, workflow, state, target, raw["output"], tenant)
+
+    @staticmethod
+    def _target_key(target: dict[str, Any]) -> tuple[Any, ...]:
+        """The identity of a ready target, independent of dict key ordering."""
+        return (
+            target.get("node_id"),
+            target.get("map_id"),
+            target.get("index", -1),
+            target.get("loop_id"),
+            target.get("iteration", -1),
+        )
+
+    def _target_is_ready(self, workflow: Workflow, state: dict[str, Any], target: dict[str, Any]) -> bool:
+        """Whether a lease's target is still a currently ready, unleased target."""
+        ready = self._ready_targets(workflow, state)
+        return any(self._target_key(item) == self._target_key(target) for item in ready)
 
     def decision(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
@@ -2715,8 +2843,59 @@ class ChronicleFlow:
             "heartbeat_at": heartbeat_at,
         }
 
+    def _target_lease_row(self, execution_id: str, work_item_id: str, tenant: str) -> Any:
+        return self.store.connection.execute(
+            "SELECT worker_id, lease_seconds, expires_at, heartbeat_at, target, status FROM target_leases "
+            "WHERE tenant = ? AND execution_id = ? AND work_item_id = ?",
+            (tenant, execution_id, work_item_id),
+        ).fetchone()
+
+    def _active_target_lease_rows(self, execution_id: str, tenant: str, now: datetime) -> list[Any]:
+        """Every target lease that is held and whose deadline has not passed."""
+        rows = self.store.connection.execute(
+            "SELECT worker_id, lease_seconds, expires_at, heartbeat_at, target, work_item_id, status "
+            "FROM target_leases WHERE tenant = ? AND execution_id = ?",
+            (tenant, execution_id),
+        ).fetchall()
+        return [row for row in rows if row["status"] == "active" and _parse_iso(row["expires_at"]) > now]
+
+    def _expire_target_leases(self, execution_id: str, tenant: str, now_stamp: str) -> None:
+        """Mark past-due active leases expired, retaining their rows.
+
+        An expired row is kept so a stale holder submitting, heartbeating, or
+        releasing the old work item is answered 409 rather than 404, while a
+        genuinely unknown id is still 404. It no longer blocks claiming.
+        """
+        self.store.connection.execute(
+            "UPDATE target_leases SET status = 'expired' "
+            "WHERE tenant = ? AND execution_id = ? AND status = 'active' AND expires_at <= ?",
+            (tenant, execution_id, now_stamp),
+        )
+
+    def _has_active_target_leases(self, execution_id: str, tenant: str) -> bool:
+        return bool(self._active_target_lease_rows(execution_id, tenant, datetime.now(timezone.utc)))
+
+    @staticmethod
+    def _target_lease_payload(
+        work_item_id: str, worker_id: str, lease_seconds: float, expires_at: str, heartbeat_at: str
+    ) -> dict[str, Any]:
+        return {
+            "work_item_id": work_item_id,
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+            "expires_at": expires_at,
+            "heartbeat_at": heartbeat_at,
+        }
+
     def _assert_submission_allowed(self, execution_id: str, worker_id: str | None, tenant: str) -> None:
-        """Once a work item is claimed, only the active lease holder may submit results."""
+        """Once an execution work item is claimed, only its holder may submit.
+
+        A valid target lease locks the execution-wide path as well: while any
+        target is held, an old-style advance is rejected regardless of its
+        worker identity, until every target lease expires or is released.
+        """
+        if self._has_active_target_leases(execution_id, tenant):
+            raise ConflictError(f"execution {execution_id} has a target work item claimed")
         row = self._lease_row(execution_id, tenant)
         if row is None:
             return
@@ -2728,14 +2907,26 @@ class ChronicleFlow:
     def claim(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
     ) -> dict[str, Any]:
-        if not isinstance(raw, dict) or "worker_id" not in raw or not set(raw) <= {"worker_id", "lease_seconds"}:
-            raise ValidationError("claim body must contain a worker_id and optionally lease_seconds")
+        if not isinstance(raw, dict) or "worker_id" not in raw or not set(raw) <= {
+            "worker_id",
+            "lease_seconds",
+            "scope",
+        }:
+            raise ValidationError("claim body must contain a worker_id and optionally lease_seconds and scope")
         worker_id = _identifier(raw["worker_id"], "worker id")
+        scope = raw.get("scope", SCOPE_EXECUTION)
+        if scope not in (SCOPE_EXECUTION, SCOPE_TARGET):
+            raise ValidationError("scope must be \"execution\" or \"target\"")
         lease_seconds = raw.get("lease_seconds", DEFAULT_LEASE_SECONDS)
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)):
             raise ValidationError("lease_seconds must be a positive number of seconds")
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValidationError("lease_seconds must be a positive number of seconds")
+
+        if scope == SCOPE_TARGET:
+            return self._idempotent(
+                key, f"claim-target:{execution_id}", self._claim_target(execution_id, worker_id, lease_seconds, tenant), tenant
+            )
 
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id, tenant)
@@ -2743,6 +2934,11 @@ class ChronicleFlow:
                 # A finished execution has no claimable work item; the request
                 # is a definite empty result and absorbs no input.
                 return {"work_item": None, "lease": None}
+            if self._has_active_target_leases(execution_id, tenant):
+                # The parallel target mode owns the execution while any target
+                # is held; the execution-wide claim returns only after every
+                # target lease is released or expires.
+                raise ConflictError(f"execution {execution_id} has a target work item claimed")
             now = time.time()
             row = self._lease_row(execution_id, tenant)
             if row is not None and now < row["expires_at"]:
@@ -2763,15 +2959,112 @@ class ChronicleFlow:
 
         return self._idempotent(key, f"claim:{execution_id}", apply, tenant)
 
+    def _target_work_item(self, execution_id: str, state: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+        """The work-item descriptor of one ready target.
+
+        Every item names its execution, workflow, and node; a map instance
+        additionally names its map and element index, and an instance in a
+        loop body names the loop and iteration it expanded in.
+        """
+        work_item = {"execution_id": execution_id, "workflow_id": state["workflow_id"], "node_id": target["node_id"]}
+        if "map_id" in target:
+            work_item["map_id"] = target["map_id"]
+            work_item["index"] = target["index"]
+        if "loop_id" in target:
+            work_item["loop_id"] = target["loop_id"]
+            work_item["iteration"] = target["iteration"]
+        return work_item
+
+    def _claim_target(
+        self, execution_id: str, worker_id: str, lease_seconds: float, tenant: str
+    ) -> Callable[[], dict[str, Any]]:
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            if state["status"] != "running":
+                return {"work_item": None, "lease": None}
+            execution_row = self._lease_row(execution_id, tenant)
+            if execution_row is not None and time.time() < execution_row["expires_at"]:
+                # An active execution-wide lease owns the whole execution.
+                raise ConflictError(f"work item for execution {execution_id} is already claimed")
+            now = datetime.now(timezone.utc)
+            workflow = self._bound_workflow(execution_id, tenant)
+            now_stamp = _iso_fixed(now)
+            # Expired leases are claimable again; mark them so their stale
+            # holder still receives 409, then this claim inserts a fresh row.
+            self._expire_target_leases(execution_id, tenant, now_stamp)
+            # A claim appends no events, so the ready list is read from the
+            # materialized state: every settlement runs the automatic
+            # condition/skip/expansion cascade before it commits, so successors
+            # are already marked ready by the time they can be claimed.
+            active_rows = self._active_target_lease_rows(execution_id, tenant, now)
+            claimed_keys = {
+                self._target_key(self.store.decode(row["target"])) for row in active_rows
+            }
+            ready_targets = self._ready_targets(workflow, state)
+            if not ready_targets:
+                # Nothing is ready to work right now (a finished execution, a
+                # parked approval, or conditions/skips not yet settled): the
+                # definite empty result, writing nothing.
+                return {"work_item": None, "lease": None}
+            target = next(
+                (
+                    candidate
+                    for candidate in ready_targets
+                    if self._target_key(candidate) not in claimed_keys
+                ),
+                None,
+            )
+            if target is None:
+                # Ready targets exist but every one already has a valid lease:
+                # re-claiming a validly held target is a conflict, not an empty
+                # result, exactly like the execution-wide claim.
+                raise ConflictError(f"execution {execution_id} has no unclaimed ready target")
+            work_item_id = uuid.uuid4().hex
+            heartbeat_at = _iso_fixed(now)
+            expires_at = _iso_fixed(now + timedelta(seconds=lease_seconds))
+            self.store.connection.execute(
+                "INSERT INTO target_leases(tenant, execution_id, work_item_id, worker_id, lease_seconds, "
+                "expires_at, heartbeat_at, target) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant,
+                    execution_id,
+                    work_item_id,
+                    worker_id,
+                    lease_seconds,
+                    expires_at,
+                    heartbeat_at,
+                    self.store.encode(target),
+                ),
+            )
+            return {
+                "work_item": self._target_work_item(execution_id, state, target),
+                "lease": self._target_lease_payload(
+                    work_item_id, worker_id, lease_seconds, expires_at, heartbeat_at
+                ),
+            }
+
+        return apply
+
     def heartbeat(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
     ) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
-            raise ValidationError("heartbeat body must contain exactly a worker_id")
+        if not isinstance(raw, dict) or set(raw) not in ({"worker_id"}, {"worker_id", "work_item_id"}):
+            raise ValidationError("heartbeat body must contain a worker_id, plus work_item_id for a target lease")
         worker_id = _identifier(raw["worker_id"], "worker id")
+        if "work_item_id" in raw:
+            work_item_id = _identifier(raw["work_item_id"], "work item id")
+            return self._idempotent(
+                key,
+                f"heartbeat-target:{execution_id}:{work_item_id}",
+                self._heartbeat_target(execution_id, work_item_id, worker_id, tenant),
+                tenant,
+            )
 
         def apply() -> dict[str, Any]:
             state = self.get_execution(execution_id, tenant)
+            if self._has_active_target_leases(execution_id, tenant):
+                # While a target is held the execution-wide lease is parked.
+                raise ConflictError(f"execution {execution_id} has a target work item claimed")
             row = self._lease_row(execution_id, tenant)
             if row is None:
                 raise NotFoundError(f"execution {execution_id} has no claimed work item")
@@ -2793,15 +3086,55 @@ class ChronicleFlow:
 
         return self._idempotent(key, f"heartbeat:{execution_id}", apply, tenant)
 
+    def _heartbeat_target(
+        self, execution_id: str, work_item_id: str, worker_id: str, tenant: str
+    ) -> Callable[[], dict[str, Any]]:
+        def apply() -> dict[str, Any]:
+            state = self.get_execution(execution_id, tenant)
+            row = self._target_lease_row(execution_id, work_item_id, tenant)
+            if row is None:
+                raise NotFoundError(f"work item {work_item_id} was not found")
+            now = datetime.now(timezone.utc)
+            if state["status"] != "running":
+                raise ConflictError(f"execution {execution_id} is not running")
+            if row["status"] != "active" or now >= _parse_iso(row["expires_at"]):
+                raise ConflictError(f"work item {work_item_id} lease is no longer active")
+            if row["worker_id"] != worker_id:
+                raise ConflictError(f"work item {work_item_id} is held by another worker")
+            heartbeat_at = _iso_fixed(now)
+            expires_at = _iso_fixed(now + timedelta(seconds=row["lease_seconds"]))
+            self.store.connection.execute(
+                "UPDATE target_leases SET expires_at = ?, heartbeat_at = ? "
+                "WHERE tenant = ? AND execution_id = ? AND work_item_id = ?",
+                (expires_at, heartbeat_at, tenant, execution_id, work_item_id),
+            )
+            return {
+                "lease": self._target_lease_payload(
+                    work_item_id, worker_id, row["lease_seconds"], expires_at, heartbeat_at
+                )
+            }
+
+        return apply
+
     def release(
         self, execution_id: str, raw: Any, key: str | None, tenant: str = DEFAULT_TENANT
     ) -> dict[str, Any]:
-        if not isinstance(raw, dict) or set(raw) != {"worker_id"}:
-            raise ValidationError("release body must contain exactly a worker_id")
+        if not isinstance(raw, dict) or set(raw) not in ({"worker_id"}, {"worker_id", "work_item_id"}):
+            raise ValidationError("release body must contain a worker_id, plus work_item_id for a target lease")
         worker_id = _identifier(raw["worker_id"], "worker id")
+        if "work_item_id" in raw:
+            work_item_id = _identifier(raw["work_item_id"], "work item id")
+            return self._idempotent(
+                key,
+                f"release-target:{execution_id}:{work_item_id}",
+                self._release_target(execution_id, work_item_id, worker_id, tenant),
+                tenant,
+            )
 
         def apply() -> dict[str, Any]:
             self.get_execution(execution_id, tenant)
+            if self._has_active_target_leases(execution_id, tenant):
+                raise ConflictError(f"execution {execution_id} has a target work item claimed")
             row = self._lease_row(execution_id, tenant)
             if row is None:
                 raise NotFoundError(f"execution {execution_id} has no claimed work item")
@@ -2816,6 +3149,27 @@ class ChronicleFlow:
             return {"released": True}
 
         return self._idempotent(key, f"release:{execution_id}", apply, tenant)
+
+    def _release_target(
+        self, execution_id: str, work_item_id: str, worker_id: str, tenant: str
+    ) -> Callable[[], dict[str, Any]]:
+        def apply() -> dict[str, Any]:
+            self.get_execution(execution_id, tenant)
+            row = self._target_lease_row(execution_id, work_item_id, tenant)
+            if row is None:
+                raise NotFoundError(f"work item {work_item_id} was not found")
+            if row["status"] != "active" or datetime.now(timezone.utc) >= _parse_iso(row["expires_at"]):
+                raise ConflictError(f"work item {work_item_id} lease is no longer active")
+            if row["worker_id"] != worker_id:
+                raise ConflictError(f"work item {work_item_id} is held by another worker")
+            self.store.connection.execute(
+                "UPDATE target_leases SET status = 'released' "
+                "WHERE tenant = ? AND execution_id = ? AND work_item_id = ?",
+                (tenant, execution_id, work_item_id),
+            )
+            return {"released": True}
+
+        return apply
 
     def checkpoints(self, execution_id: str, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         self.get_execution(execution_id, tenant)
@@ -3585,9 +3939,28 @@ class ChronicleFlow:
         Map instances queue in ascending element index once their map is
         expanded; every advance still settles exactly the first target. A map
         nested in a loop body contributes the ready instances of the loop's
-        current iteration only.
+        current iteration only. A task parked waiting on an approval decision
+        is not ready: it is moved only by a decision, so it is never offered
+        for a (parallel) claim. Map instances already carry a ``waiting``
+        status and are excluded by that alone; a parked declared task is
+        filtered against the current waiting point.
         """
-        targets: list[dict[str, Any]] = [{"node_id": node_id} for node_id in self._ready_tasks(workflow, state)]
+        waiting = state.get("waiting_approval")
+        waiting_plain: set[tuple[str, str | None, int | None]] = set()
+        if waiting is not None and "map_id" not in waiting:
+            waiting_plain.add(
+                (waiting["node_id"], waiting.get("loop_id"), waiting.get("iteration"))
+            )
+        plain: list[dict[str, Any]] = []
+        for node_id in self._ready_tasks(workflow, state):
+            loop_id = self._active_loop(workflow, state, node_id)
+            iteration = (
+                state["loops"][loop_id]["current_iteration"] if loop_id is not None else None
+            )
+            if (node_id, loop_id, iteration) in waiting_plain:
+                continue
+            plain.append({"node_id": node_id})
+        targets: list[dict[str, Any]] = plain
         maps = state.get("maps")
         if maps:
             map_nodes = {node.id: node for node in workflow.nodes if node.kind == "map"}

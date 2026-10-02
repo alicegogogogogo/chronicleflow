@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS leases (
   PRIMARY KEY (tenant, execution_id),
   FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
 );
+CREATE TABLE IF NOT EXISTS target_leases (
+  tenant TEXT NOT NULL DEFAULT '',
+  execution_id TEXT NOT NULL,
+  work_item_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  lease_seconds REAL NOT NULL,
+  expires_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  target TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  PRIMARY KEY (tenant, execution_id, work_item_id),
+  FOREIGN KEY (tenant, execution_id) REFERENCES executions(tenant, id)
+);
 CREATE TABLE IF NOT EXISTS subscriptions (
   tenant TEXT NOT NULL DEFAULT '',
   owner_type TEXT NOT NULL,

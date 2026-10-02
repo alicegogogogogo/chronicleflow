@@ -413,6 +413,109 @@ class WorkerLeaseHttpTests(unittest.TestCase):
         status, data = self.call("POST", "/executions/run-l6/advance", {"output": {}, "worker_id": "w-1"}, "shared-lease-key")
         self.assertEqual(409, status)
 
+    def start_parallel(self, execution_id):
+        self.call(
+            "POST",
+            "/workflows",
+            {
+                "id": "wf-parallel",
+                "nodes": [
+                    {"id": "p", "kind": "task", "depends_on": []},
+                    {"id": "q", "kind": "task", "depends_on": []},
+                ],
+            },
+            "wf-parallel",
+        )
+        self.call("POST", "/executions", {"id": execution_id, "workflow_id": "wf-parallel", "input": {}}, f"ex-{execution_id}")
+
+    def test_target_claims_run_in_parallel(self):
+        self.start_parallel("run-t1")
+        status, data = self.call(
+            "POST", "/executions/run-t1/claim", {"worker_id": "w-a", "scope": "target", "lease_seconds": 30}, "tcl-1"
+        )
+        self.assertEqual(200, status)
+        first = json.loads(data)
+        self.assertEqual("p", first["work_item"]["node_id"])
+        self.assertEqual(
+            ["work_item_id", "worker_id", "lease_seconds", "expires_at", "heartbeat_at"],
+            list(first["lease"]),
+        )
+        self.assertTrue(first["lease"]["expires_at"].endswith("Z"))
+        status, data = self.call(
+            "POST", "/executions/run-t1/claim", {"worker_id": "w-b", "scope": "target"}, "tcl-2"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("q", json.loads(data)["work_item"]["node_id"])
+        # A third target claim finds every ready target already leased: 409.
+        status, data = self.call("POST", "/executions/run-t1/claim", {"worker_id": "w-c", "scope": "target"}, "tcl-3")
+        self.assertEqual(409, status)
+        # The two holders settle their own targets independently.
+        status, _ = self.call(
+            "POST",
+            "/executions/run-t1/advance",
+            {"output": {"v": 1}, "worker_id": "w-a", "work_item_id": first["lease"]["work_item_id"]},
+            "tadv-1",
+        )
+        self.assertEqual(200, status)
+        second_wid = json.loads(
+            self.call("POST", "/executions/run-t1/claim", {"worker_id": "w-b", "scope": "target"}, "tcl-2")[1]
+        )["lease"]["work_item_id"]
+        status, data = self.call(
+            "POST",
+            "/executions/run-t1/advance",
+            {"output": {"v": 2}, "worker_id": "w-b", "work_item_id": second_wid},
+            "tadv-2",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("completed", json.loads(data)["status"])
+
+    def test_target_lease_blocks_legacy_operations_until_released(self):
+        self.start_parallel("run-t2")
+        status, data = self.call("POST", "/executions/run-t2/claim", {"worker_id": "w-a", "scope": "target"}, "tcl-r1")
+        self.assertEqual(200, status)
+        wid = json.loads(data)["lease"]["work_item_id"]
+        for path, body, key in (
+            ("/claim", {"worker_id": "w-z"}, "tec"),
+            ("/advance", {"output": {}, "worker_id": "w-a"}, "tea"),
+            ("/heartbeat", {"worker_id": "w-a"}, "teh"),
+            ("/release", {"worker_id": "w-a"}, "ter"),
+        ):
+            status, data = self.call("POST", f"/executions/run-t2{path}", body, key)
+            self.assertEqual(409, status, path)
+        # Releasing the target lease restores the execution-wide claim.
+        status, _ = self.call("POST", "/executions/run-t2/release", {"worker_id": "w-a", "work_item_id": wid}, "trl")
+        self.assertEqual(200, status)
+        status, data = self.call("POST", "/executions/run-t2/claim", {"worker_id": "w-z"}, "tec2")
+        self.assertEqual(200, status)
+        self.assertNotIn("work_item_id", json.loads(data)["lease"])
+
+    def test_target_lease_error_codes(self):
+        self.start_parallel("run-t3")
+        claimed = json.loads(
+            self.call("POST", "/executions/run-t3/claim", {"worker_id": "w-a", "scope": "target"}, "tce-1")[1]
+        )
+        wid = claimed["lease"]["work_item_id"]
+        # A bad scope is a validation error.
+        status, data = self.call(
+            "POST", "/executions/run-t3/claim", {"worker_id": "w-a", "scope": "nope"}, "tce-bad-scope"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(data)["error"]["code"])
+        # Missing fields on a target advance are validation errors.
+        status, _ = self.call("POST", "/executions/run-t3/advance", {"output": {}, "work_item_id": wid}, "tce-miss")
+        self.assertEqual(400, status)
+        # An unknown work item id is a missing resource.
+        status, data = self.call(
+            "POST", "/executions/run-t3/heartbeat", {"worker_id": "w-a", "work_item_id": "ghost"}, "tce-ghost"
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(data)["error"]["code"])
+        # Another worker cannot heartbeat the held item: 409.
+        status, _ = self.call(
+            "POST", "/executions/run-t3/heartbeat", {"worker_id": "w-b", "work_item_id": wid}, "tce-other"
+        )
+        self.assertEqual(409, status)
+
 
 class ApprovalHttpTests(unittest.TestCase):
     @staticmethod
