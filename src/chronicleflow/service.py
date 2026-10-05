@@ -2584,14 +2584,44 @@ class ChronicleFlow:
                 raise ConflictError(f"approver {approver} is not allowed to decide this approval point")
             node_id = waiting["node_id"]
             context = self._approval_context(waiting)
-            state["waiting_approval"] = None
-            state["approvals"].append(
-                {"node_id": node_id, "approver": approver, "decision": verdict, "reason": reason, **context}
-            )
-            payload: dict[str, Any] = {"node_id": node_id, "approver": approver, "decision": verdict, **context}
+            quorum = "required_approvals" in waiting
+            if quorum and approver in waiting["approved"]:
+                # One valid decision per approver per waiting point: an exact
+                # repeat of the recorded approval returns the current state
+                # without a new event or checkpoint; changing the verdict, the
+                # output, or the reason is a conflict.
+                prior = self._prior_approval(state, waiting, approver)
+                if verdict == "approved" and prior is not None and prior.get("output") == output:
+                    return state
+                raise ConflictError(f"approver {approver} has already decided this approval point")
+            record: dict[str, Any] = {"node_id": node_id, "approver": approver, "decision": verdict, "reason": reason}
+            if quorum and verdict == "approved":
+                # A quorum approval keeps its output on the record (and the
+                # event) so the ordered progress rebuilds from the stream.
+                record["output"] = output
+            record.update(context)
+            state["approvals"].append(record)
+            payload: dict[str, Any] = {"node_id": node_id, "approver": approver, "decision": verdict}
+            if quorum and verdict == "approved":
+                payload["output"] = output
+            payload.update(context)
             if verdict == "rejected":
                 payload["reason"] = reason
             self._append(execution_id, "approval_decided", payload, tenant)
+            if verdict == "approved" and quorum:
+                waiting["approved"].append(approver)
+                waiting["remaining"] -= 1
+                if waiting["remaining"] > 0:
+                    # The quorum is not yet met: the approval is recorded and
+                    # checkpointed, but the node stays parked — no output is
+                    # adopted and no successor is released.
+                    self.store.connection.execute(
+                        "UPDATE executions SET state = ? WHERE tenant = ? AND id = ?",
+                        (self.store.encode(state), tenant, execution_id),
+                    )
+                    self._write_checkpoint(execution_id, state, tenant)
+                    return state
+            state["waiting_approval"] = None
             if verdict == "approved":
                 target: dict[str, Any] = {"node_id": node_id}
                 if "map_id" in waiting:
@@ -2646,7 +2676,21 @@ class ChronicleFlow:
             return False
         if verdict == "rejected":
             return record["reason"] == reason
+        if "output" in record:
+            # A quorum record carries its output on the record itself.
+            return record["output"] == output
         return ChronicleFlow._recorded_output(state, record) == output
+
+    @staticmethod
+    def _prior_approval(state: dict[str, Any], waiting: dict[str, Any], approver: str) -> dict[str, Any] | None:
+        """The decision record an approver already left at the current waiting point."""
+        context = ChronicleFlow._approval_context(waiting)
+        for record in reversed(state.get("approvals") or []):
+            if record["approver"] != approver or record["node_id"] != waiting["node_id"]:
+                continue
+            if all(record.get(key) == value for key, value in context.items()):
+                return record
+        return None
 
     @staticmethod
     def _map_context(state: dict[str, Any], record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -2690,11 +2734,19 @@ class ChronicleFlow:
         node_id = target["node_id"]
         if target.get("map_id") is not None:
             map_node = next(node for node in workflow.nodes if node.id == target["map_id"])
-            approvers = list(map_node.template.approval.approvers)
+            approval = map_node.template.approval
         else:
             node = next(node for node in workflow.nodes if node.id == node_id)
-            approvers = list(node.approval.approvers)
+            approval = node.approval
+        approvers = list(approval.approvers)
         waiting: dict[str, Any] = {"node_id": node_id, "approvers": approvers}
+        if approval.required_approvals is not None:
+            # A quorum point tracks its progress in the waiting record itself:
+            # the approved approvers in submission order and the count still
+            # needed, so the parked state survives a restart as recorded.
+            waiting["required_approvals"] = approval.required_approvals
+            waiting["approved"] = []
+            waiting["remaining"] = approval.required_approvals
         if target.get("map_id") is not None:
             # A map instance carries its expansion context explicitly: the
             # template id is not a declared node, so no loop lookup applies.
@@ -2716,12 +2768,11 @@ class ChronicleFlow:
                 waiting["loop_id"] = loop_id
                 waiting["iteration"] = state["loops"][loop_id]["current_iteration"]
         state["waiting_approval"] = waiting
-        self._append(
-            execution_id,
-            "approval_requested",
-            {"node_id": node_id, "approvers": approvers, **self._approval_context(waiting)},
-            tenant,
-        )
+        payload: dict[str, Any] = {"node_id": node_id, "approvers": approvers}
+        if approval.required_approvals is not None:
+            payload["required_approvals"] = approval.required_approvals
+        payload.update(self._approval_context(waiting))
+        self._append(execution_id, "approval_requested", payload, tenant)
 
     def cancel(self, execution_id: str, key: str | None, tenant: str = DEFAULT_TENANT) -> dict[str, Any]:
         def apply() -> dict[str, Any]:
@@ -4732,8 +4783,14 @@ class ChronicleFlow:
                 waiting_record = {
                     "node_id": payload["node_id"],
                     "approvers": list(payload["approvers"]),
-                    **({"loop_id": payload["loop_id"], "iteration": payload["iteration"]} if "loop_id" in payload else {}),
                 }
+                if "required_approvals" in payload:
+                    waiting_record["required_approvals"] = payload["required_approvals"]
+                    waiting_record["approved"] = []
+                    waiting_record["remaining"] = payload["required_approvals"]
+                if "loop_id" in payload:
+                    waiting_record["loop_id"] = payload["loop_id"]
+                    waiting_record["iteration"] = payload["iteration"]
                 if "map_id" in payload:
                     waiting_record["map_id"] = payload["map_id"]
                     waiting_record["index"] = payload["index"]
@@ -4763,13 +4820,25 @@ class ChronicleFlow:
                     "decision": verdict,
                     "reason": payload.get("reason"),
                 }
+                if "output" in payload:
+                    # A quorum approval keeps its output on the record.
+                    record["output"] = payload["output"]
                 if "loop_id" in payload:
                     record["loop_id"] = payload["loop_id"]
                     record["iteration"] = payload["iteration"]
                 if "map_id" in payload:
                     record["map_id"] = payload["map_id"]
                     record["index"] = payload["index"]
-                rebuilt["waiting_approval"] = None
+                parked = rebuilt.get("waiting_approval")
+                if verdict == "approved" and isinstance(parked, dict) and "required_approvals" in parked:
+                    # A quorum point stays parked until the deciding approval
+                    # arrives; only then is the waiting record dismissed.
+                    parked["approved"].append(payload["approver"])
+                    parked["remaining"] -= 1
+                    if parked["remaining"] == 0:
+                        rebuilt["waiting_approval"] = None
+                else:
+                    rebuilt["waiting_approval"] = None
                 rebuilt["approvals"].append(record)
             elif event_type == "execution_completed" and rebuilt is not None:
                 rebuilt["status"] = "completed"

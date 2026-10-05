@@ -21,7 +21,9 @@ The initial release intentionally supports a compact public contract:
 - a task node may declare an approval point with the people allowed to decide
   it; advancing parks the task in a waiting state until an approver approves
   (completing it with the submitted output) or rejects (terminating the
-  execution with reason `rejected`);
+  execution with reason `rejected`), and a point may instead declare a quorum
+  so that a fixed number of distinct approvers must approve before the task
+  completes;
 - executions may declare a timeout in seconds, after which they terminate and
   no longer accept output, and they may be cancelled explicitly;
 - loop nodes repeat their body a bounded number of times, re-evaluating a
@@ -1036,6 +1038,52 @@ waiting points and recorded decisions remain valid after a restart. Approval
 state is added to an execution only when its workflow declares at least one
 approval point; workflows without approvals keep exactly the previous state
 shape and event stream.
+
+### Multi-approver quorum
+
+An approval declaration may additionally carry `required_approvals`, the
+number of distinct approvers whose approval is needed to complete the task:
+
+```json
+{"id": "charge", "kind": "task", "depends_on": ["reserve"],
+ "approval": {"approvers": ["alice", "bob", "carol"], "required_approvals": 2}}
+```
+
+`required_approvals` is an integer between 1 and the number of approvers; a
+null, boolean, non-integer, or out-of-range value, or an unknown field in the
+declaration, is a `400 validation_error` that writes nothing. The declared
+value is returned as-is by the workflow queries, and the declaration is
+available anywhere an approval point is: ordinary tasks, loop body tasks, and
+map templates. When the field is omitted the point keeps the existing
+any-one-decides semantics and the workflow, execution state, and event shapes
+gain no fields.
+
+Decisions are submitted through the same `decision` entry point with
+`approved` or `rejected`. Each member of `approvers` may contribute exactly
+one valid decision to a waiting point. An `approved` decision is recorded in
+submission order with its approver, decision, and output, appends an
+`approval_decided` event (carrying the output), and is checkpointed, but
+until the approved count reaches `required_approvals` the node stays parked:
+no output is adopted and no successor is released. The approval that reaches
+the threshold completes the node, its output becomes the task's final output,
+and `waiting_approval` disappears. A `rejected` decision from any allowed
+approver still terminates the execution immediately with reason `rejected`,
+whatever the current approval count.
+
+While a quorum point is parked, `waiting_approval` exposes
+`required_approvals`, the `approved` approver identifiers in submission
+order, and the `remaining` count still needed, in a deterministic order that
+is unchanged by a restart; the events, checkpoints, recovery, and replay
+rebuild the same progress and the same final output. A repeated decision from
+an approver who already decided the current point returns the current state
+without a new event or checkpoint when it is exactly the recorded decision —
+same verdict with the same output or reason — and conflicts with `409
+conflict` when it changes the verdict, the output, or the reason. Every other
+rule is unchanged: a non-approver decision is a `409 conflict`, a decision
+against an execution with no pending point follows the existing conflict
+rules, and decisions stay subject to tenant isolation and the
+`Idempotency-Key` constraint, with concurrent decisions applied in a single
+order so the threshold completes the node exactly once.
 
 A node may also have `kind` set to `loop`, describing a bounded repeated
 segment:
