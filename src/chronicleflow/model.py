@@ -67,11 +67,15 @@ class RunIf:
 @dataclass(frozen=True)
 class Approval:
     approvers: tuple[str, ...]
+    # How many distinct approvers must approve before the point completes.
+    # None keeps the legacy any-one-decides semantics and adds no field to
+    # the stored declaration, the waiting state, or the event stream.
+    required_approvals: int | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> "Approval":
-        if not isinstance(raw, dict) or set(raw) != {"approvers"}:
-            raise ValidationError("approval must contain exactly approvers")
+        if not isinstance(raw, dict) or not {"approvers"} <= set(raw) <= {"approvers", "required_approvals"}:
+            raise ValidationError("approval must contain approvers and may only add required_approvals")
         approvers = raw["approvers"]
         if not isinstance(approvers, list) or not approvers:
             raise ValidationError("approval approvers must be a non-empty array")
@@ -79,10 +83,20 @@ class Approval:
             raise ValidationError("approval approvers must be strings")
         if len(approvers) != len(set(approvers)):
             raise ValidationError("approval approvers must not contain duplicates")
-        return cls(tuple(approvers))
+        required = None
+        if "required_approvals" in raw:
+            required = raw["required_approvals"]
+            if isinstance(required, bool) or not isinstance(required, int):
+                raise ValidationError("approval required_approvals must be an integer")
+            if not 1 <= required <= len(approvers):
+                raise ValidationError("approval required_approvals must be between 1 and the number of approvers")
+        return cls(tuple(approvers), required)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"approvers": list(self.approvers)}
+        document: dict[str, Any] = {"approvers": list(self.approvers)}
+        if self.required_approvals is not None:
+            document["required_approvals"] = self.required_approvals
+        return document
 
 
 @dataclass(frozen=True)
